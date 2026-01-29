@@ -1,13 +1,43 @@
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Request
+import logging
 from typing import List, Tuple, Optional, Union
+from pydantic import BaseModel, Field
+import base64
+import hashlib
+import hmac
+import json
 import psycopg2
+from psycopg2.pool import SimpleConnectionPool, ThreadedConnectionPool
+import threading
 from fastapi.middleware.cors import CORSMiddleware
-from datetime import date
+from datetime import date, datetime
 import decimal
-import os 
+import os
+import secrets
+import time
+from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv()
 
 # Création de l'instance FastAPI
 app = FastAPI()
+
+
+def _load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_env_file(Path(__file__).with_name(".env"))
 
 
 # Origines autorisées
@@ -41,44 +71,140 @@ async def _force_cors_headers(request, call_next):
         resp.headers.setdefault("Vary", "Origin")
     return resp
 
-# Fonction de connexion PostgreSQL
+_DB_DSN = {
+    "dbname": os.getenv("DB_NAME", "EaukeyCloudSQLv1"),
+    "user": os.getenv("DB_USER", "romain"),
+    "password": os.getenv("DB_PASSWORD", "Lzl?h<P@zxle6xuL"),
+    "host": os.getenv("DB_HOST", "35.195.185.218"),
+    "connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", "5")),
+}
+
+_pool: ThreadedConnectionPool | None = None
+_pool_sem: threading.BoundedSemaphore | None = None
+_conn_checked_out: set[int] = set()
+_conn_sem_acquired: set[int] = set()
+_conn_lock = threading.Lock()
+_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "10000"))
+_POOL_WAIT_TIMEOUT = float(os.getenv("DB_POOL_WAIT_TIMEOUT", "2"))
+
+
+def _get_pool() -> ThreadedConnectionPool:
+    global _pool, _pool_sem
+    if _pool is None:
+        max_conn = int(os.getenv("DB_MAX_CONN", "50"))
+        # Pool thread-safe pour supporter le parallélisme FastAPI
+        _pool = ThreadedConnectionPool(1, max_conn, **_DB_DSN)
+        _pool_sem = threading.BoundedSemaphore(max_conn)
+    return _pool
+
+
 def get_connection():
-    return psycopg2.connect(
-        dbname="EaukeyCloudSQLv1",
-        user="romain",
-        password="Lzl?h<P@zxle6xuL",
-        host="35.195.185.218",
-        connect_timeout=5,  # évite de bloquer le handler si la DB ne répond pas
-    )
+    pool = _get_pool()
+    if _pool_sem and not _pool_sem.acquire(timeout=_POOL_WAIT_TIMEOUT):
+        raise HTTPException(status_code=503, detail="DB pool wait timeout")
+    try:
+        conn = pool.getconn()
+        with _conn_lock:
+            _conn_checked_out.add(id(conn))
+            _conn_sem_acquired.add(id(conn))
+        _apply_statement_timeout(conn)
+        return conn
+    except Exception:
+        if _pool_sem:
+            _pool_sem.release()
+        raise
+
+
+def _release_connection(conn):
+    try:
+        _get_pool().putconn(conn)
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    finally:
+        released = False
+        sem_release = False
+        with _conn_lock:
+            if id(conn) in _conn_checked_out:
+                _conn_checked_out.discard(id(conn))
+                released = True
+            if id(conn) in _conn_sem_acquired:
+                _conn_sem_acquired.discard(id(conn))
+                sem_release = True
+        if released and sem_release and _pool_sem:
+            _pool_sem.release()
+
+
+def _apply_statement_timeout(conn):
+    if _STATEMENT_TIMEOUT_MS <= 0:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SET statement_timeout = {_STATEMENT_TIMEOUT_MS}")
+    except Exception:
+        pass
 
 def executer_requete_sql(requete_sql: str, params: tuple = None) -> List[Tuple]:
     """
     Exécute une requête SQL avec des paramètres optionnels.
     """
+    conn = None
     try:
-        with get_connection() as conn:
-            with conn.cursor() as cur:
-                # 1) Exécute la requête avec (ou sans) paramètres
-                if params:
-                    cur.execute(requete_sql, params)
-                else:
-                    cur.execute(requete_sql)
+        conn = get_connection()
+        with conn.cursor() as cur:
+            if params:
+                cur.execute(requete_sql, params)
+            else:
+                cur.execute(requete_sql)
 
-                # 2) S'il s'agit d'une requête *sélective* (SELECT…) → on récupère les lignes
-                #    Pour les INSERT/UPDATE/DELETE, ⁠ cursor.description ⁠ vaut None et ⁠ fetchall() ⁠ lèverait
-                #    l'erreur  "no result to fetch".
-                if cur.description is not None:
-                    resultats = cur.fetchall()
-                else:
-                    resultats = []  # aucune donnée à renvoyer
+            if cur.description is not None:
+                resultats = cur.fetchall()
+            else:
+                resultats = []
 
-                # 3) Valide les changements pour les requêtes d'écriture
-                conn.commit()
-
+        conn.commit()
         return resultats
     except Exception as e:
         print(f"Erreur SQL : {e}")
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         return []
+    finally:
+        if conn:
+            _release_connection(conn)
+
+
+def _normalize_emails(raw: Optional[Union[str, List[str]]]) -> tuple[list[str], Optional[str]]:
+    """
+    Normalise une liste d'emails provenant d'une chaîne "a,b" ou d'un tableau.
+    - trim + lower
+    - dédoublonne
+    - enlève les entrées vides
+    Retourne (liste_normée, chaîne_csv_ou_None)
+    """
+    if raw is None:
+        return [], None
+    if isinstance(raw, str):
+        # Autoriser séparateur ";" en plus de ","
+        items = raw.replace(";", ",").split(",")
+    else:
+        items = list(raw)
+    cleaned: list[str] = []
+    for item in items:
+        email = (item or "").strip().lower()
+        if email and email not in cleaned:
+            cleaned.append(email)
+    return cleaned, ",".join(cleaned) if cleaned else None
+
+
+def _split_emails(raw: Optional[Union[str, List[str]]]) -> list[str]:
+    """Alias pratique pour ne récupérer que la liste."""
+    return _normalize_emails(raw)[0]
 
 # Fonction pour calculer la consommation
 def calculer_consommation_par_intervalle(resultat_sql: List[Tuple], timeframe: str = "jour") -> dict:
@@ -197,7 +323,7 @@ def fetch_annee_simple(nom_automate: str, column: str) -> dict:
 @app.get("/recherche/automate_LCA")
 def liste_automates():
     query = """
-        SELECT client, numero_automate, nom_automate, lieu, email
+        SELECT client, numero_automate, nom_automate, lieu, email, email2, email3
         FROM automate
         ORDER BY client NULLS LAST, nom_automate
     """
@@ -209,6 +335,9 @@ def liste_automates():
             "nom_automate": r[2],
             "lieu": r[3],
             "email": r[4],
+            "email2": r[5],
+            "email3": r[6],
+            "emails": [e for e in [r[4], r[5], r[6]] if e],
         }
         for r in rows
     ]
@@ -566,11 +695,11 @@ def pression_all_semaine(nom_automate: str = Query(..., description="Nom de l'au
     result = executer_requete_sql(query, (nom_automate,))
     return {
         "labels": [row[0].strip() for row in result],
-        "p1_mbar": [float(row[1]) for row in result],
-        "p2_mbar": [float(row[2]) for row in result],
-        "p3_mbar": [float(row[3]) for row in result],
-        "p4_mbar": [float(row[4]) for row in result],
-        "p5_mbar": [float(row[5]) for row in result],
+        "p1_med_mbar": [float(row[1]) for row in result],
+        "p2_med_mbar": [float(row[2]) for row in result],
+        "p3_med_mbar": [float(row[3]) for row in result],
+        "p4_med_mbar": [float(row[4]) for row in result],
+        "p5_med_mbar": [float(row[5]) for row in result],
     }
 
 @app.get("/pression_all/mois")
@@ -590,11 +719,11 @@ def pression_all_mois(nom_automate: str = Query(..., description="Nom de l'autom
     result = executer_requete_sql(query, (nom_automate,))
     return {
         "labels": [row[0] for row in result],
-        "pression1_mbar": [float(row[1]) for row in result],
-        "pression2_mbar": [float(row[2]) for row in result],
-        "pression3_mbar": [float(row[3]) for row in result],
-        "pression4_mbar": [float(row[4]) for row in result],
-        "pression5_mbar": [float(row[5]) for row in result],
+        "p1_med_mbar": [float(row[1]) for row in result],
+        "p2_med_mbar": [float(row[2]) for row in result],
+        "p3_med_mbar": [float(row[3]) for row in result],
+        "p4_med_mbar": [float(row[4]) for row in result],
+        "p5_med_mbar": [float(row[5]) for row in result],
     }
 
 @app.get("/pression_all/annee")
@@ -614,11 +743,11 @@ def pression_all_annee(nom_automate: str = Query(..., description="Nom de l'auto
     result = executer_requete_sql(query, (nom_automate,))
     return {
         "labels": [row[0].strip() for row in result],
-        "pression1_mbar": [float(row[1]) for row in result],
-        "pression2_mbar": [float(row[2]) for row in result],
-        "pression3_mbar": [float(row[3]) for row in result],
-        "pression4_mbar": [float(row[4]) for row in result],
-        "pression5_mbar": [float(row[5]) for row in result],
+        "p1_med_mbar": [float(row[1]) for row in result],
+        "p2_med_mbar": [float(row[2]) for row in result],
+        "p3_med_mbar": [float(row[3]) for row in result],
+        "p4_med_mbar": [float(row[4]) for row in result],
+        "p5_med_mbar": [float(row[5]) for row in result],
     }
 
 # -------------------
@@ -749,7 +878,7 @@ def temperature_jour(nom_automate: str = Query(..., description="Nom de l'automa
     result = executer_requete_sql(query, (nom_automate,))
     return {
         "labels": [row[0].strftime("%H:%M") for row in result],
-        "data": [row[1] for row in result],
+        "data": [float(row[1] or 0) / 10 for row in result],  # valeur en °C
     }
 
 @app.get("/temperature/semaine")
@@ -819,7 +948,7 @@ def ph_jour(nom_automate: str = Query(..., description="Nom de l'automate")):
     result = executer_requete_sql(query, (nom_automate,))
     return {
         "labels": [row[0].strftime("%H:%M") for row in result],
-        "data": [row[1] for row in result],
+        "data": [float(row[1] or 0) / 100 for row in result],  # valeur en pH
     }
 
 @app.get("/ph/semaine")
@@ -1049,47 +1178,78 @@ def recherche_automate_lca(
     # Cas 1️⃣ : on veut un automate précis
     if nom_automate:
         query = (
-            "SELECT nom_automate, client, lieu "
+            "SELECT nom_automate, client, lieu, email, email2, email3 "
             "FROM automate "
             "WHERE nom_automate = %s;"
         )
         rows = executer_requete_sql(query, (nom_automate,))
         if not rows:
-            return {"nom_automate": None, "client": None, "lieu": None}
+            return {"nom_automate": None, "client": None, "lieu": None, "email": None, "email2": None, "email3": None, "emails": []}
 
         row = rows[0]
-        return {"nom_automate": row[0], "client": row[1], "lieu": row[2]}
+        return {
+            "nom_automate": row[0],
+            "client": row[1],
+            "lieu": row[2],
+            "email": row[3],
+            "email2": row[4],
+            "email3": row[5],
+            "emails": [e for e in [row[3], row[4], row[5]] if e],
+        }
 
     # Cas 2️⃣ : pas de filtre ➜ on renvoie tout
-    query = "SELECT nom_automate, client, lieu FROM automate;"
+    query = "SELECT nom_automate, client, lieu, email, email2, email3 FROM automate;"
     rows = executer_requete_sql(query)
     return [
-        {"nom_automate": r[0], "client": r[1], "lieu": r[2]} for r in rows
+        {
+            "nom_automate": r[0],
+            "client": r[1],
+            "lieu": r[2],
+            "email": r[3],
+            "email2": r[4],
+            "email3": r[5],
+            "emails": [e for e in [r[3], r[4], r[5]] if e],
+        }
+        for r in rows
     ]
 
 # ---------------------------------------------------------------------------
 # ENDPOINTS CRUD SUR LA TABLE AUTOMATE (réservés aux admins côté front)
 # ---------------------------------------------------------------------------
 
-from pydantic import BaseModel
-
-
 class AutomateIn(BaseModel):
     nom_automate: str
     client: str
     lieu: str
+    email: str | None = None
+    email2: str | None = None
+    email3: str | None = None
 
 
 @app.post("/automate")
 def add_automate(auto: AutomateIn):
     """Ajoute un automate dans la table automate."""
+    def norm(v: str | None):
+        v = (v or "").strip().lower()
+        return v if v else None
+    emails = [norm(auto.email), norm(auto.email2), norm(auto.email3)]
     query = """
-        INSERT INTO automate (nom_automate, client, lieu)
-        VALUES (%s, %s, %s)
+        INSERT INTO automate (nom_automate, client, lieu, email, email2, email3)
+        VALUES (%s, %s, %s, %s, %s, %s)
         ON CONFLICT (nom_automate) DO NOTHING;
     """
     try:
-        executer_requete_sql(query, (auto.nom_automate, auto.client, auto.lieu))
+        executer_requete_sql(
+            query,
+            (
+                auto.nom_automate,
+                auto.client,
+                auto.lieu,
+                emails[0],
+                emails[1],
+                emails[2],
+            ),
+        )
         return {"status": "success"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -1098,6 +1258,9 @@ def add_automate(auto: AutomateIn):
 class AutomateUpdate(BaseModel):
     client: str | None = None
     lieu: str | None = None
+    email: str | None = None
+    email2: str | None = None
+    email3: str | None = None
 
 
 @app.put("/automate/{nom_automate}")
@@ -1111,6 +1274,18 @@ def update_automate(nom_automate: str, upd: AutomateUpdate):
     if upd.lieu is not None:
         fields.append("lieu   = %s")
         values.append(upd.lieu)
+    def norm(v: str | None):
+        v = (v or "").strip().lower()
+        return v if v else None
+    if upd.email is not None:
+        fields.append("email  = %s")
+        values.append(norm(upd.email))
+    if upd.email2 is not None:
+        fields.append("email2 = %s")
+        values.append(norm(upd.email2))
+    if upd.email3 is not None:
+        fields.append("email3 = %s")
+        values.append(norm(upd.email3))
 
     if not fields:
         return {"status": "error", "message": "Aucune donnée à mettre à jour"}
@@ -1165,6 +1340,536 @@ class MessageOut(BaseModel):
 def executer_requete_sql_one(query: str, params: tuple = ()):
     rows = executer_requete_sql(query, params)
     return rows[0] if rows else None
+
+
+# ---------------------------------------------------------------------------
+# Auth locale (passwords + token signé HMAC)
+# ---------------------------------------------------------------------------
+_AUTH_SECRET = os.getenv("AUTH_SECRET", "")
+_AUTH_TTL_SECONDS = int(os.getenv("AUTH_TTL_SECONDS", "86400"))
+_PBKDF2_ITER = int(os.getenv("AUTH_PBKDF2_ITER", "260000"))
+_AUTH_LOGGER = logging.getLogger("auth")
+
+
+def _get_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",", 1)[0].strip()
+    return request.client.host if request.client else ""
+
+
+def _auth_log(event: str, **fields: str) -> None:
+    payload = " ".join(f"{k}={v}" for k, v in fields.items() if v)
+    _AUTH_LOGGER.info("%s%s", event, f" {payload}" if payload else "")
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(data: str) -> bytes:
+    padding = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + padding)
+
+
+def _hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, _PBKDF2_ITER)
+    return f"pbkdf2_sha256${_PBKDF2_ITER}${_b64url(salt)}${_b64url(dk)}"
+
+
+def _verify_password(password: str, stored: str) -> bool:
+    try:
+        algo, iterations, salt_b64, hash_b64 = stored.split("$", 3)
+        if algo != "pbkdf2_sha256":
+            return False
+        iters = int(iterations)
+        salt = _b64url_decode(salt_b64)
+        expected = _b64url_decode(hash_b64)
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iters)
+        return hmac.compare_digest(dk, expected)
+    except Exception:
+        return False
+
+
+def _sign_token(payload: dict) -> str:
+    if not _AUTH_SECRET:
+        raise HTTPException(status_code=500, detail="AUTH_SECRET manquant")
+    body = _b64url(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    sig = hmac.new(_AUTH_SECRET.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).digest()
+    return f"{body}.{_b64url(sig)}"
+
+
+def _verify_token(token: str) -> dict:
+    if not _AUTH_SECRET:
+        raise HTTPException(status_code=500, detail="AUTH_SECRET manquant")
+    try:
+        body_b64, sig_b64 = token.split(".", 1)
+        expected = hmac.new(
+            _AUTH_SECRET.encode("utf-8"),
+            body_b64.encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+        if not hmac.compare_digest(_b64url(expected), sig_b64):
+            raise HTTPException(status_code=401, detail="Token invalide")
+        payload = json.loads(_b64url_decode(body_b64).decode("utf-8"))
+        exp = int(payload.get("exp", 0))
+        if exp and time.time() > exp:
+            raise HTTPException(status_code=401, detail="Token expiré")
+        return payload
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=401, detail="Token invalide")
+
+
+def _get_roles_for_user(user_id: int) -> list[str]:
+    rows = executer_requete_sql(
+        """
+        SELECT r.name
+        FROM user_roles ur
+        JOIN roles r ON r.id = ur.role_id
+        WHERE ur.user_id = %s
+        ORDER BY r.name;
+        """,
+        (user_id,),
+    )
+    return [r[0] for r in rows if r and r[0]]
+
+
+def _require_auth(request: Request) -> dict:
+    auth = request.headers.get("authorization") or ""
+    if not auth.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Bearer token manquant")
+    token = auth.split(" ", 1)[1].strip()
+    payload = _verify_token(token)
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Token invalide")
+    row = executer_requete_sql_one(
+        "SELECT id, email, is_active, client_id FROM users WHERE id = %s",
+        (user_id,),
+    )
+    if not row or not row[2]:
+        raise HTTPException(status_code=401, detail="Utilisateur inactif")
+    roles = _get_roles_for_user(row[0])
+    return {"id": row[0], "email": row[1], "roles": roles, "client_id": row[3]}
+
+
+def _get_org_for_user(user_id: int) -> Optional[tuple[int, str]]:
+    row = executer_requete_sql_one(
+        """
+        SELECT o.id, o.name
+        FROM organization_users ou
+        JOIN organizations o ON o.id = ou.organization_id
+        WHERE ou.user_id = %s
+        ORDER BY o.id
+        LIMIT 1;
+        """,
+        (user_id,),
+    )
+    return (row[0], row[1]) if row else None
+
+
+class AuthRegisterIn(BaseModel):
+    email: str
+    password: str
+
+
+class AuthLoginIn(BaseModel):
+    email: str
+    password: str
+
+
+@app.post("/auth/register")
+def register(payload: AuthRegisterIn):
+    email = (payload.email or "").strip().lower()
+    if "@" not in email:
+        raise HTTPException(status_code=400, detail="Email invalide")
+    if len(payload.password or "") < 8:
+        raise HTTPException(status_code=400, detail="Mot de passe trop court")
+    exists = executer_requete_sql_one("SELECT id FROM users WHERE email = %s", (email,))
+    if exists:
+        raise HTTPException(status_code=409, detail="Email déjà utilisé")
+    pw_hash = _hash_password(payload.password)
+    row = executer_requete_sql_one(
+        "INSERT INTO users (email, password_hash, is_active) VALUES (%s, %s, TRUE) RETURNING id, client_id",
+        (email, pw_hash),
+    )
+    if not row:
+        raise HTTPException(status_code=500, detail="Création utilisateur échouée")
+    role = executer_requete_sql_one("SELECT id FROM roles WHERE name = 'client'")
+    if role:
+        executer_requete_sql_one(
+            "INSERT INTO user_roles (user_id, role_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+            (row[0], role[0]),
+        )
+    roles = _get_roles_for_user(row[0])
+    token = _sign_token({"sub": row[0], "exp": int(time.time()) + _AUTH_TTL_SECONDS})
+    return {"token": token, "user": {"id": row[0], "email": email, "roles": roles, "client_id": row[1]}}
+
+
+@app.post("/auth/login")
+def login(payload: AuthLoginIn, request: Request):
+    email = (payload.email or "").strip().lower()
+    ip = _get_client_ip(request)
+    if not email:
+        _auth_log("login_failed", reason="empty_email", ip=ip)
+        raise HTTPException(status_code=401, detail="Identifiants invalides")
+    row = executer_requete_sql_one(
+        "SELECT id, password_hash, is_active, client_id FROM users WHERE email = %s",
+        (email,),
+    )
+    if not row or not row[2]:
+        reason = "user_missing_or_inactive"
+        if row and not row[2]:
+            reason = "user_inactive"
+        _auth_log("login_failed", reason=reason, email=email, ip=ip)
+        raise HTTPException(status_code=401, detail="Identifiants invalides")
+    if not row[1]:
+        _auth_log("login_failed", reason="missing_password_hash", email=email, ip=ip)
+        raise HTTPException(status_code=401, detail="Identifiants invalides")
+    if not _verify_password(payload.password or "", row[1]):
+        _auth_log("login_failed", reason="bad_password", email=email, ip=ip)
+        raise HTTPException(status_code=401, detail="Identifiants invalides")
+    roles = _get_roles_for_user(row[0])
+    token = _sign_token({"sub": row[0], "exp": int(time.time()) + _AUTH_TTL_SECONDS})
+    _auth_log("login_success", email=email, ip=ip)
+    return {"token": token, "user": {"id": row[0], "email": email, "roles": roles, "client_id": row[3]}}
+
+
+@app.get("/auth/me")
+def me(request: Request):
+    return _require_auth(request)
+
+
+# ---------------------------------------------------------------------------
+# Helpers accès admin (basé sur l'en-tête transmis par le front Auth0)
+# ---------------------------------------------------------------------------
+def _require_admin(request: Request) -> str:
+    """
+    Vérifie que l'appelant est admin.
+    Attend un bearer token valide.
+    Retourne l'email pour l'audit.
+    """
+    user = _require_auth(request)
+    if "admin" not in [r.lower() for r in user.get("roles", [])]:
+        raise HTTPException(status_code=403, detail="Accès réservé à l'admin")
+    return user.get("email") or ""
+
+
+def _require_super_admin(request: Request) -> dict:
+    user = _require_auth(request)
+    roles = [r.lower() for r in user.get("roles", [])]
+    if "super_admin" not in roles:
+        raise HTTPException(status_code=403, detail="Accès réservé au super admin")
+    return user
+
+
+def _require_admin_or_super(request: Request) -> dict:
+    user = _require_auth(request)
+    roles = [r.lower() for r in user.get("roles", [])]
+    if "admin" not in roles and "super_admin" not in roles:
+        raise HTTPException(status_code=403, detail="Accès réservé à l'admin")
+    return user
+
+
+@app.get("/my/automates")
+def list_my_automates(request: Request):
+    user = _require_auth(request)
+    roles = [r.lower() for r in user.get("roles", [])]
+    if "admin" in roles or "super_admin" in roles:
+        rows = executer_requete_sql("SELECT nom_automate, client, lieu, email, email2, email3 FROM automate;")
+    else:
+        org = _get_org_for_user(user["id"])
+        if not org:
+            return []
+        rows = executer_requete_sql(
+            """
+            SELECT nom_automate, client, lieu, email, email2, email3
+            FROM automate
+            WHERE lower(client) = lower(%s);
+            """,
+            (org[1],),
+        )
+    return [
+        {
+            "nom_automate": r[0],
+            "client": r[1],
+            "lieu": r[2],
+            "email": r[3],
+            "email2": r[4],
+            "email3": r[5],
+            "emails": [e for e in [r[3], r[4], r[5]] if e],
+        }
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# ENDPOINTS PANNES (ADMIN-ONLY)
+# ---------------------------------------------------------------------------
+
+
+class PanneIn(BaseModel):
+    client: str = Field(..., min_length=1)
+    lieu: str = Field(..., min_length=1)
+    nom_automate: str = Field(..., min_length=1)
+    panne: str = Field(..., min_length=1)
+    probleme: str = Field(..., min_length=1)
+    date_debut: datetime
+    date_fin: Optional[datetime] = None
+
+
+def _validate_automate(client: str, lieu: str, nom_automate: str):
+    row = executer_requete_sql_one(
+        "SELECT nom_automate FROM automate WHERE client = %s AND lieu = %s LIMIT 1",
+        (client, lieu),
+    )
+    if row is None:
+        raise HTTPException(status_code=400, detail="Couple client/lieu introuvable")
+    if str(row[0]) != str(nom_automate):
+        raise HTTPException(status_code=400, detail="nom_automate ne correspond pas")
+
+
+@app.get("/pannes/types")
+def pannes_types(request: Request):
+    """
+    ADMIN ONLY
+    Renvoie la liste persistante des types de pannes (défauts + types déjà saisis),
+    triée alphabétiquement (case-insensitive) et dédupliquée (case-insensitive).
+    """
+    _require_admin(request)
+
+    types_defaut = [
+        "Pompe HS",
+        "Pompe désamorcée",
+        "Filtre colmaté",
+        "Filtre saturé",
+        "Électrovanne HS",
+        "Vanne bloquée",
+        "Pressostat défectueux",
+        "Capteur niveau HS",
+        "Sonde conductivité HS",
+        "Fuite hydraulique",
+        "Fuite cuve",
+        "Cuve pleine",
+        "Cuve vide",
+        "Débordement",
+        "Manque produit chimique",
+        "Surdosage produit",
+        "Qualité eau insuffisante",
+        "Odeur anormale",
+        "Carte électronique HS",
+        "Erreur automate",
+        "Problème électrique",
+        "Disjonction",
+        "Air dans le circuit",
+        "Bobine eV HS",
+        "VAR 3 en défaut",
+    ]
+
+    rows = executer_requete_sql(
+        """
+        SELECT DISTINCT panne
+        FROM public.pannes
+        WHERE panne IS NOT NULL AND trim(panne) <> '';
+        """
+    )
+    types_db = [str(r[0]).strip() for r in rows if r and r[0] is not None and str(r[0]).strip()]
+
+    merged: dict[str, str] = {}
+    for s in types_defaut:
+        t = (s or "").strip()
+        if not t:
+            continue
+        merged.setdefault(t.casefold(), t)
+    for s in types_db:
+        t = (s or "").strip()
+        if not t:
+            continue
+        merged.setdefault(t.casefold(), t)
+
+    return sorted(merged.values(), key=lambda x: x.casefold())
+
+
+@app.options("/pannes/types")
+def pannes_types_options():
+    return {}
+
+
+@app.get("/pannes/clients")
+def pannes_clients(request: Request):
+    _require_admin(request)
+    rows = executer_requete_sql(
+        "SELECT DISTINCT client FROM automate WHERE client IS NOT NULL ORDER BY client;"
+    )
+    return [r[0] for r in rows if r and r[0]]
+
+
+@app.get("/pannes/stations")
+def pannes_stations(request: Request, client: str = Query(..., description="Client")):
+    _require_admin(request)
+    rows = executer_requete_sql(
+        "SELECT DISTINCT lieu FROM automate WHERE client = %s AND lieu IS NOT NULL ORDER BY lieu;",
+        (client,),
+    )
+    return [r[0] for r in rows if r and r[0]]
+
+
+@app.get("/pannes/automate")
+def pannes_automate(
+    request: Request,
+    client: str = Query(..., description="Client"),
+    lieu: str = Query(..., description="Station"),
+):
+    _require_admin(request)
+    row = executer_requete_sql_one(
+        "SELECT nom_automate FROM automate WHERE client = %s AND lieu = %s LIMIT 1;",
+        (client, lieu),
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Automate introuvable")
+    return {"nom_automate": row[0]}
+
+
+@app.get("/pannes")
+def lister_pannes(request: Request):
+    _require_admin(request)
+    rows = executer_requete_sql(
+        """
+        SELECT id, client, lieu, nom_automate, panne, probleme, date_debut, date_fin, created_by
+        FROM pannes
+        ORDER BY id DESC;
+        """
+    )
+    def _fmt(dt_val):
+        return dt_val.isoformat() if hasattr(dt_val, "isoformat") else dt_val
+
+    return [
+        {
+            "id": r[0],
+            "client": r[1],
+            "lieu": r[2],
+            "nom_automate": r[3],
+            "panne": r[4],
+            "probleme": r[5],
+            "date_debut": _fmt(r[6]),
+            "date_fin": _fmt(r[7]),
+            "created_by": r[8],
+        }
+        for r in rows
+    ]
+
+
+@app.post("/pannes")
+def creer_panne(p: PanneIn, request: Request):
+    email = _require_admin(request)
+
+    if p.date_fin and p.date_fin < p.date_debut:
+        raise HTTPException(status_code=400, detail="date_fin doit être >= date_debut")
+
+    _validate_automate(p.client, p.lieu, p.nom_automate)
+
+    row = executer_requete_sql_one(
+        """
+        INSERT INTO pannes (client, lieu, nom_automate, panne, probleme, date_debut, date_fin, created_by)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id;
+        """,
+        (
+            p.client,
+            p.lieu,
+            p.nom_automate,
+            p.panne,
+            p.probleme,
+            p.date_debut,
+            p.date_fin,
+            email or "",
+        ),
+    )
+    if row is None:
+        raise HTTPException(status_code=500, detail="Insertion panne échouée")
+
+    return {
+        "id": row[0],
+        "client": p.client,
+        "lieu": p.lieu,
+        "nom_automate": p.nom_automate,
+        "panne": p.panne,
+        "probleme": p.probleme,
+        "date_debut": p.date_debut.isoformat(),
+        "date_fin": p.date_fin.isoformat() if p.date_fin else None,
+        "created_by": email or "",
+    }
+
+
+@app.put("/pannes/{panne_id}")
+def maj_panne(panne_id: int, p: PanneIn, request: Request):
+    _require_admin(request)
+
+    if p.date_fin and p.date_fin < p.date_debut:
+        raise HTTPException(status_code=400, detail="date_fin doit être >= date_debut")
+
+    _validate_automate(p.client, p.lieu, p.nom_automate)
+
+    row = executer_requete_sql_one(
+        """
+        UPDATE pannes
+        SET client = %s,
+            lieu = %s,
+            nom_automate = %s,
+            panne = %s,
+            probleme = %s,
+            date_debut = %s,
+            date_fin = %s
+        WHERE id = %s
+        RETURNING id, client, lieu, nom_automate, panne, probleme, date_debut, date_fin, created_by;
+        """,
+        (
+            p.client,
+            p.lieu,
+            p.nom_automate,
+            p.panne,
+            p.probleme,
+            p.date_debut,
+            p.date_fin,
+            panne_id,
+        ),
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Panne introuvable")
+
+    def _fmt(dt_val):
+        return dt_val.isoformat() if hasattr(dt_val, "isoformat") else dt_val
+
+    return {
+        "id": row[0],
+        "client": row[1],
+        "lieu": row[2],
+        "nom_automate": row[3],
+        "panne": row[4],
+        "probleme": row[5],
+        "date_debut": _fmt(row[6]),
+        "date_fin": _fmt(row[7]),
+        "created_by": row[8],
+    }
+
+
+@app.options("/pannes/{panne_id}")
+def pannes_id_options():
+    return {}
+
+
+@app.delete("/pannes/{panne_id}")
+def supprimer_panne(panne_id: int, request: Request):
+    _require_admin(request)
+    row = executer_requete_sql_one(
+        "DELETE FROM pannes WHERE id = %s RETURNING id;", (panne_id,)
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Panne introuvable")
+    return {"status": "deleted", "id": panne_id}
 
 
 @app.get("/conversations", response_model=List[ConversationOut])
@@ -1292,6 +1997,304 @@ def get_clients(is_admin: bool = False):
         # Pour un client, on pourrait retourner juste le sien, mais pas vraiment utile
         return []
 
+
+# ---------------------------------------------------------------------------
+# SUPER ADMIN OVERVIEW
+# ---------------------------------------------------------------------------
+@app.get("/super_admin/overview")
+def super_admin_overview(request: Request):
+    _require_super_admin(request)
+
+    def _users_by_role(role_name: str):
+        rows = executer_requete_sql(
+            """
+            SELECT u.id, u.email, u.client_id
+            FROM users u
+            JOIN user_roles ur ON ur.user_id = u.id
+            JOIN roles r ON r.id = ur.role_id
+            WHERE r.name = %s
+            ORDER BY u.email;
+            """,
+            (role_name,),
+        )
+        return [{"id": r[0], "email": r[1], "client_id": r[2]} for r in rows]
+
+    super_admins = _users_by_role("super_admin")
+    admins = _users_by_role("admin")
+    accounts = executer_requete_sql(
+        "SELECT id, email, client_id FROM users WHERE client_id IS NOT NULL ORDER BY email;"
+    )
+    organizations = executer_requete_sql(
+        "SELECT DISTINCT client_id FROM users WHERE client_id IS NOT NULL ORDER BY client_id;"
+    )
+    clients = executer_requete_sql(
+        "SELECT DISTINCT client FROM automate WHERE client IS NOT NULL ORDER BY client;"
+    )
+
+    return {
+        "super_admins": super_admins,
+        "admins": admins,
+        "organizations": [r[0] for r in organizations if r and r[0]],
+        "accounts": [{"id": r[0], "email": r[1], "client_id": r[2]} for r in accounts],
+        "clients": [r[0] for r in clients if r and r[0]],
+    }
+
+
+class AccessAssignIn(BaseModel):
+    user_id: int
+    roles: list[str]
+    client_id: Optional[str] = None
+
+
+@app.get("/access/roles")
+def list_roles(request: Request):
+    _require_admin_or_super(request)
+    rows = executer_requete_sql("SELECT name FROM roles ORDER BY name;")
+    return [r[0] for r in rows if r and r[0]]
+
+
+@app.get("/access/users")
+def list_users(request: Request):
+    _require_admin_or_super(request)
+    rows = executer_requete_sql(
+        """
+        SELECT u.id, u.email, u.client_id, COALESCE(array_agg(r.name ORDER BY r.name) FILTER (WHERE r.name IS NOT NULL), '{}') AS roles
+        FROM users u
+        LEFT JOIN user_roles ur ON ur.user_id = u.id
+        LEFT JOIN roles r ON r.id = ur.role_id
+        GROUP BY u.id, u.email, u.client_id
+        ORDER BY u.email;
+        """
+    )
+    return [
+        {"id": r[0], "email": r[1], "client_id": r[2], "roles": list(r[3])}
+        for r in rows
+    ]
+
+
+@app.post("/access/assign")
+def assign_access(payload: AccessAssignIn, request: Request):
+    _require_admin_or_super(request)
+    roles = [r.strip().lower() for r in payload.roles if r and r.strip()]
+    client_id = (payload.client_id or "").strip() or None
+    # Update legacy organization link (used by chat + some UI)
+    executer_requete_sql(
+        "UPDATE users SET client_id = %s WHERE id = %s;",
+        (client_id, payload.user_id),
+    )
+    # Keep organizations table in sync when possible (email -> 1 org)
+    executer_requete_sql("DELETE FROM organization_users WHERE user_id = %s;", (payload.user_id,))
+    if client_id:
+        org_row = executer_requete_sql_one("SELECT id FROM organizations WHERE name = %s", (client_id,))
+        if org_row:
+            executer_requete_sql_one(
+                """
+                INSERT INTO organization_users (user_id, organization_id, org_role)
+                VALUES (%s, %s, 'employee')
+                ON CONFLICT (user_id, organization_id) DO UPDATE SET org_role = EXCLUDED.org_role;
+                """,
+                (payload.user_id, org_row[0]),
+            )
+    # Replace role set
+    executer_requete_sql("DELETE FROM user_roles WHERE user_id = %s;", (payload.user_id,))
+    for role_name in roles:
+        row = executer_requete_sql_one("SELECT id FROM roles WHERE name = %s", (role_name,))
+        if row:
+            executer_requete_sql_one(
+                "INSERT INTO user_roles (user_id, role_id) VALUES (%s, %s) ON CONFLICT DO NOTHING;",
+                (payload.user_id, row[0]),
+            )
+    return {"status": "success"}
+
+
+# ---------------------------------------------------------------------------
+# ORGANIZATIONS + AUTOMATES ACCESS (admin/super)
+# ---------------------------------------------------------------------------
+class OrganizationCreateIn(BaseModel):
+    name: str
+    admin_email: str
+
+
+class OrganizationUserIn(BaseModel):
+    email: str
+    org_role: str
+
+
+class AutomateAccessIn(BaseModel):
+    emails: list[str]
+
+
+@app.get("/orgs")
+def list_orgs(request: Request):
+    _require_admin_or_super(request)
+    rows = executer_requete_sql("SELECT id, name FROM organizations ORDER BY name;")
+    return [{"id": r[0], "name": r[1]} for r in rows]
+
+
+@app.post("/orgs")
+def create_org(payload: OrganizationCreateIn, request: Request):
+    _require_admin_or_super(request)
+    name = (payload.name or "").strip()
+    admin_email = (payload.admin_email or "").strip().lower()
+    if not name or "@" not in admin_email:
+        raise HTTPException(status_code=400, detail="Données invalides")
+
+    user_row = executer_requete_sql_one("SELECT id FROM users WHERE email = %s", (admin_email,))
+    if not user_row:
+        raise HTTPException(status_code=400, detail="Utilisateur introuvable (créer un compte d'abord)")
+
+    org_row = executer_requete_sql_one(
+        "INSERT INTO organizations (name) VALUES (%s) ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id",
+        (name,),
+    )
+    if not org_row:
+        raise HTTPException(status_code=500, detail="Création organisation échouée")
+
+    executer_requete_sql_one(
+        """
+        INSERT INTO organization_users (user_id, organization_id, org_role)
+        VALUES (%s, %s, 'org_admin')
+        ON CONFLICT (user_id, organization_id) DO UPDATE SET org_role = 'org_admin';
+        """,
+        (user_row[0], org_row[0]),
+    )
+    # Compat front historique
+    executer_requete_sql_one("UPDATE users SET client_id = %s WHERE id = %s", (name, user_row[0]))
+    return {"id": org_row[0], "name": name}
+
+
+@app.get("/orgs/{org_id}/users")
+def list_org_users(org_id: int, request: Request):
+    _require_admin_or_super(request)
+    rows = executer_requete_sql(
+        """
+        SELECT u.id, u.email, ou.org_role
+        FROM organization_users ou
+        JOIN users u ON u.id = ou.user_id
+        WHERE ou.organization_id = %s
+        ORDER BY u.email;
+        """,
+        (org_id,),
+    )
+    return [{"id": r[0], "email": r[1], "org_role": r[2]} for r in rows]
+
+
+@app.post("/orgs/{org_id}/users")
+def add_org_user(org_id: int, payload: OrganizationUserIn, request: Request):
+    _require_admin_or_super(request)
+    email = (payload.email or "").strip().lower()
+    org_role = (payload.org_role or "").strip().lower()
+    if org_role not in ("org_admin", "employee"):
+        raise HTTPException(status_code=400, detail="Rôle org invalide")
+    user_row = executer_requete_sql_one("SELECT id FROM users WHERE email = %s", (email,))
+    if not user_row:
+        raise HTTPException(status_code=400, detail="Utilisateur introuvable (créer un compte d'abord)")
+    # email = 1 organisation
+    executer_requete_sql_one("DELETE FROM organization_users WHERE user_id = %s", (user_row[0],))
+    if org_role == "org_admin":
+        executer_requete_sql_one(
+            "UPDATE organization_users SET org_role = 'employee' WHERE organization_id = %s AND user_id <> %s;",
+            (org_id, user_row[0]),
+        )
+    executer_requete_sql_one(
+        """
+        INSERT INTO organization_users (user_id, organization_id, org_role)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (user_id, organization_id) DO UPDATE SET org_role = EXCLUDED.org_role;
+        """,
+        (user_row[0], org_id, org_role),
+    )
+    # Compat front historique (stations/chat)
+    org_name_row = executer_requete_sql_one("SELECT name FROM organizations WHERE id = %s", (org_id,))
+    if org_name_row and org_name_row[0]:
+        executer_requete_sql_one("UPDATE users SET client_id = %s WHERE id = %s", (org_name_row[0], user_row[0]))
+    return {"status": "success"}
+
+
+@app.delete("/orgs/{org_id}/users/{user_id}")
+def remove_org_user(org_id: int, user_id: int, request: Request):
+    _require_admin_or_super(request)
+    executer_requete_sql_one(
+        "DELETE FROM organization_users WHERE organization_id = %s AND user_id = %s",
+        (org_id, user_id),
+    )
+    # email = 1 organisation (donc suppression => plus d'org)
+    executer_requete_sql_one("UPDATE users SET client_id = NULL WHERE id = %s", (user_id,))
+    return {"status": "deleted"}
+
+
+@app.get("/orgs/{org_id}/automates")
+def list_org_automates(org_id: int, request: Request):
+    _require_admin_or_super(request)
+    org_row = executer_requete_sql_one("SELECT name FROM organizations WHERE id = %s", (org_id,))
+    if not org_row:
+        raise HTTPException(status_code=404, detail="Organisation introuvable")
+    org_name = org_row[0]
+    rows = executer_requete_sql(
+        """
+        SELECT nom_automate, numero_automate, lieu, email, email2, email3
+        FROM automate
+        WHERE organization_id = %s OR lower(client) = lower(%s)
+        ORDER BY nom_automate;
+        """,
+        (org_id, org_name),
+    )
+    return [
+        {
+            "nom_automate": r[0],
+            "numero_automate": r[1],
+            "lieu": r[2],
+            "emails": [e for e in [r[3], r[4], r[5]] if e],
+        }
+        for r in rows
+    ]
+
+
+@app.get("/automates/{nom_automate}/access")
+def list_automate_access(nom_automate: str, request: Request):
+    _require_admin_or_super(request)
+    rows = executer_requete_sql(
+        """
+        SELECT u.id, u.email
+        FROM automate_access aa
+        JOIN users u ON u.id = aa.user_id
+        WHERE aa.automate_nom = %s
+        ORDER BY u.email;
+        """,
+        (nom_automate,),
+    )
+    return [{"id": r[0], "email": r[1]} for r in rows]
+
+
+@app.post("/automates/{nom_automate}/access")
+def set_automate_access(nom_automate: str, payload: AutomateAccessIn, request: Request):
+    _require_admin_or_super(request)
+    emails = [e.strip().lower() for e in payload.emails if e and e.strip()]
+    if not emails:
+        raise HTTPException(status_code=400, detail="Aucun email")
+
+    missing = []
+    user_ids = []
+    for email in emails:
+        row = executer_requete_sql_one("SELECT id FROM users WHERE email = %s", (email,))
+        if not row:
+            missing.append(email)
+        else:
+            user_ids.append(row[0])
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Comptes introuvables: {', '.join(missing)}")
+
+    executer_requete_sql_one(
+        "DELETE FROM automate_access WHERE automate_nom = %s",
+        (nom_automate,),
+    )
+    for uid in user_ids:
+        executer_requete_sql_one(
+            "INSERT INTO automate_access (automate_nom, user_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+            (nom_automate, uid),
+        )
+    return {"status": "success"}
+
 @app.get("/messages/{client_id}", response_model=List[MessageOut])
 def get_messages_for_client(client_id: str):
     """Récupère tous les messages pour un client donné."""
@@ -1374,6 +2377,22 @@ def notifications_admin(client_id: str):
     return {"count": int(row[0]) if row else 0}
 
 
+@app.get("/notifications/admin_all")
+def notifications_admin_all():
+    """Counts non lus envoyés par les clients (pour un admin), groupés par client_id."""
+    rows = executer_requete_sql(
+        """
+        SELECT client_id, COUNT(*)::int
+        FROM messages
+        WHERE is_read = false
+          AND sender_id = ANY(%s)
+        GROUP BY client_id;
+        """,
+        (list(CLIENT_SENDER_IDS),),
+    )
+    return {str(r[0]): int(r[1]) for r in rows if r and r[0] is not None}
+
+
 @app.post("/messages_client/{client_id}/marquer_non_lu")
 def marquer_messages_admin_lus(client_id: str):
     """Marque comme lus les messages envoyés par l'admin au client."""
@@ -1407,4 +2426,5 @@ def marquer_messages_client_lus(client_id: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8011)
+    port = int(os.getenv("PORT", "8011"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
