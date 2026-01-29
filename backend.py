@@ -72,10 +72,10 @@ async def _force_cors_headers(request, call_next):
     return resp
 
 _DB_DSN = {
-    "dbname": os.getenv("DB_NAME", "EaukeyCloudSQLv1"),
-    "user": os.getenv("DB_USER", "romain"),
-    "password": os.getenv("DB_PASSWORD", "Lzl?h<P@zxle6xuL"),
-    "host": os.getenv("DB_HOST", "35.195.185.218"),
+    "dbname": os.getenv("DB_NAME"),
+    "user": os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASSWORD"),
+    "host": os.getenv("DB_HOST"),
     "connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", "5")),
 }
 
