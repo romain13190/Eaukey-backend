@@ -6,8 +6,8 @@ import base64
 import hashlib
 import hmac
 import json
-import psycopg2
-from psycopg2.pool import SimpleConnectionPool, ThreadedConnectionPool
+import psycopg
+from psycopg_pool import ConnectionPool
 import threading
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import date, datetime
@@ -79,7 +79,7 @@ _DB_DSN = {
     "connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", "5")),
 }
 
-_pool: ThreadedConnectionPool | None = None
+_pool: ConnectionPool | None = None
 _pool_sem: threading.BoundedSemaphore | None = None
 _conn_checked_out: set[int] = set()
 _conn_sem_acquired: set[int] = set()
@@ -88,12 +88,16 @@ _STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "10000"))
 _POOL_WAIT_TIMEOUT = float(os.getenv("DB_POOL_WAIT_TIMEOUT", "2"))
 
 
-def _get_pool() -> ThreadedConnectionPool:
+def _dsn_to_conninfo() -> str:
+    return " ".join(f"{k}={v}" for k, v in _DB_DSN.items() if v is not None)
+
+
+def _get_pool() -> ConnectionPool:
     global _pool, _pool_sem
     if _pool is None:
         max_conn = int(os.getenv("DB_MAX_CONN", "50"))
         # Pool thread-safe pour supporter le parallélisme FastAPI
-        _pool = ThreadedConnectionPool(1, max_conn, **_DB_DSN)
+        _pool = ConnectionPool(conninfo=_dsn_to_conninfo(), min_size=1, max_size=max_conn)
         _pool_sem = threading.BoundedSemaphore(max_conn)
     return _pool
 
