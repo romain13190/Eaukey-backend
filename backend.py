@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query, HTTPException, Request
+from fastapi import FastAPI, Query, HTTPException, Request, BackgroundTasks
 import logging
 from typing import List, Tuple, Optional, Union
 from pydantic import BaseModel, Field
@@ -17,6 +17,9 @@ import secrets
 import time
 from pathlib import Path
 from dotenv import load_dotenv
+import aiosmtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 load_dotenv()
 
 # Création de l'instance FastAPI
@@ -1354,6 +1357,15 @@ _AUTH_TTL_SECONDS = int(os.getenv("AUTH_TTL_SECONDS", "86400"))
 _PBKDF2_ITER = int(os.getenv("AUTH_PBKDF2_ITER", "260000"))
 _AUTH_LOGGER = logging.getLogger("auth")
 
+# SMTP Configuration (for password reset emails)
+_SMTP_HOST = os.getenv("SMTP_HOST", "")
+_SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+_SMTP_USER = os.getenv("SMTP_USER", "")
+_SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+_SMTP_FROM = os.getenv("SMTP_FROM", "noreply@eaukey.com")
+_FRONTEND_URL = os.getenv("FRONTEND_URL", "https://my-app-zeta-blue.vercel.app")
+_RESET_TOKEN_TTL_SECONDS = int(os.getenv("RESET_TOKEN_TTL_SECONDS", "3600"))  # 1 hour
+
 
 def _get_client_ip(request: Request) -> str:
     forwarded = request.headers.get("x-forwarded-for")
@@ -1545,6 +1557,273 @@ def login(payload: AuthLoginIn, request: Request):
 @app.get("/auth/me")
 def me(request: Request):
     return _require_auth(request)
+
+
+# ---------------------------------------------------------------------------
+# Password Reset (Forgot Password)
+# ---------------------------------------------------------------------------
+
+class ForgotPasswordIn(BaseModel):
+    email: str
+
+
+class ResetPasswordIn(BaseModel):
+    token: str
+    password: str
+
+
+async def _send_reset_email(email: str, reset_token: str) -> bool:
+    """Send password reset email via SMTP."""
+    if not _SMTP_HOST or not _SMTP_USER or not _SMTP_PASSWORD:
+        _AUTH_LOGGER.warning("SMTP not configured, cannot send reset email")
+        return False
+
+    reset_link = f"{_FRONTEND_URL}/reset-password?token={reset_token}"
+
+    # Create HTML email
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <style>
+            body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
+            .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
+            .button {{
+                display: inline-block;
+                padding: 12px 24px;
+                background-color: #3b82f6;
+                color: white;
+                text-decoration: none;
+                border-radius: 6px;
+                margin: 20px 0;
+            }}
+            .footer {{ margin-top: 30px; font-size: 12px; color: #666; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h2>Réinitialisation de votre mot de passe</h2>
+            <p>Bonjour,</p>
+            <p>Vous avez demandé la réinitialisation de votre mot de passe sur Eaukey.</p>
+            <p>Cliquez sur le bouton ci-dessous pour créer un nouveau mot de passe :</p>
+            <a href="{reset_link}" class="button">Réinitialiser mon mot de passe</a>
+            <p>Ou copiez ce lien dans votre navigateur :</p>
+            <p style="word-break: break-all; color: #3b82f6;">{reset_link}</p>
+            <p><strong>Ce lien expire dans 1 heure.</strong></p>
+            <p>Si vous n'avez pas demandé cette réinitialisation, ignorez simplement cet email.</p>
+            <div class="footer">
+                <p>— L'équipe Eaukey</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+    text_content = f"""
+Réinitialisation de votre mot de passe
+
+Bonjour,
+
+Vous avez demandé la réinitialisation de votre mot de passe sur Eaukey.
+
+Cliquez sur ce lien pour créer un nouveau mot de passe :
+{reset_link}
+
+Ce lien expire dans 1 heure.
+
+Si vous n'avez pas demandé cette réinitialisation, ignorez simplement cet email.
+
+— L'équipe Eaukey
+    """
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = "Réinitialisation de votre mot de passe - Eaukey"
+    msg["From"] = _SMTP_FROM
+    msg["To"] = email
+
+    msg.attach(MIMEText(text_content, "plain", "utf-8"))
+    msg.attach(MIMEText(html_content, "html", "utf-8"))
+
+    try:
+        await aiosmtplib.send(
+            msg,
+            hostname=_SMTP_HOST,
+            port=_SMTP_PORT,
+            username=_SMTP_USER,
+            password=_SMTP_PASSWORD,
+            start_tls=True,
+        )
+        _AUTH_LOGGER.info(f"Reset email sent to {email}")
+        return True
+    except Exception as e:
+        _AUTH_LOGGER.error(f"Failed to send reset email to {email}: {e}")
+        return False
+
+
+def _generate_reset_token() -> str:
+    """Generate a secure random token for password reset."""
+    return secrets.token_hex(32)  # 64 characters
+
+
+def _cleanup_expired_tokens() -> None:
+    """Remove expired password reset tokens."""
+    try:
+        executer_requete_sql_one(
+            "DELETE FROM password_reset_tokens WHERE expires_at < NOW() OR used = TRUE"
+        )
+    except Exception:
+        pass  # Table might not exist yet
+
+
+@app.post("/auth/forgot-password")
+async def forgot_password(payload: ForgotPasswordIn, request: Request, background_tasks: BackgroundTasks):
+    """
+    Request a password reset email.
+    Always returns success to prevent email enumeration.
+    """
+    email = (payload.email or "").strip().lower()
+    ip = _get_client_ip(request)
+
+    if "@" not in email:
+        # Still return success to prevent enumeration
+        return {"message": "Si cet email existe, un lien de réinitialisation a été envoyé."}
+
+    # Check if user exists
+    row = executer_requete_sql_one(
+        "SELECT id, is_active FROM users WHERE email = %s",
+        (email,),
+    )
+
+    if not row or not row[1]:
+        _auth_log("forgot_password_user_not_found", email=email, ip=ip)
+        # Return same message to prevent email enumeration
+        return {"message": "Si cet email existe, un lien de réinitialisation a été envoyé."}
+
+    user_id = row[0]
+
+    # Rate limiting: check recent requests (max 3 per hour)
+    recent = executer_requete_sql_one(
+        """
+        SELECT COUNT(*) FROM password_reset_tokens
+        WHERE user_id = %s AND created_at > NOW() - INTERVAL '1 hour'
+        """,
+        (user_id,),
+    )
+    if recent and recent[0] >= 3:
+        _auth_log("forgot_password_rate_limited", email=email, ip=ip)
+        return {"message": "Si cet email existe, un lien de réinitialisation a été envoyé."}
+
+    # Invalidate previous unused tokens for this user
+    executer_requete_sql_one(
+        "UPDATE password_reset_tokens SET used = TRUE WHERE user_id = %s AND used = FALSE",
+        (user_id,),
+    )
+
+    # Generate new token
+    reset_token = _generate_reset_token()
+    expires_at = datetime.utcnow().timestamp() + _RESET_TOKEN_TTL_SECONDS
+
+    # Store token in database
+    executer_requete_sql_one(
+        """
+        INSERT INTO password_reset_tokens (user_id, token, expires_at, created_at)
+        VALUES (%s, %s, TO_TIMESTAMP(%s), NOW())
+        """,
+        (user_id, reset_token, expires_at),
+    )
+
+    _auth_log("forgot_password_requested", email=email, ip=ip)
+
+    # Send email in background
+    background_tasks.add_task(_send_reset_email, email, reset_token)
+
+    return {"message": "Si cet email existe, un lien de réinitialisation a été envoyé."}
+
+
+@app.post("/auth/reset-password")
+def reset_password(payload: ResetPasswordIn, request: Request):
+    """
+    Reset password using a valid token.
+    """
+    token = (payload.token or "").strip()
+    password = payload.password or ""
+    ip = _get_client_ip(request)
+
+    if not token:
+        raise HTTPException(status_code=400, detail="Token manquant")
+
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Le mot de passe doit contenir au moins 8 caractères")
+
+    # Find valid token
+    row = executer_requete_sql_one(
+        """
+        SELECT prt.id, prt.user_id, u.email
+        FROM password_reset_tokens prt
+        JOIN users u ON u.id = prt.user_id
+        WHERE prt.token = %s
+          AND prt.used = FALSE
+          AND prt.expires_at > NOW()
+          AND u.is_active = TRUE
+        """,
+        (token,),
+    )
+
+    if not row:
+        _auth_log("reset_password_invalid_token", ip=ip)
+        raise HTTPException(status_code=400, detail="Lien invalide ou expiré")
+
+    token_id, user_id, email = row[0], row[1], row[2]
+
+    # Hash new password
+    pw_hash = _hash_password(password)
+
+    # Update password
+    executer_requete_sql_one(
+        "UPDATE users SET password_hash = %s WHERE id = %s",
+        (pw_hash, user_id),
+    )
+
+    # Mark token as used
+    executer_requete_sql_one(
+        "UPDATE password_reset_tokens SET used = TRUE WHERE id = %s",
+        (token_id,),
+    )
+
+    _auth_log("reset_password_success", email=email, ip=ip)
+
+    # Cleanup expired tokens in background
+    _cleanup_expired_tokens()
+
+    return {"message": "Mot de passe réinitialisé avec succès"}
+
+
+@app.get("/auth/verify-reset-token")
+def verify_reset_token(token: str = Query(...)):
+    """
+    Verify if a reset token is valid (for frontend validation before showing form).
+    """
+    if not token:
+        raise HTTPException(status_code=400, detail="Token manquant")
+
+    row = executer_requete_sql_one(
+        """
+        SELECT prt.id, u.email
+        FROM password_reset_tokens prt
+        JOIN users u ON u.id = prt.user_id
+        WHERE prt.token = %s
+          AND prt.used = FALSE
+          AND prt.expires_at > NOW()
+          AND u.is_active = TRUE
+        """,
+        (token,),
+    )
+
+    if not row:
+        raise HTTPException(status_code=400, detail="Lien invalide ou expiré")
+
+    return {"valid": True, "email": row[1]}
 
 
 # ---------------------------------------------------------------------------
