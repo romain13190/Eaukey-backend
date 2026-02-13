@@ -1,6 +1,7 @@
 # etl_donnees_annees_incremental.py
 # Python 3.10+ | SQLAlchemy + pg8000 | Connexion directe
 
+import argparse
 import sqlalchemy
 from sqlalchemy import text
 from sqlalchemy.engine import URL
@@ -22,7 +23,7 @@ CREATE TABLE IF NOT EXISTS donnees_annees (
   -- Taux de recyclage (0..1)
   taux_recyclage         numeric,
 
-  -- Désinfection (depuis mesures.chlore_mv/2.5)
+  -- Désinfection (depuis mesures.chlore_mv/3.0)
   taux_desinfection_avg  numeric,
   taux_desinfection_med  numeric,
 
@@ -101,8 +102,8 @@ desinf_ph AS (
   SELECT
     date_trunc('month', (horodatage AT TIME ZONE 'Europe/Paris'))::date AS mois_debut,
     nom_automate,
-    ROUND(AVG((chlore_mv / 2.5)::numeric), 2)                                          AS taux_desinfection_avg,
-    ROUND((percentile_cont(0.5) WITHIN GROUP (ORDER BY (chlore_mv / 2.5)))::numeric, 2) AS taux_desinfection_med,
+    ROUND(AVG((chlore_mv / 3.0)::numeric), 2)                                          AS taux_desinfection_avg,
+    ROUND((percentile_cont(0.5) WITHIN GROUP (ORDER BY (chlore_mv / 3.0)))::numeric, 2) AS taux_desinfection_med,
     ROUND(AVG((ph / 100.0)::numeric), 2)                                               AS ph_moyen,
     ROUND((percentile_cont(0.5) WITHIN GROUP (ORDER BY (ph / 100.0)))::numeric, 2)     AS ph_med
   FROM mesures, bounds
@@ -146,7 +147,17 @@ final AS (
     v.vol_adoucie_m3,
     v.vol_relevage_m3,
     v.conso_kwh,
-    LEAST(GREATEST(COALESCE((v.vol_renvoi_m3::numeric / NULLIF(v.vol_renvoi_m3 + v.vol_adoucie_m3, 0)), 0), 0), 1) AS taux_recyclage,
+    COALESCE(
+      LEAST(
+        GREATEST(
+          (v.vol_renvoi_m3 - v.vol_adoucie_m3)
+            / NULLIF(v.vol_renvoi_m3, 0),
+          0
+        ),
+        1
+      ),
+      0
+    ) AS taux_recyclage,
     d.taux_desinfection_avg,
     d.taux_desinfection_med,
     p.p1_mbar, p.p2_mbar, p.p3_mbar, p.p4_mbar, p.p5_mbar,
@@ -254,7 +265,7 @@ def _setup_logger(name: str) -> logging.Logger:
 
 logger = _setup_logger("etl.annee")
 
-def run(engine: sqlalchemy.engine.base.Engine):
+def run(engine: sqlalchemy.engine.base.Engine, rebuild: bool = False):
     logger.info("run: start")
     try:
         with engine.begin() as conn:
@@ -270,9 +281,13 @@ def run(engine: sqlalchemy.engine.base.Engine):
                 return
 
             conn.execute(text(DDL_CREATE))
-            # 1) Efface {M-5 .. M} puis insère les calculs depuis mesures
-            res = conn.execute(text(DELETE_WINDOW_LAST_SIX))
-            logger.info(f"delete_window_last_six.rowcount={res.rowcount}")
+            if rebuild:
+                logger.info("REBUILD: truncating donnees_annees")
+                conn.execute(text("TRUNCATE donnees_annees"))
+            else:
+                # 1) Efface {M-5 .. M} puis insère les calculs depuis mesures
+                res = conn.execute(text(DELETE_WINDOW_LAST_SIX))
+                logger.info(f"delete_window_last_six.rowcount={res.rowcount}")
             res = conn.execute(text(INSERT_LAST_SIX_FROM_MESURES))
             logger.info(f"insert_last_six_from_mesures.rowcount={res.rowcount}")
             # 2) Purge au-delà de 12 mois glissants
@@ -284,15 +299,19 @@ def run(engine: sqlalchemy.engine.base.Engine):
     logger.info("run: success")
 
 # --- Entrées "Cloud job" & exécution CLI ---
-def main(request=None):
+def main(request=None, rebuild=False):
     engine = connect_with_connector()
-    run(engine)
+    run(engine, rebuild=rebuild)
     return "done"
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--rebuild", action="store_true",
+                        help="Truncate destination table and recalculate from scratch")
+    args = parser.parse_args()
     try:
         logger.info("ETL annee: start")
-        result = main()
+        result = main(rebuild=args.rebuild)
         logger.info("ETL annee: done")
         print(result)
     except Exception:

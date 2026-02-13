@@ -1,6 +1,7 @@
 # etl_donnees_last24.py
 # Python 3.10+ | SQLAlchemy + pg8000 | Connexion directe
 
+import argparse
 import sqlalchemy
 from sqlalchemy import text
 from sqlalchemy.engine import URL
@@ -131,25 +132,30 @@ def _setup_logger(name: str) -> logging.Logger:
 
 logger = _setup_logger("etl.last24")
 
-def run(engine: sqlalchemy.engine.base.Engine):
+def run(engine: sqlalchemy.engine.base.Engine, rebuild: bool = False):
     with engine.begin() as conn:
-        # Si tu veux raisonner en heure locale SQL:
-        # conn.execute(text("SET LOCAL TIME ZONE 'Europe/Paris'"))
         conn.execute(text(DDL_CREATE))
+        if rebuild:
+            logger.info("REBUILD: truncating donnees_last24")
+            conn.execute(text("TRUNCATE donnees_last24"))
         conn.execute(text(UPSERT_LAST24))
         conn.execute(text(CLEANUP_OLD))
     logger.info("OK: donnees_last24 mis à jour (fenêtre glissante 24h, dédupliquée, tous clients).")
 
-def main(*args):
-    """Point d’entrée du script ETL."""
+def main(rebuild=False):
+    """Point d'entrée du script ETL."""
     engine = connect_with_connector()
-    run(engine)
+    run(engine, rebuild=rebuild)
     return "OK", 200
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--rebuild", action="store_true",
+                        help="Truncate destination table and recalculate from scratch")
+    args = parser.parse_args()
     try:
         logger.info("ETL last24: start")
-        result = main()
+        result = main(rebuild=args.rebuild)
         logger.info("ETL last24: done")
         print(result)
     except Exception:

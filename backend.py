@@ -520,169 +520,77 @@ def avg_pression5_mois(nom_automate: str = Query(..., description="Nom de l'auto
 def avg_pression5_annee(nom_automate: str = Query(..., description="Nom de l'automate")):
     return fetch_annee_simple(nom_automate, "p5_mbar")
 
-@app.get("/taux_recyclage/jour")
-def taux_recyclage_jour(nom_automate: str = Query(..., description="Nom de l'automate")):
+@app.get("/temps_reel/taux_recyclage")
+def temps_reel_taux_recyclage(nom_automate: str = Query(..., description="Nom de l'automate")):
+    """Taux de recyclage instantane calcule sur les dernieres 24h :
+    (vol_renvoi - vol_adoucie) / vol_renvoi"""
     query = """
-    WITH w AS (
+    WITH bornes AS (
+        SELECT
+            MAX(compteur_eau_renvoi_m3)  - MIN(compteur_eau_renvoi_m3)  AS vol_renvoi,
+            MAX(compteur_eau_adoucie_m3) - MIN(compteur_eau_adoucie_m3) AS vol_adoucie,
+            MAX(horodatage) AS dernier_ts
+        FROM mesures
+        WHERE nom_automate = %s
+          AND horodatage >= NOW() - INTERVAL '24 hours'
+          AND compteur_eau_renvoi_m3 IS NOT NULL
+          AND compteur_eau_adoucie_m3 IS NOT NULL
+    )
     SELECT
-        horodatage,
-        nom_automate,
-        compteur_eau_adoucie_m3,
-        compteur_eau_renvoi_m3
-    FROM   mesures
-    WHERE  nom_automate = %s
-      AND  horodatage  >= NOW() - INTERVAL '24 hours'
-      AND  horodatage  <  NOW()
-),
-deltas AS (
-    SELECT
-        date_trunc('hour', horodatage) AS heure_ts,
-        GREATEST(
-            compteur_eau_adoucie_m3
-          - LAG(compteur_eau_adoucie_m3)
-              OVER (PARTITION BY nom_automate ORDER BY horodatage),
-            0
-        ) AS vol_adoucie,
-        GREATEST(
-            compteur_eau_renvoi_m3
-          - LAG(compteur_eau_renvoi_m3)
-              OVER (PARTITION BY nom_automate ORDER BY horodatage),
-            0
-        ) AS vol_renvoi
-    FROM w
-),
-par_heure AS (
-    SELECT
-        heure_ts,
-        SUM(vol_adoucie) AS vol_adoucie,
-        SUM(vol_renvoi)  AS vol_renvoi
-    FROM   deltas
-    GROUP  BY heure_ts
-)
-SELECT
-    TO_CHAR(heure_ts, 'HH24:MI')                AS heure_label,
-    CASE
-        WHEN vol_renvoi = 0 THEN 0
-        ELSE ROUND(((vol_renvoi - vol_adoucie) / vol_renvoi)::numeric, 2)
-    END                                         AS taux_recyclage
-FROM   par_heure
-ORDER  BY heure_ts;
+        dernier_ts,
+        CASE
+            WHEN vol_renvoi = 0 OR vol_renvoi IS NULL THEN 0
+            ELSE ROUND(((vol_renvoi - vol_adoucie) / vol_renvoi)::numeric, 4)
+        END AS taux_recyclage
+    FROM bornes;
     """
-
     result = executer_requete_sql(query, (nom_automate,))
-    return formater_series(result, timeframe="jour")
+    if not result or not result[0][0]:
+        return {"horodatage": None, "valeur": 0}
+    return {
+        "horodatage": result[0][0].strftime("%Y-%m-%d %H:%M:%S"),
+        "valeur": float(result[0][1]) if result[0][1] is not None else 0
+    }
 
 @app.get("/taux_recyclage/semaine")
 def taux_recyclage_semaine(nom_automate: str = Query(..., description="Nom de l'automate")):
-    query = """
-    SELECT
-      to_char(jour, 'FMDay') AS day_name,
-      CASE
-        WHEN vol_renvoi_m3 = 0 THEN 0
-        ELSE ROUND(((vol_renvoi_m3 - vol_adoucie_m3) / vol_renvoi_m3)::numeric, 2)
-      END AS taux_recyclage
-    FROM donnees_semaine
-    WHERE nom_automate = %s
-    ORDER BY jour;
-    """
-    return formater_series(executer_requete_sql(query, (nom_automate,)), timeframe="semaine")
+    return fetch_semaine_simple(nom_automate, "taux_recyclage")
 
 @app.get("/taux_recyclage/mois")
 def taux_recyclage_mois(nom_automate: str = Query(..., description="Nom de l'automate")):
-    query = """
-    SELECT
-      to_char(semaine_debut, 'YYYY-MM-DD') AS week_label,
-      CASE
-        WHEN vol_renvoi_m3 = 0 THEN 0
-        ELSE ROUND(((vol_renvoi_m3 - vol_adoucie_m3) / vol_renvoi_m3)::numeric, 2)
-      END AS taux_recyclage
-    FROM donnees_mois
-    WHERE nom_automate = %s
-    ORDER BY semaine_debut;
-    """
-    return formater_series(executer_requete_sql(query, (nom_automate,)), timeframe="mois")
+    return fetch_mois_simple(nom_automate, "taux_recyclage")
 
 @app.get("/taux_recyclage/annee")
 def taux_recyclage_annee(nom_automate: str = Query(..., description="Nom de l'automate")):
-    query = """
-    SELECT
-      to_char(mois_debut, 'FMMonth') AS month_label,
-      CASE
-        WHEN vol_renvoi_m3 = 0 THEN 0
-        ELSE ROUND(((vol_renvoi_m3 - vol_adoucie_m3) / vol_renvoi_m3)::numeric, 2)
-      END AS taux_recyclage
-    FROM donnees_annees
-    WHERE nom_automate = %s
-    ORDER BY mois_debut;
-    """
-    return formater_series(executer_requete_sql(query, (nom_automate,)), timeframe="annee")
+    return fetch_annee_simple(nom_automate, "taux_recyclage")
 
 @app.get("/taux_desinfection/jour")
 def taux_desinfection_jour(nom_automate: str = Query(..., description="Nom de l'automate")):
     query = """
-WITH heures AS (
-    SELECT generate_series(
-               date_trunc('hour', NOW() - INTERVAL '23 hours'),
-               date_trunc('hour', NOW()),
-               '1 hour'
-           ) AS heure_ts
-),
-mediane AS (
     SELECT
-        date_trunc('hour', horodatage) AS heure_ts,
-        percentile_cont(0.5) WITHIN GROUP (ORDER BY (chlore_mv / 3.0))
-            AS taux_med
+        date_trunc('hour', horodatage) AS heure,
+        ROUND(AVG(chlore_mv / 3.0)::numeric, 2) AS taux_desinfection
     FROM   mesures
-    WHERE  nom_automate      = %s
-      AND  horodatage        >= NOW() - INTERVAL '24 hours'
-      AND  horodatage        <  NOW()
-    GROUP  BY heure_ts
-)
-SELECT
-    TO_CHAR(h.heure_ts, 'HH24:MI')            AS heure_label,
-    COALESCE(m.taux_med, 0)                  AS taux_desinfection
-FROM   heures h
-LEFT   JOIN mediane m USING (heure_ts)
-ORDER  BY h.heure_ts;
+    WHERE  nom_automate = %s
+      AND  horodatage  >= now() - INTERVAL '24 hours'
+      AND  horodatage  <  now()
+    GROUP  BY heure
+    ORDER  BY heure;
     """
     result = executer_requete_sql(query, (nom_automate,))
     return formater_series(result, timeframe="jour")
 
 @app.get("/taux_desinfection/semaine")
 def taux_desinfection_semaine(nom_automate: str = Query(..., description="Nom de l'automate")):
-    query = """
-    SELECT
-      to_char(jour, 'FMDay') AS day_name,
-      ROUND(COALESCE(taux_desinfection, 0) * (2.5/3.0), 2) AS taux_desinfection
-    FROM donnees_semaine
-    WHERE nom_automate = %s
-    ORDER BY jour;
-    """
-    return formater_series(executer_requete_sql(query, (nom_automate,)), timeframe="semaine")
+    return fetch_semaine_simple(nom_automate, "taux_desinfection")
 
 @app.get("/taux_desinfection/mois")
 def taux_desinfection_mois(nom_automate: str = Query(..., description="Nom de l'automate")):
-    query = """
-    SELECT
-      to_char(semaine_debut, 'YYYY-MM-DD') AS week_label,
-      ROUND(COALESCE(taux_desinfection_avg, 0) * (2.5/3.0), 2) AS taux_desinfection
-    FROM donnees_mois
-    WHERE nom_automate = %s
-    ORDER BY semaine_debut;
-    """
-    return formater_series(executer_requete_sql(query, (nom_automate,)), timeframe="mois")
+    return fetch_mois_simple(nom_automate, "taux_desinfection_avg")
 
 @app.get("/taux_desinfection/annee")
 def taux_desinfection_annee(nom_automate: str = Query(..., description="Nom de l'automate")):
-    query = """
-    SELECT
-      to_char(mois_debut, 'FMMonth') AS month_label,
-      ROUND(COALESCE(taux_desinfection_avg, 0) * (2.5/3.0), 2) AS taux_desinfection
-    FROM donnees_annees
-    WHERE nom_automate = %s
-    ORDER BY mois_debut;
-    """
-    return formater_series(executer_requete_sql(query, (nom_automate,)), timeframe="annee")
+    return fetch_annee_simple(nom_automate, "taux_desinfection_avg")
 
 @app.get("/pression_medianes/jour")
 def pression_medianes_jour(nom_automate: str = Query(..., description="Nom de l'automate")):

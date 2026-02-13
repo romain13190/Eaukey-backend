@@ -2,6 +2,7 @@
 # Python 3.10+ | SQLAlchemy + pg8000 | Connexion directe
 # Lance:  python /root/etl_donnees_semaine_safe.py
 
+import argparse
 import sqlalchemy
 from sqlalchemy import text
 from sqlalchemy.engine import URL
@@ -23,7 +24,7 @@ CREATE TABLE IF NOT EXISTS donnees_semaine (
   -- Taux recyclage (0..1)
   taux_recyclage        numeric,
 
-  -- Désinfection (moyenne: chlore_mv/2.5)
+  -- Désinfection (moyenne: chlore_mv/3.0)
   taux_desinfection     numeric,
 
   -- Pressions moyennes/jour
@@ -84,7 +85,7 @@ w_mesures AS (
     compteur_eau_adoucie_m3,
     compteur_eau_relevage_m3,
     ph / 100.0      AS ph_val,
-    chlore_mv / 2.5 AS taux_desinf
+    chlore_mv / 3.0 AS taux_desinf
   FROM mesures
   WHERE horodatage >= (SELECT d FROM today) - INTERVAL '7 days'
     AND horodatage <  (SELECT d FROM today)
@@ -202,13 +203,17 @@ final AS (
     GREATEST(COALESCE(v.vol_adoucie_m3, 0), 0)  AS vol_adoucie_m3,
     GREATEST(COALESCE(v.vol_relevage_m3, 0), 0) AS vol_relevage_m3,
 
-    LEAST(GREATEST(
-      COALESCE(
-        (v.vol_renvoi_m3::numeric
-          / NULLIF(v.vol_renvoi_m3 + v.vol_adoucie_m3, 0)
-        ), 0
-      ), 0
-    ), 1) AS taux_recyclage,
+    COALESCE(
+      LEAST(
+        GREATEST(
+          (v.vol_renvoi_m3 - v.vol_adoucie_m3)
+            / NULLIF(v.vol_renvoi_m3, 0),
+          0
+        ),
+        1
+      ),
+      0
+    ) AS taux_recyclage,
 
     GREATEST(d.taux_desinfection, 0) AS taux_desinfection,
 
@@ -335,7 +340,7 @@ def connect_with_connector() -> sqlalchemy.engine.base.Engine:
     )
     return sqlalchemy.create_engine(url)
 
-def run(engine: sqlalchemy.engine.base.Engine):
+def run(engine: sqlalchemy.engine.base.Engine, rebuild: bool = False):
     with engine.begin() as conn:
         # Petit timeout de verrou pour éviter d'attendre indéfiniment
         conn.execute(text("SET LOCAL lock_timeout = '5s'"))
@@ -349,22 +354,29 @@ def run(engine: sqlalchemy.engine.base.Engine):
             return
 
         conn.execute(text(DDL_CREATE))
+        if rebuild:
+            logger.info("REBUILD: truncating donnees_semaine")
+            conn.execute(text("TRUNCATE donnees_semaine"))
         # S'assurer qu'aucune ligne 'jour = aujourd'hui' n'est conservée
         conn.execute(text(DELETE_TODAY_ROW))
         conn.execute(text(UPSERT))
         conn.execute(text(CLEANUP_KEEP_LAST_8_DAYS))
     logger.info("OK: donnees_semaine mise à jour (fenêtre [J-7 .. J] conservée).")
 
-def main(*args):
-    """Point d’entrée du script ETL."""
+def main(rebuild=False):
+    """Point d'entrée du script ETL."""
     engine = connect_with_connector()
-    run(engine)
+    run(engine, rebuild=rebuild)
     return "OK", 200
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--rebuild", action="store_true",
+                        help="Truncate destination table and recalculate from scratch")
+    args = parser.parse_args()
     try:
         logger.info("ETL semaines: start")
-        result = main()
+        result = main(rebuild=args.rebuild)
         logger.info("ETL semaines: done")
         print(result)
     except Exception:
