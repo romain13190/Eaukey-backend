@@ -21,10 +21,9 @@ CREATE TABLE IF NOT EXISTS donnees_mois (
   vol_adoucie_m3         numeric   DEFAULT 0,
   vol_relevage_m3        numeric   DEFAULT 0,
 
-  -- Taux de recyclage (0..1)
   taux_recyclage         numeric,
 
-  -- Désinfection (depuis mesures.chlore_mv/2.5)
+-- Désinfection (depuis mesures.chlore_mv/2.5)
   taux_desinfection_avg  numeric,
   taux_desinfection_med  numeric,
 

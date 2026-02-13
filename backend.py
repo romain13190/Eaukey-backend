@@ -562,8 +562,8 @@ par_heure AS (
 SELECT
     TO_CHAR(heure_ts, 'HH24:MI')                AS heure_label,
     CASE
-        WHEN vol_adoucie + vol_renvoi = 0 THEN 0
-        ELSE ROUND( (vol_renvoi / (vol_adoucie + vol_renvoi))::numeric, 2 )
+        WHEN vol_renvoi = 0 THEN 0
+        ELSE ROUND(((vol_renvoi - vol_adoucie) / vol_renvoi)::numeric, 2)
     END                                         AS taux_recyclage
 FROM   par_heure
 ORDER  BY heure_ts;
@@ -574,15 +574,48 @@ ORDER  BY heure_ts;
 
 @app.get("/taux_recyclage/semaine")
 def taux_recyclage_semaine(nom_automate: str = Query(..., description="Nom de l'automate")):
-    return fetch_semaine_simple(nom_automate, "taux_recyclage")
+    query = """
+    SELECT
+      to_char(jour, 'FMDay') AS day_name,
+      CASE
+        WHEN vol_renvoi_m3 = 0 THEN 0
+        ELSE ROUND(((vol_renvoi_m3 - vol_adoucie_m3) / vol_renvoi_m3)::numeric, 2)
+      END AS taux_recyclage
+    FROM donnees_semaine
+    WHERE nom_automate = %s
+    ORDER BY jour;
+    """
+    return formater_series(executer_requete_sql(query, (nom_automate,)), timeframe="semaine")
 
 @app.get("/taux_recyclage/mois")
 def taux_recyclage_mois(nom_automate: str = Query(..., description="Nom de l'automate")):
-    return fetch_mois_simple(nom_automate, "taux_recyclage")
+    query = """
+    SELECT
+      to_char(semaine_debut, 'YYYY-MM-DD') AS week_label,
+      CASE
+        WHEN vol_renvoi_m3 = 0 THEN 0
+        ELSE ROUND(((vol_renvoi_m3 - vol_adoucie_m3) / vol_renvoi_m3)::numeric, 2)
+      END AS taux_recyclage
+    FROM donnees_mois
+    WHERE nom_automate = %s
+    ORDER BY semaine_debut;
+    """
+    return formater_series(executer_requete_sql(query, (nom_automate,)), timeframe="mois")
 
 @app.get("/taux_recyclage/annee")
 def taux_recyclage_annee(nom_automate: str = Query(..., description="Nom de l'automate")):
-    return fetch_annee_simple(nom_automate, "taux_recyclage")
+    query = """
+    SELECT
+      to_char(mois_debut, 'FMMonth') AS month_label,
+      CASE
+        WHEN vol_renvoi_m3 = 0 THEN 0
+        ELSE ROUND(((vol_renvoi_m3 - vol_adoucie_m3) / vol_renvoi_m3)::numeric, 2)
+      END AS taux_recyclage
+    FROM donnees_annees
+    WHERE nom_automate = %s
+    ORDER BY mois_debut;
+    """
+    return formater_series(executer_requete_sql(query, (nom_automate,)), timeframe="annee")
 
 @app.get("/taux_desinfection/jour")
 def taux_desinfection_jour(nom_automate: str = Query(..., description="Nom de l'automate")):
@@ -596,13 +629,13 @@ WITH heures AS (
 ),
 mediane AS (
     SELECT
-        date_trunc('hour', rounded_timestamp) AS heure_ts,
-        percentile_cont(0.5) WITHIN GROUP (ORDER BY avg_chlore / 2.5)
+        date_trunc('hour', horodatage) AS heure_ts,
+        percentile_cont(0.5) WITHIN GROUP (ORDER BY (chlore_mv / 3.0))
             AS taux_med
-    FROM   moyenne
+    FROM   mesures
     WHERE  nom_automate      = %s
-      AND  rounded_timestamp >= NOW() - INTERVAL '24 hours'
-      AND  rounded_timestamp <  NOW()
+      AND  horodatage        >= NOW() - INTERVAL '24 hours'
+      AND  horodatage        <  NOW()
     GROUP  BY heure_ts
 )
 SELECT
@@ -617,15 +650,39 @@ ORDER  BY h.heure_ts;
 
 @app.get("/taux_desinfection/semaine")
 def taux_desinfection_semaine(nom_automate: str = Query(..., description="Nom de l'automate")):
-    return fetch_semaine_simple(nom_automate, "taux_desinfection")
+    query = """
+    SELECT
+      to_char(jour, 'FMDay') AS day_name,
+      ROUND(COALESCE(taux_desinfection, 0) * (2.5/3.0), 2) AS taux_desinfection
+    FROM donnees_semaine
+    WHERE nom_automate = %s
+    ORDER BY jour;
+    """
+    return formater_series(executer_requete_sql(query, (nom_automate,)), timeframe="semaine")
 
 @app.get("/taux_desinfection/mois")
 def taux_desinfection_mois(nom_automate: str = Query(..., description="Nom de l'automate")):
-    return fetch_mois_simple(nom_automate, "taux_desinfection_avg")
+    query = """
+    SELECT
+      to_char(semaine_debut, 'YYYY-MM-DD') AS week_label,
+      ROUND(COALESCE(taux_desinfection_avg, 0) * (2.5/3.0), 2) AS taux_desinfection
+    FROM donnees_mois
+    WHERE nom_automate = %s
+    ORDER BY semaine_debut;
+    """
+    return formater_series(executer_requete_sql(query, (nom_automate,)), timeframe="mois")
 
 @app.get("/taux_desinfection/annee")
 def taux_desinfection_annee(nom_automate: str = Query(..., description="Nom de l'automate")):
-    return fetch_annee_simple(nom_automate, "taux_desinfection_avg")
+    query = """
+    SELECT
+      to_char(mois_debut, 'FMMonth') AS month_label,
+      ROUND(COALESCE(taux_desinfection_avg, 0) * (2.5/3.0), 2) AS taux_desinfection
+    FROM donnees_annees
+    WHERE nom_automate = %s
+    ORDER BY mois_debut;
+    """
+    return formater_series(executer_requete_sql(query, (nom_automate,)), timeframe="annee")
 
 @app.get("/pression_medianes/jour")
 def pression_medianes_jour(nom_automate: str = Query(..., description="Nom de l'automate")):
