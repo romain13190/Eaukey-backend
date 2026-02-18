@@ -1521,7 +1521,23 @@ def login(payload: AuthLoginIn, request: Request):
 
 @app.get("/auth/me")
 def me(request: Request):
-    return _require_auth(request)
+    user = _require_auth(request)
+    # Ajouter info organisation (org_role, organization_id, organization_name)
+    org_row = executer_requete_sql_one(
+        """
+        SELECT ou.organization_id, ou.org_role, o.name
+        FROM organization_users ou
+        JOIN organizations o ON o.id = ou.organization_id
+        WHERE ou.user_id = %s
+        LIMIT 1;
+        """,
+        (user["id"],),
+    )
+    if org_row:
+        user["organization_id"] = org_row[0]
+        user["org_role"] = org_row[1]
+        user["organization_name"] = org_row[2]
+    return user
 
 
 # ---------------------------------------------------------------------------
@@ -2306,16 +2322,21 @@ def list_users(request: Request):
     _require_admin_or_super(request)
     rows = executer_requete_sql(
         """
-        SELECT u.id, u.email, u.client_id, COALESCE(array_agg(r.name ORDER BY r.name) FILTER (WHERE r.name IS NOT NULL), '{}') AS roles
+        SELECT u.id, u.email, u.client_id,
+               COALESCE(array_agg(r.name ORDER BY r.name) FILTER (WHERE r.name IS NOT NULL), '{}') AS roles,
+               ou.org_role, o.name AS org_name
         FROM users u
         LEFT JOIN user_roles ur ON ur.user_id = u.id
         LEFT JOIN roles r ON r.id = ur.role_id
-        GROUP BY u.id, u.email, u.client_id
+        LEFT JOIN organization_users ou ON ou.user_id = u.id
+        LEFT JOIN organizations o ON o.id = ou.organization_id
+        GROUP BY u.id, u.email, u.client_id, ou.org_role, o.name
         ORDER BY u.email;
         """
     )
     return [
-        {"id": r[0], "email": r[1], "client_id": r[2], "roles": list(r[3])}
+        {"id": r[0], "email": r[1], "client_id": r[2], "roles": list(r[3]),
+         "org_role": r[4], "org_name": r[5]}
         for r in rows
     ]
 
@@ -2379,6 +2400,24 @@ def list_orgs(request: Request):
     return [{"id": r[0], "name": r[1]} for r in rows]
 
 
+@app.get("/automates/orphan-clients")
+def list_orphan_clients(request: Request):
+    _require_admin_or_super(request)
+    rows = executer_requete_sql(
+        """
+        SELECT DISTINCT a.client
+        FROM automate a
+        WHERE a.client IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM organizations o
+              WHERE lower(o.name) = lower(a.client)
+          )
+        ORDER BY a.client;
+        """
+    )
+    return [r[0] for r in rows]
+
+
 @app.post("/orgs")
 def create_org(payload: OrganizationCreateIn, request: Request):
     _require_admin_or_super(request)
@@ -2408,6 +2447,11 @@ def create_org(payload: OrganizationCreateIn, request: Request):
     )
     # Compat front historique
     executer_requete_sql_one("UPDATE users SET client_id = %s WHERE id = %s", (name, user_row[0]))
+    # Lier les automates existants à la nouvelle org
+    executer_requete_sql_one(
+        "UPDATE automate SET organization_id = %s WHERE lower(client) = lower(%s) AND organization_id IS NULL",
+        (org_row[0], name),
+    )
     return {"id": org_row[0], "name": name}
 
 
@@ -2542,6 +2586,131 @@ def set_automate_access(nom_automate: str, payload: AutomateAccessIn, request: R
             (nom_automate, uid),
         )
     return {"status": "success"}
+
+
+# ---------------------------------------------------------------------------
+# Gestion des accès par l'admin d'organisation (org_admin)
+# ---------------------------------------------------------------------------
+
+def _require_org_admin(request: Request) -> dict:
+    """Vérifie que l'appelant est org_admin et retourne user + org info."""
+    user = _require_auth(request)
+    row = executer_requete_sql_one(
+        """
+        SELECT ou.organization_id, ou.org_role, o.name
+        FROM organization_users ou
+        JOIN organizations o ON o.id = ou.organization_id
+        WHERE ou.user_id = %s
+        LIMIT 1;
+        """,
+        (user["id"],),
+    )
+    if not row or row[1] != "org_admin":
+        raise HTTPException(status_code=403, detail="Accès réservé aux administrateurs d'organisation")
+    user["organization_id"] = row[0]
+    user["org_role"] = row[1]
+    user["organization_name"] = row[2]
+    return user
+
+
+@app.get("/org-admin/members")
+def org_admin_list_members(request: Request):
+    """Liste les membres de l'organisation de l'org_admin connecté."""
+    admin = _require_org_admin(request)
+    org_id = admin["organization_id"]
+    rows = executer_requete_sql(
+        """
+        SELECT u.id, u.email, ou.org_role
+        FROM organization_users ou
+        JOIN users u ON u.id = ou.user_id
+        WHERE ou.organization_id = %s
+        ORDER BY ou.org_role DESC, u.email;
+        """,
+        (org_id,),
+    )
+    return [{"id": r[0], "email": r[1], "org_role": r[2]} for r in rows]
+
+
+@app.get("/org-admin/automates")
+def org_admin_list_automates(request: Request):
+    """Liste les automates (stations) de l'organisation de l'org_admin."""
+    admin = _require_org_admin(request)
+    org_id = admin["organization_id"]
+    org_name = admin["organization_name"]
+    rows = executer_requete_sql(
+        """
+        SELECT nom_automate, numero_automate, lieu
+        FROM automate
+        WHERE organization_id = %s OR lower(client) = lower(%s)
+        ORDER BY nom_automate;
+        """,
+        (org_id, org_name),
+    )
+    return [{"nom_automate": r[0], "numero_automate": r[1], "lieu": r[2]} for r in rows]
+
+
+@app.get("/org-admin/member/{user_id}/automates")
+def org_admin_get_member_access(user_id: int, request: Request):
+    """Retourne la liste des noms d'automates accessibles par un membre."""
+    admin = _require_org_admin(request)
+    org_id = admin["organization_id"]
+    # Vérifier que l'utilisateur fait partie de l'organisation
+    member = executer_requete_sql_one(
+        "SELECT user_id FROM organization_users WHERE user_id = %s AND organization_id = %s",
+        (user_id, org_id),
+    )
+    if not member:
+        raise HTTPException(status_code=404, detail="Membre introuvable dans l'organisation")
+    rows = executer_requete_sql(
+        "SELECT automate_nom FROM automate_access WHERE user_id = %s ORDER BY automate_nom",
+        (user_id,),
+    )
+    return [r[0] for r in rows]
+
+
+class OrgAdminSetAccessIn(BaseModel):
+    automate_noms: list[str]
+
+
+@app.put("/org-admin/member/{user_id}/automates")
+def org_admin_set_member_access(user_id: int, payload: OrgAdminSetAccessIn, request: Request):
+    """Définit les accès automates d'un membre (limité à l'org de l'admin)."""
+    admin = _require_org_admin(request)
+    org_id = admin["organization_id"]
+    org_name = admin["organization_name"]
+    # Vérifier que l'utilisateur fait partie de l'organisation
+    member = executer_requete_sql_one(
+        "SELECT user_id FROM organization_users WHERE user_id = %s AND organization_id = %s",
+        (user_id, org_id),
+    )
+    if not member:
+        raise HTTPException(status_code=404, detail="Membre introuvable dans l'organisation")
+    # Récupérer les automates de l'organisation
+    org_automates = executer_requete_sql(
+        """
+        SELECT nom_automate FROM automate
+        WHERE organization_id = %s OR lower(client) = lower(%s)
+        """,
+        (org_id, org_name),
+    )
+    valid_automates = {r[0] for r in org_automates}
+    invalid = [n for n in payload.automate_noms if n not in valid_automates]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"Automates hors organisation: {', '.join(invalid)}")
+    # Supprimer les accès existants UNIQUEMENT pour les automates de cette org
+    for nom in valid_automates:
+        executer_requete_sql_one(
+            "DELETE FROM automate_access WHERE automate_nom = %s AND user_id = %s",
+            (nom, user_id),
+        )
+    # Insérer les nouveaux accès
+    for nom in payload.automate_noms:
+        executer_requete_sql_one(
+            "INSERT INTO automate_access (automate_nom, user_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+            (nom, user_id),
+        )
+    return {"status": "success"}
+
 
 @app.get("/messages/{client_id}", response_model=List[MessageOut])
 def get_messages_for_client(client_id: str):
