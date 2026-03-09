@@ -1,0 +1,9 @@
+{"ts": "2026-02-28T22:00:03.955615+00:00", "level": "INFO", "logger": "etl.annee", "message": "ETL annee: start", "module": "ETL_annee", "func": "<module>", "line": 313}
+{"ts": "2026-02-28T22:00:04.595301+00:00", "level": "INFO", "logger": "etl.annee", "message": "run: start", "module": "ETL_annee", "func": "run", "line": 269}
+{"ts": "2026-02-28T22:00:05.333959+00:00", "level": "INFO", "logger": "etl.annee", "message": "advisory_lock_got=True", "module": "ETL_annee", "func": "run", "line": 278}
+{"ts": "2026-02-28T22:00:05.594434+00:00", "level": "INFO", "logger": "etl.annee", "message": "delete_window_last_six.rowcount=207", "module": "ETL_annee", "func": "run", "line": 290}
+{"ts": "2026-02-28T22:31:07.770896+00:00", "level": "INFO", "logger": "etl.annee", "message": "insert_last_six_from_mesures.rowcount=255", "module": "ETL_annee", "func": "run", "line": 292}
+{"ts": "2026-02-28T22:31:07.942583+00:00", "level": "INFO", "logger": "etl.annee", "message": "delete_keep_last12.rowcount=63", "module": "ETL_annee", "func": "run", "line": 295}
+{"ts": "2026-02-28T22:31:07.991318+00:00", "level": "INFO", "logger": "etl.annee", "message": "run: success", "module": "ETL_annee", "func": "run", "line": 299}
+{"ts": "2026-02-28T22:31:07.992230+00:00", "level": "INFO", "logger": "etl.annee", "message": "ETL annee: done", "module": "ETL_annee", "func": "<module>", "line": 315}
+done

@@ -546,10 +546,10 @@ def temps_reel_taux_recyclage(nom_automate: str = Query(..., description="Nom de
     """
     result = executer_requete_sql(query, (nom_automate,))
     if not result or not result[0][0]:
-        return {"horodatage": None, "valeur": 0}
+        return {"horodatage": None, "valeur": None}
     return {
         "horodatage": result[0][0].strftime("%Y-%m-%d %H:%M:%S"),
-        "valeur": float(result[0][1]) if result[0][1] is not None else 0
+        "valeur": float(result[0][1]) if result[0][1] is not None else None
     }
 
 @app.get("/taux_recyclage/semaine")
