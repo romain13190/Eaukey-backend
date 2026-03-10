@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Query, HTTPException, Request, BackgroundTasks
-import logging
+import logging  # v2 - force redeploy with taux_recyclage endpoint
 from typing import List, Tuple, Optional, Union
 from pydantic import BaseModel, Field
 import base64
