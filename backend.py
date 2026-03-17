@@ -1838,6 +1838,43 @@ def _require_admin_or_super(request: Request) -> dict:
     return user
 
 
+@app.get("/volumes/total")
+def volumes_total(request: Request):
+    """Total m3 recyclés (renvoi - adoucie) pour toutes les stations accessibles par l'utilisateur."""
+    user = _require_auth(request)
+    roles = [r.lower() for r in user.get("roles", [])]
+    if "admin" in roles or "super_admin" in roles:
+        rows = executer_requete_sql(
+            """
+            SELECT COALESCE(SUM(vol_renvoi_m3 - vol_adoucie_m3), 0) AS total_recycle_m3,
+                   MIN(jour) AS depuis,
+                   COUNT(DISTINCT nom_automate) AS nb_stations
+            FROM donnees_semaine;
+            """
+        )
+    else:
+        org = _get_org_for_user(user["id"])
+        if not org:
+            return {"total_recycle_m3": 0, "depuis": None, "nb_stations": 0}
+        rows = executer_requete_sql(
+            """
+            SELECT COALESCE(SUM(ds.vol_renvoi_m3 - ds.vol_adoucie_m3), 0) AS total_recycle_m3,
+                   MIN(ds.jour) AS depuis,
+                   COUNT(DISTINCT ds.nom_automate) AS nb_stations
+            FROM donnees_semaine ds
+            JOIN automate a ON ds.nom_automate = a.nom_automate
+            WHERE lower(a.client) = lower(%s);
+            """,
+            (org[1],),
+        )
+    row = rows[0] if rows else (0, None, 0)
+    return {
+        "total_recycle_m3": round(float(row[0]), 1) if row[0] else 0,
+        "depuis": str(row[1].year) if row[1] else None,
+        "nb_stations": int(row[2]) if row[2] else 0,
+    }
+
+
 @app.get("/my/automates")
 def list_my_automates(request: Request):
     user = _require_auth(request)
