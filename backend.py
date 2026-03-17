@@ -1846,10 +1846,11 @@ def volumes_total(request: Request):
     if "admin" in roles or "super_admin" in roles:
         rows = executer_requete_sql(
             """
-            SELECT COALESCE(SUM(volume_renvoi_jour_m3 - volume_adoucie_jour_m3), 0) AS total_recycle_m3,
-                   MIN(horodatage) AS depuis,
-                   COUNT(DISTINCT nom_automate) AS nb_stations
-            FROM mesures_journalieres;
+            SELECT COALESCE(SUM(mj.volume_renvoi_jour_m3 - mj.volume_adoucie_jour_m3), 0) AS total_recycle_m3,
+                   MIN(mj.horodatage) AS depuis,
+                   COUNT(DISTINCT mj.nom_automate) AS nb_stations
+            FROM mesures_journalieres mj
+            JOIN automate a ON mj.nom_automate = a.nom_automate;
             """
         )
     else:
