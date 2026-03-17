@@ -1875,6 +1875,84 @@ def volumes_total(request: Request):
     }
 
 
+@app.get("/export/csv")
+def export_csv(
+    request: Request,
+    stations: str = Query(..., description="Noms automates séparés par virgule"),
+    colonnes: str = Query(..., description="Colonnes séparées par virgule"),
+    source: str = Query("semaine", description="Table source: semaine, mois, annee"),
+    date_debut: Optional[str] = Query(None, description="Date début YYYY-MM-DD"),
+    date_fin: Optional[str] = Query(None, description="Date fin YYYY-MM-DD"),
+):
+    """Export CSV des données agrégées. Admin/Super-admin uniquement."""
+    _require_admin_or_super(request)
+
+    # Validation de la source
+    source_config = {
+        "semaine": {"table": "donnees_semaine", "date_col": "jour"},
+        "mois": {"table": "donnees_mois", "date_col": "semaine_debut"},
+        "annee": {"table": "donnees_annees", "date_col": "mois_debut"},
+    }
+    if source not in source_config:
+        raise HTTPException(status_code=400, detail="Source invalide")
+    cfg = source_config[source]
+
+    # Colonnes autorisées
+    allowed_columns = {
+        "vol_renvoi_m3", "vol_adoucie_m3", "vol_relevage_m3",
+        "taux_recyclage", "taux_desinfection", "taux_desinfection_avg", "taux_desinfection_med",
+        "p1_mbar", "p2_mbar", "p3_mbar", "p4_mbar", "p5_mbar",
+        "temp_moy_c", "temp_med_c", "chlore_moy_mg_l", "chlore_med_mg_l",
+        "ph_moyen", "ph_med", "conso_kwh",
+    }
+    requested_cols = [c.strip() for c in colonnes.split(",") if c.strip()]
+    safe_cols = [c for c in requested_cols if c in allowed_columns]
+    if not safe_cols:
+        raise HTTPException(status_code=400, detail="Aucune colonne valide")
+
+    # Stations
+    station_list = [s.strip() for s in stations.split(",") if s.strip()]
+    if not station_list:
+        raise HTTPException(status_code=400, detail="Aucune station sélectionnée")
+
+    placeholders = ",".join(["%s"] * len(station_list))
+    col_sql = ", ".join(safe_cols)
+    query = f"""
+        SELECT {cfg['date_col']}, nom_automate, {col_sql}
+        FROM {cfg['table']}
+        WHERE nom_automate IN ({placeholders})
+    """
+    params = list(station_list)
+
+    if date_debut:
+        query += f" AND {cfg['date_col']} >= %s"
+        params.append(date_debut)
+    if date_fin:
+        query += f" AND {cfg['date_col']} <= %s"
+        params.append(date_fin)
+
+    query += f" ORDER BY {cfg['date_col']}, nom_automate"
+
+    rows = executer_requete_sql(query, tuple(params))
+
+    # Construction CSV
+    import io, csv
+    output = io.StringIO()
+    writer = csv.writer(output, delimiter=";")
+    writer.writerow(["date", "nom_automate"] + safe_cols)
+    for row in rows:
+        date_val = row[0].strftime("%Y-%m-%d") if hasattr(row[0], "strftime") else str(row[0])
+        writer.writerow([date_val, row[1]] + [str(v) if v is not None else "" for v in row[2:]])
+
+    from fastapi.responses import StreamingResponse
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=export_eaukey.csv"},
+    )
+
+
 @app.get("/my/automates")
 def list_my_automates(request: Request):
     user = _require_auth(request)
