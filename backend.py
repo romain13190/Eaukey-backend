@@ -914,6 +914,7 @@ def ph_jour(nom_automate: str = Query(..., description="Nom de l'automate")):
     WHERE  nom_automate = %s
       AND  horodatage   >= now() - INTERVAL '24 hours'
       AND  horodatage   <  now()
+      AND  ph / 100.0 BETWEEN 2 AND 12
     GROUP  BY heure
     ORDER  BY heure;
     """
@@ -923,17 +924,35 @@ def ph_jour(nom_automate: str = Query(..., description="Nom de l'automate")):
         "data": [float(row[1] or 0) / 100 for row in result],  # valeur en pH
     }
 
+def _filtrer_ph_extremes(series: dict, ph_min: float = 2.0, ph_max: float = 12.0) -> dict:
+    """Remplace les valeurs pH hors [ph_min, ph_max] par la mediane des valeurs valides."""
+    data = series.get("data", [])
+    if not data:
+        return series
+
+    # Calcul de la mediane des valeurs valides
+    valides = [v for v in data if ph_min <= v <= ph_max]
+    if not valides:
+        return series
+    valides_sorted = sorted(valides)
+    n = len(valides_sorted)
+    mediane = (valides_sorted[n // 2] + valides_sorted[(n - 1) // 2]) / 2
+
+    # Remplacement des outliers par la mediane
+    series["data"] = [v if ph_min <= v <= ph_max else mediane for v in data]
+    return series
+
 @app.get("/ph/semaine")
 def ph_semaine(nom_automate: str = Query(..., description="Nom de l'automate")):
-    return fetch_semaine_simple(nom_automate, "ph_moyen")
+    return _filtrer_ph_extremes(fetch_semaine_simple(nom_automate, "ph_moyen"))
 
 @app.get("/ph/mois")
 def ph_mois(nom_automate: str = Query(..., description="Nom de l'automate")):
-    return fetch_mois_simple(nom_automate, "ph_moyen")
+    return _filtrer_ph_extremes(fetch_mois_simple(nom_automate, "ph_moyen"))
 
 @app.get("/ph/annee")
 def ph_annee(nom_automate: str = Query(..., description="Nom de l'automate")):
-    return fetch_annee_simple(nom_automate, "ph_moyen")
+    return _filtrer_ph_extremes(fetch_annee_simple(nom_automate, "ph_moyen"))
 
 # -------------------
 # ENDPOINTS COMPTEUR ÉLECTRIQUE
