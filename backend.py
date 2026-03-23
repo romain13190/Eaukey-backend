@@ -1840,34 +1840,56 @@ def _require_admin_or_super(request: Request) -> dict:
 
 @app.get("/volumes/total")
 def volumes_total(request: Request):
-    """Total m3 recyclés (renvoi - adoucie) pour toutes les stations accessibles par l'utilisateur."""
+    """Total m3 recyclés (renvoi - adoucie) pour toutes les stations accessibles par l'utilisateur.
+    Prend la derniere valeur compteur de chaque station (compteurs cumulatifs) au lieu de sommer les volumes journaliers."""
     user = _require_auth(request)
     roles = [r.lower() for r in user.get("roles", [])]
-    if "admin" in roles or "super_admin" in roles:
-        rows = executer_requete_sql(
-            """
-            SELECT COALESCE(SUM(mj.volume_renvoi_jour_m3 - mj.volume_adoucie_jour_m3), 0) AS total_recycle_m3,
-                   MIN(mj.horodatage) AS depuis,
-                   COUNT(DISTINCT mj.nom_automate) AS nb_stations
-            FROM mesures_journalieres mj
-            JOIN automate a ON mj.nom_automate = a.nom_automate;
-            """
+    # Sous-requete : pour chaque station, on prend la derniere mesure connue
+    # et on lit les compteurs cumulatifs renvoi et adoucie.
+    query_admin = """
+        WITH derniere_mesure AS (
+            SELECT DISTINCT ON (m.nom_automate)
+                   m.nom_automate,
+                   m.compteur_eau_renvoi_m3,
+                   m.compteur_eau_adoucie_m3,
+                   m.horodatage
+            FROM mesures m
+            JOIN automate a ON m.nom_automate = a.nom_automate
+            WHERE m.compteur_eau_renvoi_m3 IS NOT NULL
+              AND m.compteur_eau_adoucie_m3 IS NOT NULL
+            ORDER BY m.nom_automate, m.horodatage DESC
         )
+        SELECT COALESCE(SUM(compteur_eau_renvoi_m3 - compteur_eau_adoucie_m3), 0) AS total_recycle_m3,
+               MIN(horodatage) AS depuis,
+               COUNT(*) AS nb_stations
+        FROM derniere_mesure;
+    """
+    query_org = """
+        WITH derniere_mesure AS (
+            SELECT DISTINCT ON (m.nom_automate)
+                   m.nom_automate,
+                   m.compteur_eau_renvoi_m3,
+                   m.compteur_eau_adoucie_m3,
+                   m.horodatage
+            FROM mesures m
+            JOIN automate a ON m.nom_automate = a.nom_automate
+            WHERE m.compteur_eau_renvoi_m3 IS NOT NULL
+              AND m.compteur_eau_adoucie_m3 IS NOT NULL
+              AND lower(a.client) = lower(%s)
+            ORDER BY m.nom_automate, m.horodatage DESC
+        )
+        SELECT COALESCE(SUM(compteur_eau_renvoi_m3 - compteur_eau_adoucie_m3), 0) AS total_recycle_m3,
+               MIN(horodatage) AS depuis,
+               COUNT(*) AS nb_stations
+        FROM derniere_mesure;
+    """
+    if "admin" in roles or "super_admin" in roles:
+        rows = executer_requete_sql(query_admin)
     else:
         org = _get_org_for_user(user["id"])
         if not org:
             return {"total_recycle_m3": 0, "depuis": None, "nb_stations": 0}
-        rows = executer_requete_sql(
-            """
-            SELECT COALESCE(SUM(mj.volume_renvoi_jour_m3 - mj.volume_adoucie_jour_m3), 0) AS total_recycle_m3,
-                   MIN(mj.horodatage) AS depuis,
-                   COUNT(DISTINCT mj.nom_automate) AS nb_stations
-            FROM mesures_journalieres mj
-            JOIN automate a ON mj.nom_automate = a.nom_automate
-            WHERE lower(a.client) = lower(%s);
-            """,
-            (org[1],),
-        )
+        rows = executer_requete_sql(query_org, (org[1],))
     row = rows[0] if rows else (0, None, 0)
     return {
         "total_recycle_m3": round(float(row[0]), 1) if row[0] else 0,
