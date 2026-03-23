@@ -844,6 +844,7 @@ def temperature_jour(nom_automate: str = Query(..., description="Nom de l'automa
     WHERE  nom_automate = %s
       AND  horodatage  >= now() - INTERVAL '24 hours'
       AND  horodatage  <  now()
+      AND  temperature_deg / 10.0 BETWEEN 0 AND 60
     GROUP  BY heure
     ORDER  BY heure;
     """
@@ -855,15 +856,15 @@ def temperature_jour(nom_automate: str = Query(..., description="Nom de l'automa
 
 @app.get("/temperature/semaine")
 def temperature_semaine(nom_automate: str = Query(..., description="Nom de l'automate")):
-    return fetch_semaine_simple(nom_automate, "temp_moy_c")
+    return _filtrer_extremes(fetch_semaine_simple(nom_automate, "temp_moy_c"), 0, 60)
 
 @app.get("/temperature/mois")
 def temperature_mois(nom_automate: str = Query(..., description="Nom de l'automate")):
-    return fetch_mois_simple(nom_automate, "temp_moy_c")
+    return _filtrer_extremes(fetch_mois_simple(nom_automate, "temp_moy_c"), 0, 60)
 
 @app.get("/temperature/annee")
 def temperature_annee(nom_automate: str = Query(..., description="Nom de l'automate")):
-    return fetch_annee_simple(nom_automate, "temp_moy_c")
+    return _filtrer_extremes(fetch_annee_simple(nom_automate, "temp_moy_c"), 0, 60)
 
 # -------------------
 # ENDPOINTS CHLORE
@@ -879,6 +880,7 @@ def chlore_jour(nom_automate: str = Query(..., description="Nom de l'automate"))
     WHERE  nom_automate = %s
       AND  horodatage  >= now() - INTERVAL '24 hours'
       AND  horodatage  <  now()
+      AND  chlore_mv BETWEEN 0 AND 2000
     GROUP  BY heure
     ORDER  BY heure;
     """
@@ -890,15 +892,15 @@ def chlore_jour(nom_automate: str = Query(..., description="Nom de l'automate"))
 
 @app.get("/chlore/semaine")
 def chlore_semaine(nom_automate: str = Query(..., description="Nom de l'automate")):
-    return fetch_semaine_simple(nom_automate, "chlore_moy_mg_l")
+    return _filtrer_extremes(fetch_semaine_simple(nom_automate, "chlore_moy_mg_l"), 0, 2000)
 
 @app.get("/chlore/mois")
 def chlore_mois(nom_automate: str = Query(..., description="Nom de l'automate")):
-    return fetch_mois_simple(nom_automate, "chlore_moy_mg_l")
+    return _filtrer_extremes(fetch_mois_simple(nom_automate, "chlore_moy_mg_l"), 0, 2000)
 
 @app.get("/chlore/annee")
 def chlore_annee(nom_automate: str = Query(..., description="Nom de l'automate")):
-    return fetch_annee_simple(nom_automate, "chlore_moy_mg_l")
+    return _filtrer_extremes(fetch_annee_simple(nom_automate, "chlore_moy_mg_l"), 0, 2000)
 
 # -------------------
 # ENDPOINTS PH
@@ -924,14 +926,14 @@ def ph_jour(nom_automate: str = Query(..., description="Nom de l'automate")):
         "data": [float(row[1] or 0) / 100 for row in result],  # valeur en pH
     }
 
-def _filtrer_ph_extremes(series: dict, ph_min: float = 2.0, ph_max: float = 12.0) -> dict:
-    """Remplace les valeurs pH hors [ph_min, ph_max] par la mediane des valeurs valides."""
+def _filtrer_extremes(series: dict, val_min: float, val_max: float) -> dict:
+    """Remplace les valeurs hors [val_min, val_max] par la mediane des valeurs valides."""
     data = series.get("data", [])
     if not data:
         return series
 
     # Calcul de la mediane des valeurs valides
-    valides = [v for v in data if ph_min <= v <= ph_max]
+    valides = [v for v in data if val_min <= v <= val_max]
     if not valides:
         return series
     valides_sorted = sorted(valides)
@@ -939,20 +941,20 @@ def _filtrer_ph_extremes(series: dict, ph_min: float = 2.0, ph_max: float = 12.0
     mediane = (valides_sorted[n // 2] + valides_sorted[(n - 1) // 2]) / 2
 
     # Remplacement des outliers par la mediane
-    series["data"] = [v if ph_min <= v <= ph_max else mediane for v in data]
+    series["data"] = [v if val_min <= v <= val_max else mediane for v in data]
     return series
 
 @app.get("/ph/semaine")
 def ph_semaine(nom_automate: str = Query(..., description="Nom de l'automate")):
-    return _filtrer_ph_extremes(fetch_semaine_simple(nom_automate, "ph_moyen"))
+    return _filtrer_extremes(fetch_semaine_simple(nom_automate, "ph_moyen"), 2, 12)
 
 @app.get("/ph/mois")
 def ph_mois(nom_automate: str = Query(..., description="Nom de l'automate")):
-    return _filtrer_ph_extremes(fetch_mois_simple(nom_automate, "ph_moyen"))
+    return _filtrer_extremes(fetch_mois_simple(nom_automate, "ph_moyen"), 2, 12)
 
 @app.get("/ph/annee")
 def ph_annee(nom_automate: str = Query(..., description="Nom de l'automate")):
-    return _filtrer_ph_extremes(fetch_annee_simple(nom_automate, "ph_moyen"))
+    return _filtrer_extremes(fetch_annee_simple(nom_automate, "ph_moyen"), 2, 12)
 
 # -------------------
 # ENDPOINTS COMPTEUR ÉLECTRIQUE
