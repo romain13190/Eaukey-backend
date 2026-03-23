@@ -1846,11 +1846,30 @@ def volumes_total(request: Request):
     if "admin" in roles or "super_admin" in roles:
         rows = executer_requete_sql(
             """
-            SELECT COALESCE(SUM(mj.volume_renvoi_jour_m3 - mj.volume_adoucie_jour_m3), 0) AS total_recycle_m3,
-                   MIN(mj.horodatage) AS depuis,
-                   COUNT(DISTINCT mj.nom_automate) AS nb_stations
-            FROM mesures_journalieres mj
-            JOIN automate a ON mj.nom_automate = a.nom_automate;
+            WITH derniere_lecture AS (
+                SELECT DISTINCT ON (m.nom_automate)
+                    m.nom_automate,
+                    m.compteur_eau_renvoi_m3,
+                    m.compteur_eau_adoucie_m3,
+                    m.horodatage
+                FROM mesures m
+                JOIN automate a ON m.nom_automate = a.nom_automate
+                ORDER BY m.nom_automate, m.horodatage DESC
+            ),
+            premiere_lecture AS (
+                SELECT DISTINCT ON (m.nom_automate)
+                    m.nom_automate,
+                    m.horodatage AS depuis
+                FROM mesures m
+                JOIN automate a ON m.nom_automate = a.nom_automate
+                ORDER BY m.nom_automate, m.horodatage ASC
+            )
+            SELECT
+                COALESCE(SUM(dl.compteur_eau_renvoi_m3 - dl.compteur_eau_adoucie_m3), 0) AS total_recycle_m3,
+                MIN(pl.depuis) AS depuis,
+                COUNT(DISTINCT dl.nom_automate) AS nb_stations
+            FROM derniere_lecture dl
+            JOIN premiere_lecture pl ON dl.nom_automate = pl.nom_automate;
             """
         )
     else:
@@ -1859,14 +1878,34 @@ def volumes_total(request: Request):
             return {"total_recycle_m3": 0, "depuis": None, "nb_stations": 0}
         rows = executer_requete_sql(
             """
-            SELECT COALESCE(SUM(mj.volume_renvoi_jour_m3 - mj.volume_adoucie_jour_m3), 0) AS total_recycle_m3,
-                   MIN(mj.horodatage) AS depuis,
-                   COUNT(DISTINCT mj.nom_automate) AS nb_stations
-            FROM mesures_journalieres mj
-            JOIN automate a ON mj.nom_automate = a.nom_automate
-            WHERE lower(a.client) = lower(%s);
+            WITH derniere_lecture AS (
+                SELECT DISTINCT ON (m.nom_automate)
+                    m.nom_automate,
+                    m.compteur_eau_renvoi_m3,
+                    m.compteur_eau_adoucie_m3,
+                    m.horodatage
+                FROM mesures m
+                JOIN automate a ON m.nom_automate = a.nom_automate
+                WHERE lower(a.client) = lower(%s)
+                ORDER BY m.nom_automate, m.horodatage DESC
+            ),
+            premiere_lecture AS (
+                SELECT DISTINCT ON (m.nom_automate)
+                    m.nom_automate,
+                    m.horodatage AS depuis
+                FROM mesures m
+                JOIN automate a ON m.nom_automate = a.nom_automate
+                WHERE lower(a.client) = lower(%s)
+                ORDER BY m.nom_automate, m.horodatage ASC
+            )
+            SELECT
+                COALESCE(SUM(dl.compteur_eau_renvoi_m3 - dl.compteur_eau_adoucie_m3), 0) AS total_recycle_m3,
+                MIN(pl.depuis) AS depuis,
+                COUNT(DISTINCT dl.nom_automate) AS nb_stations
+            FROM derniere_lecture dl
+            JOIN premiere_lecture pl ON dl.nom_automate = pl.nom_automate;
             """,
-            (org[1],),
+            (org[1], org[1]),
         )
     row = rows[0] if rows else (0, None, 0)
     return {
