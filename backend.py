@@ -1862,11 +1862,13 @@ def _require_admin_or_super(request: Request) -> dict:
 @app.get("/volumes/total")
 def volumes_total(request: Request):
     """Total m3 recyclés (renvoi - adoucie) pour toutes les stations accessibles par l'utilisateur.
-    Prend la derniere valeur compteur de chaque station (compteurs cumulatifs) au lieu de sommer les volumes journaliers."""
+    Prend la derniere valeur compteur de chaque station (compteurs cumulatifs).
+    Les stations dont la difference est negative sont exclues du total."""
     user = _require_auth(request)
     roles = [r.lower() for r in user.get("roles", [])]
     # Sous-requete : pour chaque station, on prend la derniere mesure connue
     # et on lit les compteurs cumulatifs renvoi et adoucie.
+    # On exclut les stations avec une valeur negative (ne devrait pas arriver mais securite).
     query_admin = """
         WITH derniere_mesure AS (
             SELECT DISTINCT ON (m.nom_automate)
@@ -1883,7 +1885,8 @@ def volumes_total(request: Request):
         SELECT COALESCE(SUM(compteur_eau_renvoi_m3 - compteur_eau_adoucie_m3), 0) AS total_recycle_m3,
                MIN(horodatage) AS depuis,
                COUNT(*) AS nb_stations
-        FROM derniere_mesure;
+        FROM derniere_mesure
+        WHERE compteur_eau_renvoi_m3 - compteur_eau_adoucie_m3 >= 0;
     """
     query_org = """
         WITH derniere_mesure AS (
@@ -1902,7 +1905,8 @@ def volumes_total(request: Request):
         SELECT COALESCE(SUM(compteur_eau_renvoi_m3 - compteur_eau_adoucie_m3), 0) AS total_recycle_m3,
                MIN(horodatage) AS depuis,
                COUNT(*) AS nb_stations
-        FROM derniere_mesure;
+        FROM derniere_mesure
+        WHERE compteur_eau_renvoi_m3 - compteur_eau_adoucie_m3 >= 0;
     """
     if "admin" in roles or "super_admin" in roles:
         rows = executer_requete_sql(query_admin)
