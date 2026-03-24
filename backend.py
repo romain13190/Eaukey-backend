@@ -2513,8 +2513,7 @@ def assign_access(payload: AccessAssignIn, request: Request):
         "UPDATE users SET client_id = %s WHERE id = %s;",
         (client_id, payload.user_id),
     )
-    # Keep organizations table in sync when possible (email -> 1 org)
-    executer_requete_sql("DELETE FROM organization_users WHERE user_id = %s;", (payload.user_id,))
+    # Ajouter l'organisation sans supprimer les associations existantes
     if client_id:
         org_row = executer_requete_sql_one("SELECT id FROM organizations WHERE name = %s", (client_id,))
         if org_row:
@@ -2643,8 +2642,7 @@ def add_org_user(org_id: int, payload: OrganizationUserIn, request: Request):
     user_row = executer_requete_sql_one("SELECT id FROM users WHERE email = %s", (email,))
     if not user_row:
         raise HTTPException(status_code=400, detail="Utilisateur introuvable (créer un compte d'abord)")
-    # email = 1 organisation
-    executer_requete_sql_one("DELETE FROM organization_users WHERE user_id = %s", (user_row[0],))
+    # Un utilisateur peut appartenir à plusieurs organisations
     if org_role == "org_admin":
         executer_requete_sql_one(
             "UPDATE organization_users SET org_role = 'employee' WHERE organization_id = %s AND user_id <> %s;",
