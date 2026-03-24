@@ -1866,43 +1866,42 @@ def volumes_total(request: Request):
     Les stations dont la difference est negative sont exclues du total."""
     user = _require_auth(request)
     roles = [r.lower() for r in user.get("roles", [])]
-    # Sous-requete : pour chaque station, on prend la derniere mesure connue
-    # et on lit les compteurs cumulatifs renvoi et adoucie.
-    # On exclut les stations avec une valeur negative (ne devrait pas arriver mais securite).
-    query_admin = """
-        SELECT COALESCE(SUM(renvoi - adoucie), 0) AS total_recycle_m3,
-               COUNT(*) AS nb_stations
-        FROM (
-            SELECT a.nom_automate,
-                   (SELECT compteur_eau_renvoi_m3 FROM mesures WHERE nom_automate = a.nom_automate AND compteur_eau_renvoi_m3 IS NOT NULL ORDER BY horodatage DESC LIMIT 1) AS renvoi,
-                   (SELECT compteur_eau_adoucie_m3 FROM mesures WHERE nom_automate = a.nom_automate AND compteur_eau_adoucie_m3 IS NOT NULL ORDER BY horodatage DESC LIMIT 1) AS adoucie
-            FROM automate a
-        ) sub
-        WHERE renvoi IS NOT NULL AND adoucie IS NOT NULL AND renvoi - adoucie >= 0;
-    """
-    query_org = """
-        SELECT COALESCE(SUM(renvoi - adoucie), 0) AS total_recycle_m3,
-               COUNT(*) AS nb_stations
-        FROM (
-            SELECT a.nom_automate,
-                   (SELECT compteur_eau_renvoi_m3 FROM mesures WHERE nom_automate = a.nom_automate AND compteur_eau_renvoi_m3 IS NOT NULL ORDER BY horodatage DESC LIMIT 1) AS renvoi,
-                   (SELECT compteur_eau_adoucie_m3 FROM mesures WHERE nom_automate = a.nom_automate AND compteur_eau_adoucie_m3 IS NOT NULL ORDER BY horodatage DESC LIMIT 1) AS adoucie
-            FROM automate a
-            WHERE lower(a.client) = lower(%s)
-        ) sub
-        WHERE renvoi IS NOT NULL AND adoucie IS NOT NULL AND renvoi - adoucie >= 0;
-    """
+    # Recupere la liste des automates puis, pour chacun, la derniere valeur
+    # des compteurs renvoi et adoucie (requete LIMIT 1 ultra rapide avec index).
     if "admin" in roles or "super_admin" in roles:
-        rows = executer_requete_sql(query_admin)
+        automates = executer_requete_sql("SELECT nom_automate FROM automate")
     else:
         org = _get_org_for_user(user["id"])
         if not org:
-            return {"total_recycle_m3": 0, "depuis": None, "nb_stations": 0}
-        rows = executer_requete_sql(query_org, (org[1],))
-    row = rows[0] if rows else (0, 0)
+            return {"total_recycle_m3": 0, "nb_stations": 0}
+        automates = executer_requete_sql(
+            "SELECT nom_automate FROM automate WHERE lower(client) = lower(%s)", (org[1],)
+        )
+
+    total = 0.0
+    nb = 0
+    query_compteur = """
+        SELECT compteur_eau_renvoi_m3, compteur_eau_adoucie_m3
+        FROM mesures
+        WHERE nom_automate = %s
+          AND compteur_eau_renvoi_m3 IS NOT NULL
+          AND compteur_eau_adoucie_m3 IS NOT NULL
+        ORDER BY horodatage DESC
+        LIMIT 1
+    """
+    for (nom,) in automates:
+        rows = executer_requete_sql(query_compteur, (nom,))
+        if not rows:
+            continue
+        renvoi, adoucie = rows[0]
+        diff = renvoi - adoucie
+        if diff >= 0:
+            total += diff
+            nb += 1
+
     return {
-        "total_recycle_m3": round(float(row[0]), 1) if row[0] else 0,
-        "nb_stations": int(row[1]) if row[1] else 0,
+        "total_recycle_m3": round(total, 1),
+        "nb_stations": nb,
     }
 
 
