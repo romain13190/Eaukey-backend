@@ -1877,7 +1877,6 @@ def volumes_total(request: Request):
                    m.compteur_eau_adoucie_m3,
                    m.horodatage
             FROM mesures m
-            JOIN automate a ON m.nom_automate = a.nom_automate
             WHERE m.compteur_eau_renvoi_m3 IS NOT NULL
               AND m.compteur_eau_adoucie_m3 IS NOT NULL
             ORDER BY m.nom_automate, m.horodatage DESC
