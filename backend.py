@@ -1543,21 +1543,25 @@ def login(payload: AuthLoginIn, request: Request):
 @app.get("/auth/me")
 def me(request: Request):
     user = _require_auth(request)
-    # Ajouter info organisation (org_role, organization_id, organization_name)
-    org_row = executer_requete_sql_one(
+    # Ajouter info organisations (un utilisateur peut appartenir à plusieurs)
+    org_rows = executer_requete_sql(
         """
         SELECT ou.organization_id, ou.org_role, o.name
         FROM organization_users ou
         JOIN organizations o ON o.id = ou.organization_id
         WHERE ou.user_id = %s
-        LIMIT 1;
+        ORDER BY o.name;
         """,
         (user["id"],),
     )
-    if org_row:
-        user["organization_id"] = org_row[0]
-        user["org_role"] = org_row[1]
-        user["organization_name"] = org_row[2]
+    user["organizations"] = [
+        {"id": r[0], "org_role": r[1], "name": r[2]} for r in org_rows
+    ]
+    # Rétro-compatibilité : garder les champs simples (première org)
+    if org_rows:
+        user["organization_id"] = org_rows[0][0]
+        user["org_role"] = org_rows[0][1]
+        user["organization_name"] = org_rows[0][2]
     return user
 
 
@@ -2453,6 +2457,7 @@ class AccessAssignIn(BaseModel):
     user_id: int
     roles: list[str]
     client_id: Optional[str] = None
+    organization_names: Optional[list[str]] = None
 
 
 @app.get("/access/roles")
@@ -2468,46 +2473,105 @@ def list_users(request: Request):
     rows = executer_requete_sql(
         """
         SELECT u.id, u.email, u.client_id,
-               COALESCE(array_agg(r.name ORDER BY r.name) FILTER (WHERE r.name IS NOT NULL), '{}') AS roles,
-               ou.org_role, o.name AS org_name
+               COALESCE(array_agg(DISTINCT r.name ORDER BY r.name) FILTER (WHERE r.name IS NOT NULL), '{}') AS roles
         FROM users u
         LEFT JOIN user_roles ur ON ur.user_id = u.id
         LEFT JOIN roles r ON r.id = ur.role_id
-        LEFT JOIN organization_users ou ON ou.user_id = u.id
-        LEFT JOIN organizations o ON o.id = ou.organization_id
-        GROUP BY u.id, u.email, u.client_id, ou.org_role, o.name
+        GROUP BY u.id, u.email, u.client_id
         ORDER BY u.email;
         """
     )
-    return [
-        {"id": r[0], "email": r[1], "client_id": r[2], "roles": list(r[3]),
-         "org_role": r[4], "org_name": r[5]}
-        for r in rows
-    ]
+    # Récupérer toutes les associations organisation-utilisateur en une requête
+    org_rows = executer_requete_sql(
+        """
+        SELECT ou.user_id, o.name, ou.org_role
+        FROM organization_users ou
+        JOIN organizations o ON o.id = ou.organization_id
+        ORDER BY o.name;
+        """
+    )
+    # Indexer par user_id
+    user_orgs: dict[int, list[dict]] = {}
+    for r in org_rows:
+        user_orgs.setdefault(r[0], []).append({"org_name": r[1], "org_role": r[2]})
+    result = []
+    for r in rows:
+        orgs = user_orgs.get(r[0], [])
+        entry = {
+            "id": r[0], "email": r[1], "client_id": r[2], "roles": list(r[3]),
+            "organizations": orgs,
+            # Rétro-compatibilité
+            "org_role": orgs[0]["org_role"] if orgs else None,
+            "org_name": orgs[0]["org_name"] if orgs else None,
+        }
+        result.append(entry)
+    return result
 
 
 @app.post("/access/assign")
 def assign_access(payload: AccessAssignIn, request: Request):
     _require_admin_or_super(request)
     roles = [r.strip().lower() for r in payload.roles if r and r.strip()]
-    client_id = (payload.client_id or "").strip() or None
-    # Update legacy organization link (used by chat + some UI)
-    executer_requete_sql(
-        "UPDATE users SET client_id = %s WHERE id = %s;",
-        (client_id, payload.user_id),
-    )
-    # Ajouter l'organisation sans supprimer les associations existantes
-    if client_id:
-        org_row = executer_requete_sql_one("SELECT id FROM organizations WHERE name = %s", (client_id,))
-        if org_row:
-            executer_requete_sql_one(
-                """
-                INSERT INTO organization_users (user_id, organization_id, org_role)
-                VALUES (%s, %s, 'employee')
-                ON CONFLICT (user_id, organization_id) DO UPDATE SET org_role = EXCLUDED.org_role;
-                """,
-                (payload.user_id, org_row[0]),
-            )
+
+    # Gestion des organisations (multi-org)
+    if payload.organization_names is not None:
+        org_names = [n.strip() for n in payload.organization_names if n and n.strip()]
+        # Récupérer les org_role existants pour les préserver
+        existing_roles = {}
+        existing_rows = executer_requete_sql(
+            """
+            SELECT o.name, ou.org_role
+            FROM organization_users ou
+            JOIN organizations o ON o.id = ou.organization_id
+            WHERE ou.user_id = %s;
+            """,
+            (payload.user_id,),
+        )
+        for er in existing_rows:
+            existing_roles[er[0]] = er[1]
+        # Supprimer les anciennes associations
+        executer_requete_sql(
+            "DELETE FROM organization_users WHERE user_id = %s;",
+            (payload.user_id,),
+        )
+        # Ajouter les nouvelles en préservant le org_role existant
+        for org_name in org_names:
+            org_row = executer_requete_sql_one("SELECT id FROM organizations WHERE name = %s", (org_name,))
+            if org_row:
+                preserved_role = existing_roles.get(org_name, "employee")
+                executer_requete_sql_one(
+                    """
+                    INSERT INTO organization_users (user_id, organization_id, org_role)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (user_id, organization_id) DO NOTHING;
+                    """,
+                    (payload.user_id, org_row[0], preserved_role),
+                )
+        # Mettre à jour client_id legacy (première org ou NULL)
+        first_org = org_names[0] if org_names else None
+        executer_requete_sql(
+            "UPDATE users SET client_id = %s WHERE id = %s;",
+            (first_org, payload.user_id),
+        )
+    elif payload.client_id is not None:
+        # Rétro-compatibilité : ancien comportement avec client_id unique
+        client_id = (payload.client_id or "").strip() or None
+        executer_requete_sql(
+            "UPDATE users SET client_id = %s WHERE id = %s;",
+            (client_id, payload.user_id),
+        )
+        if client_id:
+            org_row = executer_requete_sql_one("SELECT id FROM organizations WHERE name = %s", (client_id,))
+            if org_row:
+                executer_requete_sql_one(
+                    """
+                    INSERT INTO organization_users (user_id, organization_id, org_role)
+                    VALUES (%s, %s, 'employee')
+                    ON CONFLICT (user_id, organization_id) DO UPDATE SET org_role = EXCLUDED.org_role;
+                    """,
+                    (payload.user_id, org_row[0]),
+                )
+
     # Replace role set
     executer_requete_sql("DELETE FROM user_roles WHERE user_id = %s;", (payload.user_id,))
     for role_name in roles:
@@ -2653,8 +2717,19 @@ def remove_org_user(org_id: int, user_id: int, request: Request):
         "DELETE FROM organization_users WHERE organization_id = %s AND user_id = %s",
         (org_id, user_id),
     )
-    # email = 1 organisation (donc suppression => plus d'org)
-    executer_requete_sql_one("UPDATE users SET client_id = NULL WHERE id = %s", (user_id,))
+    # Mettre à jour client_id : prendre une autre org si elle existe, sinon NULL
+    remaining = executer_requete_sql_one(
+        """
+        SELECT o.name FROM organization_users ou
+        JOIN organizations o ON o.id = ou.organization_id
+        WHERE ou.user_id = %s ORDER BY o.name LIMIT 1
+        """,
+        (user_id,),
+    )
+    executer_requete_sql_one(
+        "UPDATE users SET client_id = %s WHERE id = %s",
+        (remaining[0] if remaining else None, user_id),
+    )
     return {"status": "deleted"}
 
 
@@ -2735,31 +2810,64 @@ def set_automate_access(nom_automate: str, payload: AutomateAccessIn, request: R
 # Gestion des accès par l'admin d'organisation (org_admin)
 # ---------------------------------------------------------------------------
 
-def _require_org_admin(request: Request) -> dict:
-    """Vérifie que l'appelant est org_admin et retourne user + org info."""
+def _require_org_admin(request: Request, org_id: int | None = None) -> dict:
+    """Vérifie que l'appelant est org_admin et retourne user + org info.
+    Si org_id est fourni, vérifie que l'utilisateur est org_admin de cette org spécifique.
+    Sinon, prend la première org où il est org_admin.
+    """
     user = _require_auth(request)
-    row = executer_requete_sql_one(
-        """
-        SELECT ou.organization_id, ou.org_role, o.name
-        FROM organization_users ou
-        JOIN organizations o ON o.id = ou.organization_id
-        WHERE ou.user_id = %s
-        LIMIT 1;
-        """,
-        (user["id"],),
-    )
-    if not row or row[1] != "org_admin":
+    if org_id is not None:
+        row = executer_requete_sql_one(
+            """
+            SELECT ou.organization_id, ou.org_role, o.name
+            FROM organization_users ou
+            JOIN organizations o ON o.id = ou.organization_id
+            WHERE ou.user_id = %s AND ou.organization_id = %s AND ou.org_role = 'org_admin';
+            """,
+            (user["id"], org_id),
+        )
+    else:
+        row = executer_requete_sql_one(
+            """
+            SELECT ou.organization_id, ou.org_role, o.name
+            FROM organization_users ou
+            JOIN organizations o ON o.id = ou.organization_id
+            WHERE ou.user_id = %s AND ou.org_role = 'org_admin'
+            ORDER BY o.name LIMIT 1;
+            """,
+            (user["id"],),
+        )
+    if not row:
         raise HTTPException(status_code=403, detail="Accès réservé aux administrateurs d'organisation")
     user["organization_id"] = row[0]
     user["org_role"] = row[1]
     user["organization_name"] = row[2]
+    # Ajouter toutes les orgs admin
+    all_admin_orgs = executer_requete_sql(
+        """
+        SELECT ou.organization_id, o.name
+        FROM organization_users ou
+        JOIN organizations o ON o.id = ou.organization_id
+        WHERE ou.user_id = %s AND ou.org_role = 'org_admin'
+        ORDER BY o.name;
+        """,
+        (user["id"],),
+    )
+    user["admin_organizations"] = [{"id": r[0], "name": r[1]} for r in all_admin_orgs]
     return user
 
 
-@app.get("/org-admin/members")
-def org_admin_list_members(request: Request):
-    """Liste les membres de l'organisation de l'org_admin connecté."""
+@app.get("/org-admin/organizations")
+def org_admin_list_organizations(request: Request):
+    """Retourne les organisations où l'utilisateur est org_admin."""
     admin = _require_org_admin(request)
+    return admin["admin_organizations"]
+
+
+@app.get("/org-admin/members")
+def org_admin_list_members(request: Request, org_id: int | None = None):
+    """Liste les membres de l'organisation de l'org_admin connecté."""
+    admin = _require_org_admin(request, org_id=org_id)
     org_id = admin["organization_id"]
     rows = executer_requete_sql(
         """
@@ -2775,9 +2883,9 @@ def org_admin_list_members(request: Request):
 
 
 @app.get("/org-admin/automates")
-def org_admin_list_automates(request: Request):
+def org_admin_list_automates(request: Request, org_id: int | None = None):
     """Liste les automates (stations) de l'organisation de l'org_admin."""
-    admin = _require_org_admin(request)
+    admin = _require_org_admin(request, org_id=org_id)
     org_id = admin["organization_id"]
     org_name = admin["organization_name"]
     rows = executer_requete_sql(
@@ -2793,9 +2901,9 @@ def org_admin_list_automates(request: Request):
 
 
 @app.get("/org-admin/member/{user_id}/automates")
-def org_admin_get_member_access(user_id: int, request: Request):
+def org_admin_get_member_access(user_id: int, request: Request, org_id: int | None = None):
     """Retourne la liste des noms d'automates accessibles par un membre."""
-    admin = _require_org_admin(request)
+    admin = _require_org_admin(request, org_id=org_id)
     org_id = admin["organization_id"]
     # Vérifier que l'utilisateur fait partie de l'organisation
     member = executer_requete_sql_one(
@@ -2816,9 +2924,9 @@ class OrgAdminSetAccessIn(BaseModel):
 
 
 @app.put("/org-admin/member/{user_id}/automates")
-def org_admin_set_member_access(user_id: int, payload: OrgAdminSetAccessIn, request: Request):
+def org_admin_set_member_access(user_id: int, payload: OrgAdminSetAccessIn, request: Request, org_id: int | None = None):
     """Définit les accès automates d'un membre (limité à l'org de l'admin)."""
-    admin = _require_org_admin(request)
+    admin = _require_org_admin(request, org_id=org_id)
     org_id = admin["organization_id"]
     org_name = admin["organization_name"]
     # Vérifier que l'utilisateur fait partie de l'organisation
