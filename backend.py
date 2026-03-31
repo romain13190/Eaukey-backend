@@ -562,10 +562,10 @@ def taux_recyclage_jour(nom_automate: str = Query(..., description="Nom de l'aut
             WHEN (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3)) = 0
                  OR (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3)) IS NULL
             THEN 0
-            ELSE ROUND((
+            ELSE ROUND(((
                 (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3))
               - (MAX(compteur_eau_adoucie_m3) - MIN(compteur_eau_adoucie_m3))
-            ) / (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3))::numeric, 4)
+            ) / NULLIF(MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3), 0))::numeric, 4)
         END AS taux_recyclage
     FROM mesures
     WHERE nom_automate = %s
@@ -588,10 +588,10 @@ def taux_recyclage_semaine(nom_automate: str = Query(..., description="Nom de l'
             WHEN (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3)) = 0
                  OR (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3)) IS NULL
             THEN 0
-            ELSE ROUND((
+            ELSE ROUND(((
                 (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3))
               - (MAX(compteur_eau_adoucie_m3) - MIN(compteur_eau_adoucie_m3))
-            ) / (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3))::numeric, 4)
+            ) / NULLIF(MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3), 0))::numeric, 4)
         END AS taux_recyclage
     FROM mesures
     WHERE nom_automate = %s
@@ -614,10 +614,10 @@ def taux_recyclage_mois(nom_automate: str = Query(..., description="Nom de l'aut
             WHEN (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3)) = 0
                  OR (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3)) IS NULL
             THEN 0
-            ELSE ROUND((
+            ELSE ROUND(((
                 (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3))
               - (MAX(compteur_eau_adoucie_m3) - MIN(compteur_eau_adoucie_m3))
-            ) / (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3))::numeric, 4)
+            ) / NULLIF(MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3), 0))::numeric, 4)
         END AS taux_recyclage
     FROM mesures
     WHERE nom_automate = %s
@@ -640,10 +640,10 @@ def taux_recyclage_annee(nom_automate: str = Query(..., description="Nom de l'au
             WHEN (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3)) = 0
                  OR (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3)) IS NULL
             THEN 0
-            ELSE ROUND((
+            ELSE ROUND(((
                 (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3))
               - (MAX(compteur_eau_adoucie_m3) - MIN(compteur_eau_adoucie_m3))
-            ) / (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3))::numeric, 4)
+            ) / NULLIF(MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3), 0))::numeric, 4)
         END AS taux_recyclage
     FROM mesures
     WHERE nom_automate = %s
