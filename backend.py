@@ -1458,19 +1458,19 @@ def _require_auth(request: Request) -> dict:
     return {"id": row[0], "email": row[1], "roles": roles, "client_id": row[3]}
 
 
-def _get_org_for_user(user_id: int) -> Optional[tuple[int, str]]:
-    row = executer_requete_sql_one(
+def _get_orgs_for_user(user_id: int) -> list[tuple[int, str]]:
+    """Retourne TOUTES les organisations d'un utilisateur (pas seulement la première)."""
+    rows = executer_requete_sql(
         """
         SELECT o.id, o.name
         FROM organization_users ou
         JOIN organizations o ON o.id = ou.organization_id
         WHERE ou.user_id = %s
-        ORDER BY o.id
-        LIMIT 1;
+        ORDER BY o.name;
         """,
         (user_id,),
     )
-    return (row[0], row[1]) if row else None
+    return [(r[0], r[1]) for r in rows]
 
 
 class AuthRegisterIn(BaseModel):
@@ -1875,15 +1875,7 @@ def volumes_total(request: Request):
     if "admin" in roles or "super_admin" in roles:
         automates = executer_requete_sql("SELECT nom_automate FROM automate")
     else:
-        orgs = executer_requete_sql(
-            """
-            SELECT o.id, o.name
-            FROM organization_users ou
-            JOIN organizations o ON o.id = ou.organization_id
-            WHERE ou.user_id = %s;
-            """,
-            (user["id"],),
-        )
+        orgs = _get_orgs_for_user(user["id"])
         if not orgs:
             return {"total_recycle_m3": 0, "nb_stations": 0}
         org_names = [o[1] for o in orgs]
@@ -2005,17 +1997,7 @@ def list_my_automates(request: Request):
     if "admin" in roles or "super_admin" in roles:
         rows = executer_requete_sql("SELECT nom_automate, client, lieu, email, email2, email3 FROM automate;")
     else:
-        # Récupérer TOUTES les organisations de l'utilisateur
-        orgs = executer_requete_sql(
-            """
-            SELECT o.id, o.name
-            FROM organization_users ou
-            JOIN organizations o ON o.id = ou.organization_id
-            WHERE ou.user_id = %s
-            ORDER BY o.name;
-            """,
-            (user["id"],),
-        )
+        orgs = _get_orgs_for_user(user["id"])
         if not orgs:
             return []
         org_names = [o[1] for o in orgs]
