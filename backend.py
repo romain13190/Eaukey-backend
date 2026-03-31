@@ -2025,6 +2025,49 @@ def list_my_automates(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# ADMIN: VISUALISER L'INTERFACE D'UN UTILISATEUR
+# ---------------------------------------------------------------------------
+
+@app.get("/admin/view-as/{user_id}")
+def admin_view_as_user(user_id: int, request: Request):
+    """Retourne les automates visibles par un utilisateur donné (admin/super_admin only)."""
+    _require_admin_or_super(request)
+    # Vérifier que l'utilisateur cible existe
+    target = executer_requete_sql_one(
+        "SELECT id, email, client_id FROM users WHERE id = %s", (user_id,)
+    )
+    if not target:
+        raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
+    # Récupérer ses organisations
+    orgs = _get_orgs_for_user(user_id)
+    if not orgs:
+        return {"user": {"id": target[0], "email": target[1], "client_id": target[2]}, "automates": []}
+    org_names = [o[1] for o in orgs]
+    placeholders = ",".join(["%s"] * len(org_names))
+    rows = executer_requete_sql(
+        f"""
+        SELECT nom_automate, client, lieu, email, email2, email3
+        FROM automate
+        WHERE lower(client) IN ({placeholders});
+        """,
+        tuple(n.lower() for n in org_names),
+    )
+    automates = [
+        {
+            "nom_automate": r[0], "client": r[1], "lieu": r[2],
+            "email": r[3], "email2": r[4], "email3": r[5],
+            "emails": [e for e in [r[3], r[4], r[5]] if e],
+        }
+        for r in rows
+    ]
+    return {
+        "user": {"id": target[0], "email": target[1], "client_id": target[2]},
+        "organizations": [{"id": o[0], "name": o[1]} for o in orgs],
+        "automates": automates,
+    }
+
+
+# ---------------------------------------------------------------------------
 # ENDPOINTS PANNES (ADMIN-ONLY)
 # ---------------------------------------------------------------------------
 
