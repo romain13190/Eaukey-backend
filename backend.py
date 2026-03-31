@@ -1947,7 +1947,9 @@ def volumes_total(request: Request):
 
     if "admin" in roles or "super_admin" in roles:
         rows = executer_requete_sql(
-            "SELECT compteur_eau_renvoi_m3, compteur_eau_adoucie_m3 FROM cache_volumes_total"
+            """SELECT c.compteur_eau_renvoi_m3, c.compteur_eau_adoucie_m3
+               FROM cache_volumes_total c
+               JOIN automate a ON a.nom_automate = c.nom_automate"""
         )
     else:
         orgs = _get_orgs_for_user(user["id"])
