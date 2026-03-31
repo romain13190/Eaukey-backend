@@ -1940,44 +1940,35 @@ def _require_admin_or_super(request: Request) -> dict:
 @app.get("/volumes/total")
 def volumes_total(request: Request):
     """Total m3 recyclés (renvoi - adoucie) pour toutes les stations accessibles par l'utilisateur.
-    Prend la derniere valeur compteur de chaque station (compteurs cumulatifs).
+    Lit depuis la table cache_volumes_total (précalculée par ETL_volumes_total).
     Les stations dont la difference est negative sont exclues du total."""
     user = _require_auth(request)
     roles = [r.lower() for r in user.get("roles", [])]
-    # Recupere la liste des automates puis, pour chacun, la derniere valeur
-    # des compteurs renvoi et adoucie (requete LIMIT 1 ultra rapide avec index).
+
     if "admin" in roles or "super_admin" in roles:
-        automates = executer_requete_sql("SELECT nom_automate FROM automate")
+        rows = executer_requete_sql(
+            "SELECT compteur_eau_renvoi_m3, compteur_eau_adoucie_m3 FROM cache_volumes_total"
+        )
     else:
         orgs = _get_orgs_for_user(user["id"])
         if not orgs:
             return {"total_recycle_m3": 0, "nb_stations": 0}
         org_names = [o[1] for o in orgs]
         placeholders = ",".join(["%s"] * len(org_names))
-        automates = executer_requete_sql(
-            f"SELECT nom_automate FROM automate WHERE lower(client) IN ({placeholders})",
+        rows = executer_requete_sql(
+            f"""SELECT c.compteur_eau_renvoi_m3, c.compteur_eau_adoucie_m3
+                FROM cache_volumes_total c
+                JOIN automate a ON a.nom_automate = c.nom_automate
+                WHERE lower(a.client) IN ({placeholders})""",
             tuple(n.lower() for n in org_names),
         )
 
     total = 0.0
     nb = 0
-    query_compteur = """
-        SELECT compteur_eau_renvoi_m3, compteur_eau_adoucie_m3
-        FROM mesures
-        WHERE nom_automate = %s
-          AND compteur_eau_renvoi_m3 IS NOT NULL
-          AND compteur_eau_adoucie_m3 IS NOT NULL
-        ORDER BY horodatage DESC
-        LIMIT 1
-    """
-    for (nom,) in automates:
-        rows = executer_requete_sql(query_compteur, (nom,))
-        if not rows:
-            continue
-        renvoi, adoucie = rows[0]
+    for renvoi, adoucie in rows:
         diff = renvoi - adoucie
         if diff >= 0:
-            total += diff
+            total += float(diff)
             nb += 1
 
     return {
