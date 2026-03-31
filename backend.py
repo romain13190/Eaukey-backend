@@ -580,25 +580,19 @@ def taux_recyclage_jour(nom_automate: str = Query(..., description="Nom de l'aut
 
 @app.get("/taux_recyclage/semaine")
 def taux_recyclage_semaine(nom_automate: str = Query(..., description="Nom de l'automate")):
-    """Rendement recycleur par jour (MAX-MIN sur chaque jour) sur les 7 derniers jours."""
+    """Rendement recycleur par jour depuis donnees_semaine (ETL).
+    Recalcule (vol_renvoi - vol_adoucie) / vol_renvoi a partir des volumes."""
     query = """
     SELECT
-        date_trunc('day', horodatage)::date AS jour,
-        CASE
-            WHEN (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3)) = 0
-                 OR (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3)) IS NULL
-            THEN 0
-            ELSE ROUND(((
-                (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3))
-              - (MAX(compteur_eau_adoucie_m3) - MIN(compteur_eau_adoucie_m3))
-            ) / NULLIF(MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3), 0))::numeric, 4)
-        END AS taux_recyclage
-    FROM mesures
+        to_char(jour, 'FMDay') AS day_name,
+        GREATEST(0, LEAST(1,
+            CASE
+                WHEN vol_renvoi_m3 IS NULL OR vol_renvoi_m3 <= 0 THEN 0
+                ELSE ((vol_renvoi_m3 - COALESCE(vol_adoucie_m3, 0)) / vol_renvoi_m3)
+            END
+        ))::numeric AS taux_recyclage
+    FROM donnees_semaine
     WHERE nom_automate = %s
-      AND horodatage >= NOW() - INTERVAL '7 days'
-      AND compteur_eau_renvoi_m3 IS NOT NULL
-      AND compteur_eau_adoucie_m3 IS NOT NULL
-    GROUP BY jour
     ORDER BY jour;
     """
     result = executer_requete_sql(query, (nom_automate,))
@@ -606,52 +600,40 @@ def taux_recyclage_semaine(nom_automate: str = Query(..., description="Nom de l'
 
 @app.get("/taux_recyclage/mois")
 def taux_recyclage_mois(nom_automate: str = Query(..., description="Nom de l'automate")):
-    """Rendement recycleur par semaine (MAX-MIN sur chaque semaine) sur les 4 dernieres semaines."""
+    """Rendement recycleur par semaine depuis donnees_mois (ETL).
+    Recalcule (vol_renvoi - vol_adoucie) / vol_renvoi a partir des volumes."""
     query = """
     SELECT
-        date_trunc('week', horodatage)::date AS semaine,
-        CASE
-            WHEN (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3)) = 0
-                 OR (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3)) IS NULL
-            THEN 0
-            ELSE ROUND(((
-                (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3))
-              - (MAX(compteur_eau_adoucie_m3) - MIN(compteur_eau_adoucie_m3))
-            ) / NULLIF(MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3), 0))::numeric, 4)
-        END AS taux_recyclage
-    FROM mesures
+        to_char(semaine_debut, 'YYYY-MM-DD') AS week_label,
+        GREATEST(0, LEAST(1,
+            CASE
+                WHEN vol_renvoi_m3 IS NULL OR vol_renvoi_m3 <= 0 THEN 0
+                ELSE ((vol_renvoi_m3 - COALESCE(vol_adoucie_m3, 0)) / vol_renvoi_m3)
+            END
+        ))::numeric AS taux_recyclage
+    FROM donnees_mois
     WHERE nom_automate = %s
-      AND horodatage >= NOW() - INTERVAL '4 weeks'
-      AND compteur_eau_renvoi_m3 IS NOT NULL
-      AND compteur_eau_adoucie_m3 IS NOT NULL
-    GROUP BY semaine
-    ORDER BY semaine;
+    ORDER BY semaine_debut;
     """
     result = executer_requete_sql(query, (nom_automate,))
     return formater_series(result, timeframe="mois")
 
 @app.get("/taux_recyclage/annee")
 def taux_recyclage_annee(nom_automate: str = Query(..., description="Nom de l'automate")):
-    """Rendement recycleur par mois (MAX-MIN sur chaque mois) sur les 12 derniers mois."""
+    """Rendement recycleur par mois depuis donnees_annees (ETL).
+    Recalcule (vol_renvoi - vol_adoucie) / vol_renvoi a partir des volumes."""
     query = """
     SELECT
-        date_trunc('month', horodatage)::date AS mois,
-        CASE
-            WHEN (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3)) = 0
-                 OR (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3)) IS NULL
-            THEN 0
-            ELSE ROUND(((
-                (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3))
-              - (MAX(compteur_eau_adoucie_m3) - MIN(compteur_eau_adoucie_m3))
-            ) / NULLIF(MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3), 0))::numeric, 4)
-        END AS taux_recyclage
-    FROM mesures
+        to_char(mois_debut, 'FMMonth') AS month_label,
+        GREATEST(0, LEAST(1,
+            CASE
+                WHEN vol_renvoi_m3 IS NULL OR vol_renvoi_m3 <= 0 THEN 0
+                ELSE ((vol_renvoi_m3 - COALESCE(vol_adoucie_m3, 0)) / vol_renvoi_m3)
+            END
+        ))::numeric AS taux_recyclage
+    FROM donnees_annees
     WHERE nom_automate = %s
-      AND horodatage >= NOW() - INTERVAL '12 months'
-      AND compteur_eau_renvoi_m3 IS NOT NULL
-      AND compteur_eau_adoucie_m3 IS NOT NULL
-    GROUP BY mois
-    ORDER BY mois;
+    ORDER BY mois_debut;
     """
     result = executer_requete_sql(query, (nom_automate,))
     return formater_series(result, timeframe="annee")
