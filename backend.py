@@ -1875,11 +1875,22 @@ def volumes_total(request: Request):
     if "admin" in roles or "super_admin" in roles:
         automates = executer_requete_sql("SELECT nom_automate FROM automate")
     else:
-        org = _get_org_for_user(user["id"])
-        if not org:
+        orgs = executer_requete_sql(
+            """
+            SELECT o.id, o.name
+            FROM organization_users ou
+            JOIN organizations o ON o.id = ou.organization_id
+            WHERE ou.user_id = %s;
+            """,
+            (user["id"],),
+        )
+        if not orgs:
             return {"total_recycle_m3": 0, "nb_stations": 0}
+        org_names = [o[1] for o in orgs]
+        placeholders = ",".join(["%s"] * len(org_names))
         automates = executer_requete_sql(
-            "SELECT nom_automate FROM automate WHERE lower(client) = lower(%s)", (org[1],)
+            f"SELECT nom_automate FROM automate WHERE lower(client) IN ({placeholders})",
+            tuple(n.lower() for n in org_names),
         )
 
     total = 0.0
@@ -1994,16 +2005,28 @@ def list_my_automates(request: Request):
     if "admin" in roles or "super_admin" in roles:
         rows = executer_requete_sql("SELECT nom_automate, client, lieu, email, email2, email3 FROM automate;")
     else:
-        org = _get_org_for_user(user["id"])
-        if not org:
-            return []
-        rows = executer_requete_sql(
+        # Récupérer TOUTES les organisations de l'utilisateur
+        orgs = executer_requete_sql(
             """
+            SELECT o.id, o.name
+            FROM organization_users ou
+            JOIN organizations o ON o.id = ou.organization_id
+            WHERE ou.user_id = %s
+            ORDER BY o.name;
+            """,
+            (user["id"],),
+        )
+        if not orgs:
+            return []
+        org_names = [o[1] for o in orgs]
+        placeholders = ",".join(["%s"] * len(org_names))
+        rows = executer_requete_sql(
+            f"""
             SELECT nom_automate, client, lieu, email, email2, email3
             FROM automate
-            WHERE lower(client) = lower(%s);
+            WHERE lower(client) IN ({placeholders});
             """,
-            (org[1],),
+            tuple(n.lower() for n in org_names),
         )
     return [
         {
