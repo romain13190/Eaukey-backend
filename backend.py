@@ -2039,6 +2039,22 @@ def export_csv(
 
     rows = executer_requete_sql(query, tuple(params))
 
+    # Forward-fill taux_recyclage : remplacer les 0 par la dernière valeur positive (par station)
+    taux_idx = safe_cols.index("taux_recyclage") if "taux_recyclage" in safe_cols else None
+    if taux_idx is not None:
+        last_positive = {}  # par nom_automate
+        patched_rows = []
+        for row in rows:
+            row = list(row)
+            station = row[1]
+            val = row[2 + taux_idx]
+            if val is not None and float(val) > 0:
+                last_positive[station] = val
+            elif val is not None and float(val) == 0 and station in last_positive:
+                row[2 + taux_idx] = last_positive[station]
+            patched_rows.append(row)
+        rows = patched_rows
+
     # Construction CSV
     import io, csv
     output = io.StringIO()
