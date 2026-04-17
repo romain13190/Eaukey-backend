@@ -1090,8 +1090,8 @@ def compteur_elec_annee(nom_automate: str = Query(..., description="Nom de l'aut
 @app.get("/ratio_kwh_m3/jour")
 def ratio_kwh_m3_jour(nom_automate: str = Query(..., description="Nom de l'automate")):
     """
-    Ratio kWh / m³ relevé par heure sur les dernières 24h.
-    Calculé à partir des deltas de compteur_electrique_kwh et compteur_eau_relevage_m3.
+    Ratio kWh / m³ relevé par heure sur les dernières 24h, lissé par
+    moyenne glissante sur 3 heures. Les heures sans relevage renvoient null.
     """
     query = """
     WITH w AS (
@@ -1121,22 +1121,34 @@ def ratio_kwh_m3_jour(nom_automate: str = Query(..., description="Nom de l'autom
                 0
             ) AS d_m3
         FROM w
+    ),
+    hourly AS (
+        SELECT
+            heure,
+            CASE
+                WHEN SUM(d_m3) > 0
+                THEN SUM(d_kwh) / SUM(d_m3)
+                ELSE NULL
+            END AS ratio_brut
+        FROM   deltas
+        GROUP  BY heure
     )
     SELECT
         heure,
-        CASE
-            WHEN SUM(d_m3) > 0
-            THEN ROUND((SUM(d_kwh) / SUM(d_m3))::numeric, 3)
-            ELSE 0
-        END AS ratio
-    FROM   deltas
-    GROUP  BY heure
+        ROUND(
+            AVG(ratio_brut) OVER (
+                ORDER BY heure
+                ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+            )::numeric,
+            3
+        ) AS ratio
+    FROM   hourly
     ORDER  BY heure;
     """
     result = executer_requete_sql(query, (nom_automate,))
     return {
         "labels": [row[0].strftime("%H:%M") for row in result],
-        "data":   [float(row[1]) for row in result],
+        "data":   [float(row[1]) if row[1] is not None else None for row in result],
     }
 
 @app.get("/ratio_kwh_m3/semaine")
