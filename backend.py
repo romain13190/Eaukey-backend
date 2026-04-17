@@ -1084,6 +1084,110 @@ def compteur_elec_annee(nom_automate: str = Query(..., description="Nom de l'aut
     return fetch_annee_simple(nom_automate, "conso_kwh")
 
 # -------------------
+# ENDPOINTS RATIO KWH / M3 RELEVÉ (Évolution de la consommation)
+# -------------------
+
+@app.get("/ratio_kwh_m3/jour")
+def ratio_kwh_m3_jour(nom_automate: str = Query(..., description="Nom de l'automate")):
+    """
+    Ratio kWh / m³ relevé par heure sur les dernières 24h.
+    Calculé à partir des deltas de compteur_electrique_kwh et compteur_eau_relevage_m3.
+    """
+    query = """
+    WITH w AS (
+        SELECT
+            horodatage,
+            nom_automate,
+            compteur_electrique_kwh,
+            compteur_eau_relevage_m3
+        FROM   mesures
+        WHERE  nom_automate = %s
+          AND  horodatage  >= now() - INTERVAL '24 hours'
+          AND  horodatage  <  now()
+    ),
+    deltas AS (
+        SELECT
+            date_trunc('hour', horodatage) AS heure,
+            GREATEST(
+                compteur_electrique_kwh
+              - LAG(compteur_electrique_kwh)
+                  OVER (PARTITION BY nom_automate ORDER BY horodatage),
+                0
+            ) AS d_kwh,
+            GREATEST(
+                compteur_eau_relevage_m3
+              - LAG(compteur_eau_relevage_m3)
+                  OVER (PARTITION BY nom_automate ORDER BY horodatage),
+                0
+            ) AS d_m3
+        FROM w
+    )
+    SELECT
+        heure,
+        CASE
+            WHEN SUM(d_m3) > 0
+            THEN ROUND((SUM(d_kwh) / SUM(d_m3))::numeric, 3)
+            ELSE 0
+        END AS ratio
+    FROM   deltas
+    GROUP  BY heure
+    ORDER  BY heure;
+    """
+    result = executer_requete_sql(query, (nom_automate,))
+    return {
+        "labels": [row[0].strftime("%H:%M") for row in result],
+        "data":   [float(row[1]) for row in result],
+    }
+
+@app.get("/ratio_kwh_m3/semaine")
+def ratio_kwh_m3_semaine(nom_automate: str = Query(..., description="Nom de l'automate")):
+    query = """
+    SELECT
+      to_char(jour, 'FMDay') AS day_name,
+      CASE
+        WHEN COALESCE(vol_relevage_m3, 0) > 0
+        THEN ROUND((conso_kwh / vol_relevage_m3)::numeric, 3)
+        ELSE 0
+      END AS ratio
+    FROM donnees_semaine
+    WHERE nom_automate = %s
+    ORDER BY jour;
+    """
+    return formater_series(executer_requete_sql(query, (nom_automate,)), timeframe="semaine")
+
+@app.get("/ratio_kwh_m3/mois")
+def ratio_kwh_m3_mois(nom_automate: str = Query(..., description="Nom de l'automate")):
+    query = """
+    SELECT
+      to_char(semaine_debut, 'YYYY-MM-DD') AS week_label,
+      CASE
+        WHEN COALESCE(vol_relevage_m3, 0) > 0
+        THEN ROUND((conso_kwh / vol_relevage_m3)::numeric, 3)
+        ELSE 0
+      END AS ratio
+    FROM donnees_mois
+    WHERE nom_automate = %s
+    ORDER BY semaine_debut;
+    """
+    return formater_series(executer_requete_sql(query, (nom_automate,)), timeframe="mois")
+
+@app.get("/ratio_kwh_m3/annee")
+def ratio_kwh_m3_annee(nom_automate: str = Query(..., description="Nom de l'automate")):
+    query = """
+    SELECT
+      to_char(mois_debut, 'FMMonth') AS month_label,
+      CASE
+        WHEN COALESCE(vol_relevage_m3, 0) > 0
+        THEN ROUND((conso_kwh / vol_relevage_m3)::numeric, 3)
+        ELSE 0
+      END AS ratio
+    FROM donnees_annees
+    WHERE nom_automate = %s
+    ORDER BY mois_debut;
+    """
+    return formater_series(executer_requete_sql(query, (nom_automate,)), timeframe="annee")
+
+# -------------------
 # ENDPOINTS DONNÉES TEMPS RÉEL
 # -------------------
 
