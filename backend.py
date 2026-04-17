@@ -2039,21 +2039,36 @@ def export_csv(
 
     rows = executer_requete_sql(query, tuple(params))
 
-    # Forward-fill taux_recyclage : remplacer les 0 par la dernière valeur positive (par station)
+    # Lissage taux_recyclage : forward-fill + backward-fill pour les 0 en debut (par station)
     taux_idx = safe_cols.index("taux_recyclage") if "taux_recyclage" in safe_cols else None
     if taux_idx is not None:
-        last_positive = {}  # par nom_automate
-        patched_rows = []
-        for row in rows:
-            row = list(row)
-            station = row[1]
-            val = row[2 + taux_idx]
-            if val is not None and float(val) > 0:
-                last_positive[station] = val
-            elif val is not None and float(val) == 0 and station in last_positive:
-                row[2 + taux_idx] = last_positive[station]
-            patched_rows.append(row)
-        rows = patched_rows
+        col = 2 + taux_idx
+        rows = [list(r) for r in rows]
+        # Grouper par station
+        stations = {}
+        for i, row in enumerate(rows):
+            stations.setdefault(row[1], []).append(i)
+        for station, indices in stations.items():
+            # Forward-fill
+            last_positive = None
+            for i in indices:
+                val = rows[i][col]
+                if val is not None and float(val) > 0:
+                    last_positive = val
+                elif val is not None and float(val) == 0 and last_positive is not None:
+                    rows[i][col] = last_positive
+            # Backward-fill pour les 0 en debut de serie
+            first_positive = None
+            for i in indices:
+                if rows[i][col] is not None and float(rows[i][col]) > 0:
+                    first_positive = rows[i][col]
+                    break
+            if first_positive is not None:
+                for i in indices:
+                    if rows[i][col] is not None and float(rows[i][col]) == 0:
+                        rows[i][col] = first_positive
+                    else:
+                        break
 
     # Construction CSV
     import io, csv
