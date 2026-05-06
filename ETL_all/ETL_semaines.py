@@ -46,6 +46,18 @@ CREATE TABLE IF NOT EXISTS donnees_semaine (
   -- Électricité: somme des deltas kWh/jour
   conso_kwh             numeric,
 
+  -- Conductivites (moy + med)
+  cond_traitement_moy                numeric,
+  cond_traitement_med                numeric,
+  cond_renvoi_moy                    numeric,
+  cond_renvoi_med                    numeric,
+
+  -- Hauteurs cuves (moy + med, en %)
+  hauteur_cuve_traitement_moy_pc     numeric,
+  hauteur_cuve_traitement_med_pc     numeric,
+  hauteur_cuve_disconnection_moy_pc  numeric,
+  hauteur_cuve_disconnection_med_pc  numeric,
+
   created_at            timestamptz DEFAULT now(),
   updated_at            timestamptz DEFAULT now(),
 
@@ -194,6 +206,25 @@ elec_jour AS (
   GROUP BY 1,2
 ),
 
+-- ===== Conductivites & hauteurs cuves (depuis mesures) =====
+cond_cuve_jour AS (
+  SELECT
+    date_trunc('day', horodatage)::date AS jour,
+    nom_automate,
+    ROUND(AVG(conductivite_traitement)::numeric, 2)                                          AS cond_traitement_moy,
+    ROUND((percentile_cont(0.5) WITHIN GROUP (ORDER BY conductivite_traitement))::numeric, 2) AS cond_traitement_med,
+    ROUND(AVG(conductivite_renvoi)::numeric, 2)                                              AS cond_renvoi_moy,
+    ROUND((percentile_cont(0.5) WITHIN GROUP (ORDER BY conductivite_renvoi))::numeric, 2)    AS cond_renvoi_med,
+    ROUND(AVG(hauteur_cuve_traitement_pc)::numeric, 2)                                       AS hauteur_cuve_traitement_moy_pc,
+    ROUND((percentile_cont(0.5) WITHIN GROUP (ORDER BY hauteur_cuve_traitement_pc))::numeric, 2) AS hauteur_cuve_traitement_med_pc,
+    ROUND(AVG(hauteur_cuve_disconnection_pc)::numeric, 2)                                    AS hauteur_cuve_disconnection_moy_pc,
+    ROUND((percentile_cont(0.5) WITHIN GROUP (ORDER BY hauteur_cuve_disconnection_pc))::numeric, 2) AS hauteur_cuve_disconnection_med_pc
+  FROM mesures
+  WHERE horodatage >= (SELECT d FROM today) - INTERVAL '7 days'
+    AND horodatage <  (SELECT d FROM today)
+  GROUP BY 1,2
+),
+
 final AS (
   SELECT
     g.jour,
@@ -225,7 +256,16 @@ final AS (
 
     ph.ph_moyen,
 
-    GREATEST(e.conso_kwh, 0) AS conso_kwh
+    GREATEST(e.conso_kwh, 0) AS conso_kwh,
+
+    cc.cond_traitement_moy,
+    cc.cond_traitement_med,
+    cc.cond_renvoi_moy,
+    cc.cond_renvoi_med,
+    cc.hauteur_cuve_traitement_moy_pc,
+    cc.hauteur_cuve_traitement_med_pc,
+    cc.hauteur_cuve_disconnection_moy_pc,
+    cc.hauteur_cuve_disconnection_med_pc
   FROM grid g
   LEFT JOIN vols_jour       v  ON (v.jour,  v.nom_automate)  = (g.jour, g.nom_automate)
   LEFT JOIN desinf_jour     d  ON (d.jour,  d.nom_automate)  = (g.jour, g.nom_automate)
@@ -234,6 +274,7 @@ final AS (
   LEFT JOIN chlore_moy_jour c  ON (c.jour,  c.nom_automate)  = (g.jour, g.nom_automate)
   LEFT JOIN ph_jour         ph ON (ph.jour, ph.nom_automate) = (g.jour, g.nom_automate)
   LEFT JOIN elec_jour       e  ON (e.jour,  e.nom_automate)  = (g.jour, g.nom_automate)
+  LEFT JOIN cond_cuve_jour  cc ON (cc.jour, cc.nom_automate) = (g.jour, g.nom_automate)
 )
 
 INSERT INTO donnees_semaine AS ds (
@@ -246,6 +287,10 @@ INSERT INTO donnees_semaine AS ds (
   chlore_moy_mg_l,
   ph_moyen,
   conso_kwh,
+  cond_traitement_moy, cond_traitement_med,
+  cond_renvoi_moy, cond_renvoi_med,
+  hauteur_cuve_traitement_moy_pc, hauteur_cuve_traitement_med_pc,
+  hauteur_cuve_disconnection_moy_pc, hauteur_cuve_disconnection_med_pc,
   updated_at
 )
 SELECT
@@ -258,6 +303,10 @@ SELECT
   chlore_moy_mg_l,
   ph_moyen,
   conso_kwh,
+  cond_traitement_moy, cond_traitement_med,
+  cond_renvoi_moy, cond_renvoi_med,
+  hauteur_cuve_traitement_moy_pc, hauteur_cuve_traitement_med_pc,
+  hauteur_cuve_disconnection_moy_pc, hauteur_cuve_disconnection_med_pc,
   now()
 FROM final
 ON CONFLICT (jour, nom_automate) DO UPDATE SET
@@ -275,6 +324,14 @@ ON CONFLICT (jour, nom_automate) DO UPDATE SET
   chlore_moy_mg_l = EXCLUDED.chlore_moy_mg_l,
   ph_moyen        = EXCLUDED.ph_moyen,
   conso_kwh       = EXCLUDED.conso_kwh,
+  cond_traitement_moy               = EXCLUDED.cond_traitement_moy,
+  cond_traitement_med               = EXCLUDED.cond_traitement_med,
+  cond_renvoi_moy                   = EXCLUDED.cond_renvoi_moy,
+  cond_renvoi_med                   = EXCLUDED.cond_renvoi_med,
+  hauteur_cuve_traitement_moy_pc    = EXCLUDED.hauteur_cuve_traitement_moy_pc,
+  hauteur_cuve_traitement_med_pc    = EXCLUDED.hauteur_cuve_traitement_med_pc,
+  hauteur_cuve_disconnection_moy_pc = EXCLUDED.hauteur_cuve_disconnection_moy_pc,
+  hauteur_cuve_disconnection_med_pc = EXCLUDED.hauteur_cuve_disconnection_med_pc,
   updated_at      = now();
 """
 
