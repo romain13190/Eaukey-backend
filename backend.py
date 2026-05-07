@@ -1355,6 +1355,7 @@ def hauteur_cuve_traitement_jour(nom_automate: str = Query(..., description="Nom
     WHERE  nom_automate = %s
       AND  horodatage  >= now() - INTERVAL '24 hours'
       AND  horodatage  <  now()
+      AND  hauteur_cuve_traitement_pc BETWEEN 0 AND 150
     GROUP  BY heure
     ORDER  BY heure;
     """
@@ -1362,15 +1363,15 @@ def hauteur_cuve_traitement_jour(nom_automate: str = Query(..., description="Nom
 
 @app.get("/hauteur_cuve_traitement/semaine")
 def hauteur_cuve_traitement_semaine(nom_automate: str = Query(..., description="Nom de l'automate")):
-    return fetch_semaine_simple(nom_automate, "hauteur_cuve_traitement_moy_pc")
+    return _filtrer_extremes(fetch_semaine_simple(nom_automate, "hauteur_cuve_traitement_moy_pc"), 0, 150)
 
 @app.get("/hauteur_cuve_traitement/mois")
 def hauteur_cuve_traitement_mois(nom_automate: str = Query(..., description="Nom de l'automate")):
-    return fetch_mois_simple(nom_automate, "hauteur_cuve_traitement_moy_pc")
+    return _filtrer_extremes(fetch_mois_simple(nom_automate, "hauteur_cuve_traitement_moy_pc"), 0, 150)
 
 @app.get("/hauteur_cuve_traitement/annee")
 def hauteur_cuve_traitement_annee(nom_automate: str = Query(..., description="Nom de l'automate")):
-    return fetch_annee_simple(nom_automate, "hauteur_cuve_traitement_moy_pc")
+    return _filtrer_extremes(fetch_annee_simple(nom_automate, "hauteur_cuve_traitement_moy_pc"), 0, 150)
 
 # -------------------
 # ENDPOINTS HAUTEUR CUVE DISCONNEXION (mono-serie, %)
@@ -1386,6 +1387,7 @@ def hauteur_cuve_disconnection_jour(nom_automate: str = Query(..., description="
     WHERE  nom_automate = %s
       AND  horodatage  >= now() - INTERVAL '24 hours'
       AND  horodatage  <  now()
+      AND  hauteur_cuve_disconnection_pc BETWEEN 0 AND 150
     GROUP  BY heure
     ORDER  BY heure;
     """
@@ -1393,15 +1395,15 @@ def hauteur_cuve_disconnection_jour(nom_automate: str = Query(..., description="
 
 @app.get("/hauteur_cuve_disconnection/semaine")
 def hauteur_cuve_disconnection_semaine(nom_automate: str = Query(..., description="Nom de l'automate")):
-    return fetch_semaine_simple(nom_automate, "hauteur_cuve_disconnection_moy_pc")
+    return _filtrer_extremes(fetch_semaine_simple(nom_automate, "hauteur_cuve_disconnection_moy_pc"), 0, 150)
 
 @app.get("/hauteur_cuve_disconnection/mois")
 def hauteur_cuve_disconnection_mois(nom_automate: str = Query(..., description="Nom de l'automate")):
-    return fetch_mois_simple(nom_automate, "hauteur_cuve_disconnection_moy_pc")
+    return _filtrer_extremes(fetch_mois_simple(nom_automate, "hauteur_cuve_disconnection_moy_pc"), 0, 150)
 
 @app.get("/hauteur_cuve_disconnection/annee")
 def hauteur_cuve_disconnection_annee(nom_automate: str = Query(..., description="Nom de l'automate")):
-    return fetch_annee_simple(nom_automate, "hauteur_cuve_disconnection_moy_pc")
+    return _filtrer_extremes(fetch_annee_simple(nom_automate, "hauteur_cuve_disconnection_moy_pc"), 0, 150)
 
 # -------------------
 # ENDPOINTS DONNÉES TEMPS RÉEL
