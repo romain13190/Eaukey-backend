@@ -350,6 +350,69 @@ def liste_automates():
     ]
 
 
+# ---------------------------------------------------------------------------
+# Endpoint : dernière ligne des données modifiables (consignes / paramètres)
+# pour un automate donné. Renvoie {"data": null} si aucune ligne.
+# ---------------------------------------------------------------------------
+DONNEES_MODIFIABLES_COLS = [
+    "horodatage",
+    "numero_automate",
+    "nom_automate",
+    "relevage_on",
+    "filtration_on",
+    "renvoi_on",
+    "consigne_pompe_relevage",
+    "consigne_debit_max_pompe_relevage_m3h",
+    "choix_pompe_relevage",
+    "temps_ouverture_decanteur_min",
+    "volume_relevage_entre_pause_decal",
+    "temps_pause_ms",
+    "hauteur_cuve_traitement_demarrage_relevage_pc",
+    "consigne_vitesse_pompe_filtration",
+    "consigne_pression_max_filtre_mbar",
+    "hauteur_stop_filtration_pc",
+    "hauteur_relance_filtration_pc",
+    "choix_pompe_filtration",
+    "hauteur_cuve_traitement_demarrage_filtration_pc",
+    "hauteur_min_remplissage_eau_adoucie_pc",
+    "hauteur_max_pc",
+    "valeur_min_conductivite_us_cm2",
+    "valeur_max_conductivite_us_cm2",
+    "volume_actualisation_renvoi_dilution_m3",
+    "choix_pompe_renvoi",
+    "consigne_vitesse_pompe_renvoi",
+    "consigne_pression_station_mbar",
+    "hysteresis_renvoi_mbar",
+    "ouverture_electrovanne_station_mbar",
+    "fermeture_electrovanne_station_mbar",
+    "temps_cl_filtre_media",
+    "temps_cl_ca_filtre_transparent",
+    "frequence_vidange_cuve",
+    "frequence_vidange_filtration",
+    "temps_dosage",
+]
+
+
+@app.get("/donnees_modifiables/{nom_automate}")
+def get_donnees_modifiables(nom_automate: str):
+    cols_sql = ", ".join(DONNEES_MODIFIABLES_COLS)
+    query = f"""
+        SELECT {cols_sql}
+        FROM donnees_modifiables
+        WHERE nom_automate = %s
+        ORDER BY horodatage DESC
+        LIMIT 1
+    """
+    rows = executer_requete_sql(query, (nom_automate,))
+    if not rows:
+        return {"data": None}
+    r = rows[0]
+    row = dict(zip(DONNEES_MODIFIABLES_COLS, r))
+    if row.get("horodatage") is not None:
+        row["horodatage"] = row["horodatage"].isoformat()
+    return {"data": row}
+
+
 # Endpoints pour renvoi
 @app.get("/renvoi/jour")
 def renvoi_jour_delta_m3(nom_automate: str = Query(..., description="Nom de l'automate")):
@@ -1198,6 +1261,147 @@ def ratio_kwh_m3_annee(nom_automate: str = Query(..., description="Nom de l'auto
     ORDER BY mois_debut;
     """
     return formater_series(executer_requete_sql(query, (nom_automate,)), timeframe="annee")
+
+# -------------------
+# ENDPOINTS CONDUCTIVITE (traitement + renvoi, multi-series)
+# -------------------
+
+@app.get("/conductivite/jour")
+def conductivite_jour(nom_automate: str = Query(..., description="Nom de l'automate")):
+    query = """
+    SELECT
+        date_trunc('hour', horodatage) AS heure,
+        ROUND((percentile_cont(0.5) WITHIN GROUP (ORDER BY conductivite_traitement))::numeric, 1) AS cond_t,
+        ROUND((percentile_cont(0.5) WITHIN GROUP (ORDER BY conductivite_renvoi))::numeric, 1)     AS cond_r
+    FROM   mesures
+    WHERE  nom_automate = %s
+      AND  horodatage  >= now() - INTERVAL '24 hours'
+      AND  horodatage  <  now()
+    GROUP  BY heure
+    ORDER  BY heure;
+    """
+    rows = executer_requete_sql(query, (nom_automate,))
+    return {
+        "labels": [r[0].strftime("%H:%M") for r in rows],
+        "cond_traitement": [float(r[1]) if r[1] is not None else 0 for r in rows],
+        "cond_renvoi":     [float(r[2]) if r[2] is not None else 0 for r in rows],
+    }
+
+@app.get("/conductivite/semaine")
+def conductivite_semaine(nom_automate: str = Query(..., description="Nom de l'automate")):
+    query = """
+    SELECT
+      to_char(jour, 'FMDay') AS day_name,
+      COALESCE(cond_traitement_moy, 0) AS cond_t,
+      COALESCE(cond_renvoi_moy, 0)     AS cond_r
+    FROM donnees_semaine
+    WHERE nom_automate = %s
+    ORDER BY jour;
+    """
+    rows = executer_requete_sql(query, (nom_automate,))
+    return {
+        "labels": [r[0].strip() for r in rows],
+        "cond_traitement": [float(r[1]) for r in rows],
+        "cond_renvoi":     [float(r[2]) for r in rows],
+    }
+
+@app.get("/conductivite/mois")
+def conductivite_mois(nom_automate: str = Query(..., description="Nom de l'automate")):
+    query = """
+    SELECT
+      to_char(semaine_debut, 'YYYY-MM-DD') AS week_label,
+      COALESCE(cond_traitement_moy, 0) AS cond_t,
+      COALESCE(cond_renvoi_moy, 0)     AS cond_r
+    FROM donnees_mois
+    WHERE nom_automate = %s
+    ORDER BY semaine_debut;
+    """
+    rows = executer_requete_sql(query, (nom_automate,))
+    return {
+        "labels": [r[0] for r in rows],
+        "cond_traitement": [float(r[1]) for r in rows],
+        "cond_renvoi":     [float(r[2]) for r in rows],
+    }
+
+@app.get("/conductivite/annee")
+def conductivite_annee(nom_automate: str = Query(..., description="Nom de l'automate")):
+    query = """
+    SELECT
+      to_char(mois_debut, 'FMMonth') AS month_label,
+      COALESCE(cond_traitement_moy, 0) AS cond_t,
+      COALESCE(cond_renvoi_moy, 0)     AS cond_r
+    FROM donnees_annees
+    WHERE nom_automate = %s
+    ORDER BY mois_debut;
+    """
+    rows = executer_requete_sql(query, (nom_automate,))
+    return {
+        "labels": [r[0].strip() for r in rows],
+        "cond_traitement": [float(r[1]) for r in rows],
+        "cond_renvoi":     [float(r[2]) for r in rows],
+    }
+
+# -------------------
+# ENDPOINTS HAUTEUR CUVE TRAITEMENT (mono-serie, %)
+# -------------------
+
+@app.get("/hauteur_cuve_traitement/jour")
+def hauteur_cuve_traitement_jour(nom_automate: str = Query(..., description="Nom de l'automate")):
+    query = """
+    SELECT
+        date_trunc('hour', horodatage) AS heure,
+        ROUND((percentile_cont(0.5) WITHIN GROUP (ORDER BY hauteur_cuve_traitement_pc))::numeric, 1) AS h_pc
+    FROM   mesures
+    WHERE  nom_automate = %s
+      AND  horodatage  >= now() - INTERVAL '24 hours'
+      AND  horodatage  <  now()
+    GROUP  BY heure
+    ORDER  BY heure;
+    """
+    return formater_series(executer_requete_sql(query, (nom_automate,)), timeframe="jour")
+
+@app.get("/hauteur_cuve_traitement/semaine")
+def hauteur_cuve_traitement_semaine(nom_automate: str = Query(..., description="Nom de l'automate")):
+    return fetch_semaine_simple(nom_automate, "hauteur_cuve_traitement_moy_pc")
+
+@app.get("/hauteur_cuve_traitement/mois")
+def hauteur_cuve_traitement_mois(nom_automate: str = Query(..., description="Nom de l'automate")):
+    return fetch_mois_simple(nom_automate, "hauteur_cuve_traitement_moy_pc")
+
+@app.get("/hauteur_cuve_traitement/annee")
+def hauteur_cuve_traitement_annee(nom_automate: str = Query(..., description="Nom de l'automate")):
+    return fetch_annee_simple(nom_automate, "hauteur_cuve_traitement_moy_pc")
+
+# -------------------
+# ENDPOINTS HAUTEUR CUVE DISCONNEXION (mono-serie, %)
+# -------------------
+
+@app.get("/hauteur_cuve_disconnection/jour")
+def hauteur_cuve_disconnection_jour(nom_automate: str = Query(..., description="Nom de l'automate")):
+    query = """
+    SELECT
+        date_trunc('hour', horodatage) AS heure,
+        ROUND((percentile_cont(0.5) WITHIN GROUP (ORDER BY hauteur_cuve_disconnection_pc))::numeric, 1) AS h_pc
+    FROM   mesures
+    WHERE  nom_automate = %s
+      AND  horodatage  >= now() - INTERVAL '24 hours'
+      AND  horodatage  <  now()
+    GROUP  BY heure
+    ORDER  BY heure;
+    """
+    return formater_series(executer_requete_sql(query, (nom_automate,)), timeframe="jour")
+
+@app.get("/hauteur_cuve_disconnection/semaine")
+def hauteur_cuve_disconnection_semaine(nom_automate: str = Query(..., description="Nom de l'automate")):
+    return fetch_semaine_simple(nom_automate, "hauteur_cuve_disconnection_moy_pc")
+
+@app.get("/hauteur_cuve_disconnection/mois")
+def hauteur_cuve_disconnection_mois(nom_automate: str = Query(..., description="Nom de l'automate")):
+    return fetch_mois_simple(nom_automate, "hauteur_cuve_disconnection_moy_pc")
+
+@app.get("/hauteur_cuve_disconnection/annee")
+def hauteur_cuve_disconnection_annee(nom_automate: str = Query(..., description="Nom de l'automate")):
+    return fetch_annee_simple(nom_automate, "hauteur_cuve_disconnection_moy_pc")
 
 # -------------------
 # ENDPOINTS DONNÉES TEMPS RÉEL
