@@ -585,8 +585,13 @@ def avg_pression5_annee(nom_automate: str = Query(..., description="Nom de l'aut
 
 @app.get("/temps_reel/taux_recyclage")
 def temps_reel_taux_recyclage(nom_automate: str = Query(..., description="Nom de l'automate")):
-    """Taux de recyclage instantane calcule sur les dernieres 24h :
-    (vol_renvoi - vol_adoucie) / vol_renvoi"""
+    """Taux de recyclage sur les dernieres 24h, fenetre alignee sur l'heure tronquee :
+    (vol_renvoi - vol_adoucie) / vol_renvoi
+
+    La carte du front affiche "MAJ par heure" et refresh toutes les heures. On aligne donc
+    la fenetre sur [date_trunc('hour', NOW()) - 24h, date_trunc('hour', NOW())], de sorte
+    que la valeur soit identique a la derniere barre du graph /taux_recyclage/jour.
+    """
     query = """
     WITH bornes AS (
         SELECT
@@ -595,7 +600,8 @@ def temps_reel_taux_recyclage(nom_automate: str = Query(..., description="Nom de
             MAX(horodatage) AS dernier_ts
         FROM mesures
         WHERE nom_automate = %s
-          AND horodatage >= NOW() - INTERVAL '24 hours'
+          AND horodatage >  date_trunc('hour', NOW()) - INTERVAL '24 hours'
+          AND horodatage <= date_trunc('hour', NOW())
           AND compteur_eau_renvoi_m3 IS NOT NULL
           AND compteur_eau_adoucie_m3 IS NOT NULL
     )
