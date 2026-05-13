@@ -617,26 +617,46 @@ def temps_reel_taux_recyclage(nom_automate: str = Query(..., description="Nom de
 
 @app.get("/taux_recyclage/jour")
 def taux_recyclage_jour(nom_automate: str = Query(..., description="Nom de l'automate")):
-    """Rendement recycleur par heure (MAX-MIN sur chaque heure) sur les dernieres 24h."""
+    """Rendement recycleur sur les dernieres 24h, en fenetre glissante 24h pour chaque heure.
+
+    Les compteurs eau_renvoi / eau_adoucie incrementent par paliers de 1 m3 (quelques ticks
+    par jour seulement). Un calcul MAX-MIN par heure donne des ratios 0% ou 100% noisy.
+    On calcule donc pour chaque heure H le taux sur la fenetre [H-24h, H], ce qui converge
+    a la derniere heure vers le KPI temps reel et lisse les valeurs sur la journee.
+    """
     query = """
+    WITH hours AS (
+        SELECT generate_series(
+            date_trunc('hour', NOW()) - INTERVAL '23 hours',
+            date_trunc('hour', NOW()),
+            INTERVAL '1 hour'
+        ) AS heure
+    ),
+    mesures_window AS (
+        SELECT horodatage, compteur_eau_renvoi_m3, compteur_eau_adoucie_m3
+        FROM mesures
+        WHERE nom_automate = %s
+          AND horodatage > NOW() - INTERVAL '48 hours'
+          AND compteur_eau_renvoi_m3 IS NOT NULL
+          AND compteur_eau_adoucie_m3 IS NOT NULL
+    )
     SELECT
-        date_trunc('hour', horodatage) AS heure,
+        h.heure,
         CASE
-            WHEN (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3)) = 0
-                 OR (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3)) IS NULL
+            WHEN (MAX(m.compteur_eau_renvoi_m3) - MIN(m.compteur_eau_renvoi_m3)) IS NULL
+              OR (MAX(m.compteur_eau_renvoi_m3) - MIN(m.compteur_eau_renvoi_m3)) <= 0
             THEN 0
             ELSE ROUND(((
-                (MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3))
-              - (MAX(compteur_eau_adoucie_m3) - MIN(compteur_eau_adoucie_m3))
-            ) / NULLIF(MAX(compteur_eau_renvoi_m3) - MIN(compteur_eau_renvoi_m3), 0))::numeric, 4)
+                  (MAX(m.compteur_eau_renvoi_m3) - MIN(m.compteur_eau_renvoi_m3))
+                - (MAX(m.compteur_eau_adoucie_m3) - MIN(m.compteur_eau_adoucie_m3))
+              ) / NULLIF(MAX(m.compteur_eau_renvoi_m3) - MIN(m.compteur_eau_renvoi_m3), 0))::numeric, 4)
         END AS taux_recyclage
-    FROM mesures
-    WHERE nom_automate = %s
-      AND horodatage >= NOW() - INTERVAL '24 hours'
-      AND compteur_eau_renvoi_m3 IS NOT NULL
-      AND compteur_eau_adoucie_m3 IS NOT NULL
-    GROUP BY heure
-    ORDER BY heure;
+    FROM hours h
+    LEFT JOIN mesures_window m
+      ON m.horodatage > h.heure - INTERVAL '24 hours'
+     AND m.horodatage <= h.heure
+    GROUP BY h.heure
+    ORDER BY h.heure;
     """
     result = executer_requete_sql(query, (nom_automate,))
     return formater_series(result, timeframe="jour")
