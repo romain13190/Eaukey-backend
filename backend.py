@@ -350,6 +350,242 @@ def liste_automates():
     ]
 
 
+# ---------------------------------------------------------------------------
+# Endpoint : dernière ligne des données modifiables (consignes / paramètres)
+# pour un automate donné. Renvoie {"data": null} si aucune ligne.
+# ---------------------------------------------------------------------------
+DONNEES_MODIFIABLES_COLS = [
+    "horodatage",
+    "numero_automate",
+    "nom_automate",
+    "relevage_on",
+    "filtration_on",
+    "renvoi_on",
+    "consigne_pompe_relevage",
+    "consigne_debit_max_pompe_relevage_m3h",
+    "choix_pompe_relevage",
+    "temps_ouverture_decanteur_min",
+    "volume_relevage_entre_pause_decal",
+    "temps_pause_ms",
+    "hauteur_cuve_traitement_demarrage_relevage_pc",
+    "consigne_vitesse_pompe_filtration",
+    "consigne_pression_max_filtre_mbar",
+    "hauteur_stop_filtration_pc",
+    "hauteur_relance_filtration_pc",
+    "choix_pompe_filtration",
+    "hauteur_cuve_traitement_demarrage_filtration_pc",
+    "hauteur_min_remplissage_eau_adoucie_pc",
+    "hauteur_max_pc",
+    "valeur_min_conductivite_us_cm2",
+    "valeur_max_conductivite_us_cm2",
+    "volume_actualisation_renvoi_dilution_m3",
+    "choix_pompe_renvoi",
+    "consigne_vitesse_pompe_renvoi",
+    "consigne_pression_station_mbar",
+    "hysteresis_renvoi_mbar",
+    "ouverture_electrovanne_station_mbar",
+    "fermeture_electrovanne_station_mbar",
+    "temps_cl_filtre_media",
+    "temps_cl_ca_filtre_transparent",
+    "frequence_vidange_cuve",
+    "frequence_vidange_filtration",
+    "temps_dosage",
+]
+
+
+@app.get("/donnees_modifiables/{nom_automate}")
+def get_donnees_modifiables(nom_automate: str):
+    cols_sql = ", ".join(DONNEES_MODIFIABLES_COLS)
+    query = f"""
+        SELECT {cols_sql}
+        FROM donnees_modifiables
+        WHERE nom_automate = %s
+        ORDER BY horodatage DESC
+        LIMIT 1
+    """
+    rows = executer_requete_sql(query, (nom_automate,))
+    if not rows:
+        return {"data": None}
+    r = rows[0]
+    row = dict(zip(DONNEES_MODIFIABLES_COLS, r))
+    if row.get("horodatage") is not None:
+        row["horodatage"] = row["horodatage"].isoformat()
+    return {"data": row}
+
+
+# ---------------------------------------------------------------------------
+# Consignes modifiables : cible posee par l'utilisateur depuis l'UI.
+# L'automate poll cote Flask (/api/consignes_modifiables/.../diff) et applique
+# quand le diff vaut 1. Une fois applique, son prochain POST de donnees_modifiables
+# fera repasser le diff a 0.
+# ---------------------------------------------------------------------------
+# Colonnes editables : toutes les colonnes de donnees_modifiables sauf l'identite
+# et l'horodatage. Genere depuis DONNEES_MODIFIABLES_COLS pour eviter la duplication.
+CONSIGNES_EDITABLE_COLS = [
+    c for c in DONNEES_MODIFIABLES_COLS
+    if c not in ("horodatage", "numero_automate", "nom_automate")
+]
+
+
+def _user_can_access_automate(user: dict, nom_automate: str) -> bool:
+    """admin / super_admin : tout. Sinon : verifier automate_access."""
+    roles = [r.lower() for r in user.get("roles", [])]
+    if "admin" in roles or "super_admin" in roles:
+        return True
+    row = executer_requete_sql_one(
+        "SELECT 1 FROM automate_access WHERE automate_nom = %s AND user_id = %s",
+        (nom_automate, user["id"]),
+    )
+    return bool(row)
+
+
+@app.get("/consignes_modifiables/{nom_automate}")
+def get_consignes_modifiables(nom_automate: str, request: Request):
+    """Retourne la consigne en attente pour cet automate, ou null si aucune."""
+    user = _require_auth(request)
+    if not _user_can_access_automate(user, nom_automate):
+        raise HTTPException(status_code=403, detail="Acces refuse pour cet automate")
+
+    cols_sql = ", ".join(CONSIGNES_EDITABLE_COLS)
+    query = f"""
+        SELECT {cols_sql}, updated_at, updated_by
+        FROM consignes_modifiables
+        WHERE nom_automate = %s
+        LIMIT 1
+    """
+    rows = executer_requete_sql(query, (nom_automate,))
+    if not rows:
+        return {"data": None}
+    r = rows[0]
+    data = dict(zip(CONSIGNES_EDITABLE_COLS, r[: len(CONSIGNES_EDITABLE_COLS)]))
+    updated_at = r[len(CONSIGNES_EDITABLE_COLS)]
+    updated_by = r[len(CONSIGNES_EDITABLE_COLS) + 1]
+    return {
+        "data": data,
+        "updated_at": updated_at.isoformat() if updated_at else None,
+        "updated_by": updated_by,
+    }
+
+
+class ConsignesModifiablesIn(BaseModel):
+    # Tous les champs sont optionnels : on n'ecrase que ce qui est fourni.
+    # Les types reels sont valides cote SQL (BOOLEAN/INTEGER/REAL).
+    relevage_on: Optional[bool] = None
+    filtration_on: Optional[bool] = None
+    renvoi_on: Optional[bool] = None
+    consigne_pompe_relevage: Optional[int] = None
+    consigne_debit_max_pompe_relevage_m3h: Optional[float] = None
+    choix_pompe_relevage: Optional[int] = None
+    temps_ouverture_decanteur_min: Optional[float] = None
+    volume_relevage_entre_pause_decal: Optional[float] = None
+    temps_pause_ms: Optional[int] = None
+    hauteur_cuve_traitement_demarrage_relevage_pc: Optional[float] = None
+    consigne_vitesse_pompe_filtration: Optional[int] = None
+    consigne_pression_max_filtre_mbar: Optional[float] = None
+    hauteur_stop_filtration_pc: Optional[float] = None
+    hauteur_relance_filtration_pc: Optional[float] = None
+    choix_pompe_filtration: Optional[int] = None
+    hauteur_cuve_traitement_demarrage_filtration_pc: Optional[float] = None
+    hauteur_min_remplissage_eau_adoucie_pc: Optional[float] = None
+    hauteur_max_pc: Optional[float] = None
+    valeur_min_conductivite_us_cm2: Optional[float] = None
+    valeur_max_conductivite_us_cm2: Optional[float] = None
+    volume_actualisation_renvoi_dilution_m3: Optional[float] = None
+    choix_pompe_renvoi: Optional[int] = None
+    consigne_vitesse_pompe_renvoi: Optional[int] = None
+    consigne_pression_station_mbar: Optional[float] = None
+    hysteresis_renvoi_mbar: Optional[float] = None
+    ouverture_electrovanne_station_mbar: Optional[float] = None
+    fermeture_electrovanne_station_mbar: Optional[float] = None
+    temps_cl_filtre_media: Optional[float] = None
+    temps_cl_ca_filtre_transparent: Optional[float] = None
+    frequence_vidange_cuve: Optional[float] = None
+    frequence_vidange_filtration: Optional[float] = None
+    temps_dosage: Optional[float] = None
+
+
+@app.put("/consignes_modifiables/{nom_automate}")
+def upsert_consignes_modifiables(nom_automate: str, payload: ConsignesModifiablesIn, request: Request):
+    """Pose / met a jour la consigne cible pour cet automate.
+
+    Strategie :
+      - upsert sur la PK nom_automate
+      - on initialise une nouvelle ligne avec la derniere ligne de donnees_modifiables
+        si elle n'existe pas encore (ainsi un PUT partiel ne laisse pas les autres
+        champs a NULL, ce qui declencherait un faux diff)
+      - puis on ecrase uniquement les champs fournis dans le payload
+    """
+    user = _require_auth(request)
+    if not _user_can_access_automate(user, nom_automate):
+        raise HTTPException(status_code=403, detail="Acces refuse pour cet automate")
+
+    fields = payload.model_dump(exclude_unset=True)
+    if not fields:
+        raise HTTPException(status_code=400, detail="Aucune valeur a mettre a jour")
+
+    invalid = [k for k in fields if k not in CONSIGNES_EDITABLE_COLS]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"Champs inconnus : {', '.join(invalid)}")
+
+    # Si pas encore de ligne consigne pour cet automate, on l'initialise depuis
+    # la derniere ligne de donnees_modifiables pour eviter un diff parasite sur
+    # les champs non fournis.
+    exists = executer_requete_sql_one(
+        "SELECT 1 FROM consignes_modifiables WHERE nom_automate = %s",
+        (nom_automate,),
+    )
+    if not exists:
+        seed_cols_sql = ", ".join(CONSIGNES_EDITABLE_COLS)
+        seed_row = executer_requete_sql_one(
+            f"""
+            SELECT numero_automate, {seed_cols_sql}
+            FROM donnees_modifiables
+            WHERE nom_automate = %s
+            ORDER BY horodatage DESC
+            LIMIT 1
+            """,
+            (nom_automate,),
+        )
+        if seed_row:
+            insert_cols = ["nom_automate", "numero_automate", *CONSIGNES_EDITABLE_COLS, "updated_by"]
+            placeholders = ", ".join(["%s"] * len(insert_cols))
+            executer_requete_sql(
+                f"INSERT INTO consignes_modifiables ({', '.join(insert_cols)}) VALUES ({placeholders})",
+                (nom_automate, seed_row[0], *seed_row[1:], user.get("email") or ""),
+            )
+        else:
+            # Pas de donnees_modifiables connu pour cet automate : ligne minimale.
+            executer_requete_sql(
+                "INSERT INTO consignes_modifiables (nom_automate, updated_by) VALUES (%s, %s)",
+                (nom_automate, user.get("email") or ""),
+            )
+
+    # UPDATE des champs fournis + updated_at/by.
+    set_parts = [f"{k} = %s" for k in fields]
+    set_parts.append("updated_at = now()")
+    set_parts.append("updated_by = %s")
+    values = list(fields.values()) + [user.get("email") or "", nom_automate]
+    executer_requete_sql(
+        f"UPDATE consignes_modifiables SET {', '.join(set_parts)} WHERE nom_automate = %s",
+        tuple(values),
+    )
+
+    return {"status": "success", "updated_fields": list(fields.keys())}
+
+
+@app.delete("/consignes_modifiables/{nom_automate}")
+def delete_consignes_modifiables(nom_automate: str, request: Request):
+    """Annule la consigne en attente (par ex. apres confirmation que l'automate a applique)."""
+    user = _require_auth(request)
+    if not _user_can_access_automate(user, nom_automate):
+        raise HTTPException(status_code=403, detail="Acces refuse pour cet automate")
+    executer_requete_sql(
+        "DELETE FROM consignes_modifiables WHERE nom_automate = %s",
+        (nom_automate,),
+    )
+    return {"status": "success"}
+
+
 # Endpoints pour renvoi
 @app.get("/renvoi/jour")
 def renvoi_jour_delta_m3(nom_automate: str = Query(..., description="Nom de l'automate")):
