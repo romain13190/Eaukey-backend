@@ -3586,6 +3586,324 @@ def marquer_messages_client_lus(client_id: str):
 # FIN ENDPOINTS MESSAGERIE SIMPLIFIÉS
 # -------------------
 
+
+# ===========================================================================
+# ENDPOINTS RECYCLEURS D'AIR (additif - ne touche AUCUNE logique recycleur eau)
+# ---------------------------------------------------------------------------
+# Grandeurs air dans `mesures` : debit{1,2,3}_m3h, pression{1..4}_pa,
+# temperature{1,3,4}, hygro{1,2,3}_pc, co2_ppm, cov_ppm, mes_microg_l.
+# Tables pre-agregees ETL : donnees_semaine_air / donnees_mois_air / donnees_annees_air.
+# Sentinelle capteur pression deconnecte = |x| >= 60000 (filtree).
+# ===========================================================================
+
+# Cap d'integration (heures) pour les volumes d'air a la volee (cf. ETL air)
+_AIR_DT_CAP_H = 0.0833  # 5 min
+# Borne de validite des pressions (Pa) : hors de cet intervalle = capteur deconnecte
+_AIR_PA_MIN, _AIR_PA_MAX = -60000, 60000
+
+# --- Detection eau/air par les valeurs remontees (avec petit cache TTL) ---
+_AIR_TYPES_CACHE = {"ts": 0.0, "data": None}
+_AIR_TYPES_TTL = 300  # secondes
+
+@app.get("/automates/types")
+def automates_types():
+    """Retourne {nom_automate: 'air'|'eau'} d'apres les grandeurs remontees sur 7 jours.
+    Un automate est 'air' s'il remonte debit/hygro/pression_pa ; sinon 'eau'."""
+    now_ts = time.time()
+    if _AIR_TYPES_CACHE["data"] is not None and (now_ts - _AIR_TYPES_CACHE["ts"]) < _AIR_TYPES_TTL:
+        return _AIR_TYPES_CACHE["data"]
+
+    query = """
+      SELECT nom_automate,
+        CASE WHEN bool_or(
+               debit1_m3h IS NOT NULL OR hygro1_pc IS NOT NULL OR pression1_pa IS NOT NULL
+             ) THEN 'air' ELSE 'eau' END AS type
+      FROM mesures
+      WHERE horodatage > now() - INTERVAL '7 days'
+      GROUP BY nom_automate;
+    """
+    rows = executer_requete_sql(query)
+    data = {r[0]: r[1] for r in rows}
+    _AIR_TYPES_CACHE["ts"] = now_ts
+    _AIR_TYPES_CACHE["data"] = data
+    return data
+
+
+# --- Helpers generiques de series air ---
+def _air_strip_label(x) -> str:
+    return x.strip() if isinstance(x, str) else str(x)
+
+def _air_series_pre_aggrege(table: str, date_col: str, label_kind: str,
+                            nom_automate: str, series: list) -> dict:
+    """Lit une table ETL air pre-agregee et renvoie {labels, <key>:[...], ...}.
+    series = liste de tuples (out_key, db_column). Colonnes hardcodees cote serveur."""
+    cols_sql = ",\n      ".join(f"COALESCE({col}, 0) AS {key}" for key, col in series)
+    if label_kind == "semaine":
+        label_sql = f"to_char({date_col}, 'FMDay')"
+    elif label_kind == "mois":
+        label_sql = f"to_char({date_col}, 'YYYY-MM-DD')"
+    else:  # annee
+        label_sql = f"to_char({date_col}, 'FMMonth')"
+    query = f"""
+      SELECT {label_sql} AS label,
+      {cols_sql}
+      FROM {table}
+      WHERE nom_automate = %s
+      ORDER BY {date_col};
+    """
+    rows = executer_requete_sql(query, (nom_automate,))
+    out = {"labels": [_air_strip_label(r[0]) for r in rows]}
+    for i, (key, _) in enumerate(series, start=1):
+        out[key] = [float(r[i]) if r[i] is not None else 0 for r in rows]
+    return out
+
+def _air_series_jour(nom_automate: str, aggrs: list) -> dict:
+    """Series 'jour' (24h glissantes) calculees a la volee depuis `mesures`.
+    aggrs = liste de tuples (out_key, sql_aggregate_expr)."""
+    agg_sql = ",\n      ".join(f"{expr} AS {key}" for key, expr in aggrs)
+    query = f"""
+      SELECT date_trunc('hour', horodatage) AS heure,
+      {agg_sql}
+      FROM mesures
+      WHERE nom_automate = %s
+        AND horodatage >= now() - INTERVAL '24 hours'
+        AND horodatage <  now()
+      GROUP BY heure
+      ORDER BY heure;
+    """
+    rows = executer_requete_sql(query, (nom_automate,))
+    out = {"labels": [r[0].strftime("%H:%M") for r in rows]}
+    for i, (key, _) in enumerate(aggrs, start=1):
+        out[key] = [float(r[i]) if r[i] is not None else 0 for r in rows]
+    return out
+
+def _air_empty(keys: list) -> dict:
+    return {"labels": [], **{k: [] for k in keys}}
+
+
+# --- DEBITS D'AIR (m3/h) : debit1/2/3 ---
+@app.get("/air/debit_all/{period}")
+def air_debit_all(period: str, nom_automate: str = Query(..., description="Nom de l'automate")):
+    keys = ["debit1_m3h", "debit2_m3h", "debit3_m3h"]
+    if period == "jour":
+        return _air_series_jour(nom_automate, [
+            ("debit1_m3h", "ROUND(AVG(debit1_m3h)::numeric, 1)"),
+            ("debit2_m3h", "ROUND(AVG(debit2_m3h)::numeric, 1)"),
+            ("debit3_m3h", "ROUND(AVG(debit3_m3h)::numeric, 1)"),
+        ])
+    table, date_col, kind = _AIR_PERIOD_MAP.get(period, (None, None, None))
+    if not table:
+        return _air_empty(keys)
+    return _air_series_pre_aggrege(table, date_col, kind, nom_automate, [
+        ("debit1_m3h", "debit1_moy_m3h"),
+        ("debit2_m3h", "debit2_moy_m3h"),
+        ("debit3_m3h", "debit3_moy_m3h"),
+    ])
+
+
+# --- VOLUMES D'AIR TRAITES (m3) : vol_air1/2/3 ---
+@app.get("/air/volume_air/{period}")
+def air_volume_air(period: str, nom_automate: str = Query(..., description="Nom de l'automate")):
+    keys = ["vol_air1_m3", "vol_air2_m3", "vol_air3_m3"]
+    if period == "jour":
+        # Integration trapezoidale du debit, par heure (cf. ETL air)
+        query = f"""
+          WITH flow AS (
+            SELECT date_trunc('hour', horodatage) AS heure,
+              debit1_m3h, debit2_m3h, debit3_m3h,
+              LAG(debit1_m3h) OVER w AS l1,
+              LAG(debit2_m3h) OVER w AS l2,
+              LAG(debit3_m3h) OVER w AS l3,
+              LEAST(GREATEST(EXTRACT(EPOCH FROM (horodatage - LAG(horodatage) OVER w)) / 3600.0, 0), {_AIR_DT_CAP_H}) AS dt_h
+            FROM mesures
+            WHERE nom_automate = %s
+              AND horodatage >= now() - INTERVAL '24 hours'
+              AND horodatage <  now()
+            WINDOW w AS (ORDER BY horodatage)
+          )
+          SELECT heure,
+            ROUND(SUM(COALESCE((debit1_m3h + l1) / 2.0, 0) * dt_h)::numeric, 2),
+            ROUND(SUM(COALESCE((debit2_m3h + l2) / 2.0, 0) * dt_h)::numeric, 2),
+            ROUND(SUM(COALESCE((debit3_m3h + l3) / 2.0, 0) * dt_h)::numeric, 2)
+          FROM flow
+          GROUP BY heure
+          ORDER BY heure;
+        """
+        rows = executer_requete_sql(query, (nom_automate,))
+        return {
+            "labels": [r[0].strftime("%H:%M") for r in rows],
+            "vol_air1_m3": [float(r[1]) if r[1] is not None else 0 for r in rows],
+            "vol_air2_m3": [float(r[2]) if r[2] is not None else 0 for r in rows],
+            "vol_air3_m3": [float(r[3]) if r[3] is not None else 0 for r in rows],
+        }
+    table, date_col, kind = _AIR_PERIOD_MAP.get(period, (None, None, None))
+    if not table:
+        return _air_empty(keys)
+    return _air_series_pre_aggrege(table, date_col, kind, nom_automate, [
+        ("vol_air1_m3", "vol_air1_m3"),
+        ("vol_air2_m3", "vol_air2_m3"),
+        ("vol_air3_m3", "vol_air3_m3"),
+    ])
+
+
+# --- PRESSIONS DIFFERENTIELLES (Pa) : encrassement filtres, sentinelles filtrees ---
+@app.get("/air/pression_all/{period}")
+def air_pression_all(period: str, nom_automate: str = Query(..., description="Nom de l'automate")):
+    keys = ["p1_pa", "p2_pa", "p3_pa", "p4_pa"]
+    if period == "jour":
+        flt = f"FILTER (WHERE {{c}} BETWEEN {_AIR_PA_MIN} AND {_AIR_PA_MAX})"
+        return _air_series_jour(nom_automate, [
+            ("p1_pa", f"ROUND(AVG(pression1_pa) {flt.format(c='pression1_pa')})"),
+            ("p2_pa", f"ROUND(AVG(pression2_pa) {flt.format(c='pression2_pa')})"),
+            ("p3_pa", f"ROUND(AVG(pression3_pa) {flt.format(c='pression3_pa')})"),
+            ("p4_pa", f"ROUND(AVG(pression4_pa) {flt.format(c='pression4_pa')})"),
+        ])
+    table, date_col, kind = _AIR_PERIOD_MAP.get(period, (None, None, None))
+    if not table:
+        return _air_empty(keys)
+    return _air_series_pre_aggrege(table, date_col, kind, nom_automate, [
+        ("p1_pa", "p1_pa"), ("p2_pa", "p2_pa"), ("p3_pa", "p3_pa"), ("p4_pa", "p4_pa"),
+    ])
+
+
+# --- TEMPERATURES (degC) : temperature1/3/4 ---
+@app.get("/air/temperature_all/{period}")
+def air_temperature_all(period: str, nom_automate: str = Query(..., description="Nom de l'automate")):
+    keys = ["temp1_c", "temp3_c", "temp4_c"]
+    if period == "jour":
+        return _air_series_jour(nom_automate, [
+            ("temp1_c", "ROUND(AVG(temperature1)::numeric, 1)"),
+            ("temp3_c", "ROUND(AVG(temperature3)::numeric, 1)"),
+            ("temp4_c", "ROUND(AVG(temperature4)::numeric, 1)"),
+        ])
+    table, date_col, kind = _AIR_PERIOD_MAP.get(period, (None, None, None))
+    if not table:
+        return _air_empty(keys)
+    return _air_series_pre_aggrege(table, date_col, kind, nom_automate, [
+        ("temp1_c", "temp1_c"), ("temp3_c", "temp3_c"), ("temp4_c", "temp4_c"),
+    ])
+
+
+# --- HYGROMETRIE (%) : hygro1/2/3 ---
+@app.get("/air/hygro_all/{period}")
+def air_hygro_all(period: str, nom_automate: str = Query(..., description="Nom de l'automate")):
+    keys = ["hygro1_pc", "hygro2_pc", "hygro3_pc"]
+    if period == "jour":
+        return _air_series_jour(nom_automate, [
+            ("hygro1_pc", "ROUND(AVG(hygro1_pc)::numeric, 1)"),
+            ("hygro2_pc", "ROUND(AVG(hygro2_pc)::numeric, 1)"),
+            ("hygro3_pc", "ROUND(AVG(hygro3_pc)::numeric, 1)"),
+        ])
+    table, date_col, kind = _AIR_PERIOD_MAP.get(period, (None, None, None))
+    if not table:
+        return _air_empty(keys)
+    return _air_series_pre_aggrege(table, date_col, kind, nom_automate, [
+        ("hygro1_pc", "hygro1_pc"), ("hygro2_pc", "hygro2_pc"), ("hygro3_pc", "hygro3_pc"),
+    ])
+
+
+# --- QUALITE D'AIR : co2_ppm, cov_ppm, mes_microg_l (capteurs futurs, peut etre 0) ---
+@app.get("/air/qualite_air/{period}")
+def air_qualite_air(period: str, nom_automate: str = Query(..., description="Nom de l'automate")):
+    keys = ["co2_ppm", "cov_ppm", "mes_microg_l"]
+    if period == "jour":
+        return _air_series_jour(nom_automate, [
+            ("co2_ppm", "ROUND(AVG(co2_ppm)::numeric, 1)"),
+            ("cov_ppm", "ROUND(AVG(cov_ppm)::numeric, 1)"),
+            ("mes_microg_l", "ROUND(AVG(mes_microg_l)::numeric, 1)"),
+        ])
+    table, date_col, kind = _AIR_PERIOD_MAP.get(period, (None, None, None))
+    if not table:
+        return _air_empty(keys)
+    return _air_series_pre_aggrege(table, date_col, kind, nom_automate, [
+        ("co2_ppm", "co2_ppm"), ("cov_ppm", "cov_ppm"), ("mes_microg_l", "mes_microg_l"),
+    ])
+
+
+# Mapping period -> (table ETL air, colonne date, type de label)
+_AIR_PERIOD_MAP = {
+    "semaine": ("donnees_semaine_air", "jour", "semaine"),
+    "mois":    ("donnees_mois_air", "semaine_debut", "mois"),
+    "annee":   ("donnees_annees_air", "mois_debut", "annee"),
+}
+
+
+# --- TEMPS REEL (cartes KPI) : derniere mesure air ---
+def _air_clean_pa(v):
+    """Neutralise les sentinelles capteur pression."""
+    if v is None:
+        return None
+    return v if _AIR_PA_MIN <= v <= _AIR_PA_MAX else None
+
+@app.get("/air/temps_reel/{metric}")
+def air_temps_reel(metric: str, nom_automate: str = Query(..., description="Nom de l'automate")):
+    """Derniere valeur pour les cartes KPI air. JSON : {horodatage, valeur, valeurs?}.
+    `valeur` = valeur principale (compat KpiCard) ; `valeurs` = detail par capteur."""
+    # Cas special : volume d'air traite sur les 24 dernieres heures (integration)
+    if metric == "volume_air":
+        query = f"""
+          WITH flow AS (
+            SELECT
+              debit1_m3h, debit2_m3h, debit3_m3h,
+              LAG(debit1_m3h) OVER w AS l1, LAG(debit2_m3h) OVER w AS l2, LAG(debit3_m3h) OVER w AS l3,
+              LEAST(GREATEST(EXTRACT(EPOCH FROM (horodatage - LAG(horodatage) OVER w)) / 3600.0, 0), {_AIR_DT_CAP_H}) AS dt_h
+            FROM mesures
+            WHERE nom_automate = %s AND horodatage >= now() - INTERVAL '24 hours' AND horodatage < now()
+            WINDOW w AS (ORDER BY horodatage)
+          )
+          SELECT
+            ROUND(SUM(COALESCE((debit1_m3h + l1) / 2.0, 0) * dt_h)::numeric, 1),
+            ROUND(SUM(COALESCE((debit2_m3h + l2) / 2.0, 0) * dt_h)::numeric, 1),
+            ROUND(SUM(COALESCE((debit3_m3h + l3) / 2.0, 0) * dt_h)::numeric, 1)
+          FROM flow;
+        """
+        r = executer_requete_sql(query, (nom_automate,))
+        if not r or r[0][0] is None:
+            return {"horodatage": None, "valeur": 0}
+        v1, v2, v3 = [float(x) if x is not None else 0 for x in r[0]]
+        return {"horodatage": None, "valeur": round(v1 + v2 + v3, 1),
+                "valeurs": {"vol_air1_m3": v1, "vol_air2_m3": v2, "vol_air3_m3": v3}}
+
+    # Metriques instantanees : derniere ligne de mesures
+    query = """
+      SELECT horodatage,
+        debit1_m3h, debit2_m3h, debit3_m3h,
+        pression1_pa, pression2_pa, pression3_pa, pression4_pa,
+        temperature1, temperature3, temperature4,
+        hygro1_pc, hygro2_pc, hygro3_pc,
+        co2_ppm, cov_ppm, mes_microg_l
+      FROM mesures
+      WHERE nom_automate = %s
+      ORDER BY horodatage DESC
+      LIMIT 1;
+    """
+    r = executer_requete_sql(query, (nom_automate,))
+    if not r:
+        return {"horodatage": None, "valeur": 0}
+    row = r[0]
+    ho = row[0].strftime("%Y-%m-%d %H:%M:%S") if row[0] is not None else None
+
+    def f(v):
+        return float(v) if v is not None else None
+
+    mapping = {
+        "debit":       (f(row[1]), {"debit1_m3h": f(row[1]), "debit2_m3h": f(row[2]), "debit3_m3h": f(row[3])}),
+        "pression":    (f(_air_clean_pa(row[4])), {"p1_pa": f(_air_clean_pa(row[4])), "p2_pa": f(_air_clean_pa(row[5])),
+                                                    "p3_pa": f(_air_clean_pa(row[6])), "p4_pa": f(_air_clean_pa(row[7]))}),
+        "temperature": (f(row[8]), {"temp1_c": f(row[8]), "temp3_c": f(row[9]), "temp4_c": f(row[10])}),
+        "hygro":       (f(row[11]), {"hygro1_pc": f(row[11]), "hygro2_pc": f(row[12]), "hygro3_pc": f(row[13])}),
+        "qualite":     (f(row[14]), {"co2_ppm": f(row[14]), "cov_ppm": f(row[15]), "mes_microg_l": f(row[16])}),
+    }
+    if metric not in mapping:
+        return {"horodatage": ho, "valeur": 0}
+    principale, detail = mapping[metric]
+    return {"horodatage": ho, "valeur": principale if principale is not None else 0, "valeurs": detail}
+
+# ===========================================================================
+# FIN ENDPOINTS RECYCLEURS D'AIR
+# ===========================================================================
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8011"))
