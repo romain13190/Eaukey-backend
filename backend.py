@@ -3924,6 +3924,81 @@ def air_temps_reel(metric: str, nom_automate: str = Query(..., description="Nom 
 # ===========================================================================
 
 
+# ===========================================================================
+# QUALITE D'EAU : predictions IA sur les images recycleur (table urls_images)
+# ===========================================================================
+# Le modele ecrit pred_qualite_eau / pred_opacite / pred_bac_vide_prob sur
+# urls_images (cf. app_labelisation/backend/predict_production.py).
+# On exclut les images "bac sans eau" (qualite non significative).
+_EAU_BAC_VIDE_SEUIL = 0.5
+# period -> (intervalle SQL, granularite date_trunc, format du label)
+_EAU_PERIOD_MAP = {
+    "jour":    ("24 hours",  "hour",  "HH24:MI"),
+    "semaine": ("7 days",    "day",   "FMDay"),
+    "mois":    ("30 days",   "day",   "YYYY-MM-DD"),
+    "annee":   ("12 months", "month", "FMMonth"),
+}
+
+
+@app.get("/eau/qualite_eau/{period}")
+def eau_qualite_eau(period: str, nom_automate: str = Query(..., description="Nom de l'automate")):
+    """Serie de qualite d'eau predite par le modele IA depuis urls_images.
+    Filtre les images 'bac sans eau'. JSON : {labels, qualite_eau, opacite}.
+    Jointure : urls_images.numero_automate (INT) <-> automate.nom_automate (ex '2022121.0')."""
+    keys = ["qualite_eau", "opacite"]
+    cfg = _EAU_PERIOD_MAP.get(period)
+    if not cfg:
+        return {"labels": [], **{k: [] for k in keys}}
+    interval, trunc, label_fmt = cfg
+    query = f"""
+      SELECT to_char(bucket, %s) AS label, qualite_eau, opacite
+      FROM (
+        SELECT date_trunc(%s, timestamp) AS bucket,
+               ROUND(AVG(pred_qualite_eau)::numeric, 1) AS qualite_eau,
+               ROUND(AVG(pred_opacite)::numeric, 1)     AS opacite
+        FROM urls_images
+        WHERE numero_automate = CAST(SPLIT_PART(%s, '.', 1) AS INTEGER)
+          AND timestamp >= now() - INTERVAL '{interval}'
+          AND pred_qualite_eau IS NOT NULL
+          AND (pred_bac_vide_prob IS NULL OR pred_bac_vide_prob < %s)
+        GROUP BY bucket
+      ) t
+      ORDER BY bucket;
+    """
+    rows = executer_requete_sql(query, (label_fmt, trunc, nom_automate, _EAU_BAC_VIDE_SEUIL))
+    out = {"labels": [r[0].strip() if isinstance(r[0], str) else r[0] for r in rows]}
+    out["qualite_eau"] = [float(r[1]) if r[1] is not None else 0 for r in rows]
+    out["opacite"]     = [float(r[2]) if r[2] is not None else 0 for r in rows]
+    return out
+
+
+@app.get("/eau/derniere_photo")
+def eau_derniere_photo(nom_automate: str = Query(..., description="Nom de l'automate")):
+    """Derniere photo AVEC DE L'EAU prise par le recycleur (table urls_images),
+    avec sa qualite predite. On exclut les images 'bac sans eau' et celles sans
+    qualite predite. JSON : {url, timestamp, qualite}. url=None si aucune photo.
+    Jointure : urls_images.numero_automate (INT) <-> nom_automate (ex '2022121.0')."""
+    query = """
+      SELECT url, timestamp, pred_qualite_eau
+      FROM urls_images
+      WHERE numero_automate = CAST(SPLIT_PART(%s, '.', 1) AS INTEGER)
+        AND url IS NOT NULL
+        AND pred_qualite_eau IS NOT NULL
+        AND (pred_bac_vide_prob IS NULL OR pred_bac_vide_prob < %s)
+      ORDER BY timestamp DESC
+      LIMIT 1;
+    """
+    rows = executer_requete_sql(query, (nom_automate, _EAU_BAC_VIDE_SEUIL))
+    if not rows:
+        return {"url": None, "timestamp": None, "qualite": None}
+    url, ts, qualite = rows[0]
+    return {
+        "url": url,
+        "timestamp": ts.isoformat() if ts is not None else None,
+        "qualite": float(qualite) if qualite is not None else None,
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8011"))
