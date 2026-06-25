@@ -1559,6 +1559,26 @@ def temps_reel_volume_renvoi(nom_automate: str = Query(..., description="Nom de 
         "valeur": float(result[0][1]) if result[0][1] is not None else 0
     }
 
+@app.get("/temps_reel/volume_relevage")
+def temps_reel_volume_relevage(nom_automate: str = Query(..., description="Nom de l'automate")):
+    query = """
+    SELECT
+      horodatage,
+      compteur_eau_relevage_m3 AS vol_relevage_m3
+    FROM mesures
+    WHERE nom_automate = %s
+    ORDER BY horodatage DESC
+    LIMIT 1;
+    """
+    result = executer_requete_sql(query, (nom_automate,))
+    if not result:
+        return {"horodatage": None, "valeur": 0}
+
+    return {
+        "horodatage": result[0][0].strftime("%Y-%m-%d %H:%M:%S"),
+        "valeur": float(result[0][1]) if result[0][1] is not None else 0
+    }
+
 @app.get("/temps_reel/compteur_electrique")
 def temps_reel_compteur_electrique(nom_automate: str = Query(..., description="Nom de l'automate")):
     query = """
