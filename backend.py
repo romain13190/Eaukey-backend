@@ -3941,61 +3941,81 @@ _EAU_PERIOD_MAP = {
 
 
 @app.get("/eau/qualite_eau/{period}")
-def eau_qualite_eau(period: str, nom_automate: str = Query(..., description="Nom de l'automate")):
+def eau_qualite_eau(period: str, nom_automate: str = Query(..., description="Nom de l'automate"),
+                    include_bac_vide: bool = Query(False, description="Inclure les images detectees comme 'bac vide'")):
     """Serie de qualite d'eau predite par le modele IA depuis urls_images.
-    Filtre les images 'bac sans eau'. JSON : {labels, qualite_eau, opacite}.
+    Filtre les images 'bac sans eau' par defaut. Avec include_bac_vide=true on
+    garde tout et on renvoie aussi la prob 'bac vide' moyenne par bucket (pour
+    diagnostiquer un automate dont toutes les photos sont classees 'bac vide').
+    JSON : {labels, qualite_eau, opacite, bac_vide}.
     Jointure : urls_images.numero_automate (INT) <-> automate.nom_automate (ex '2022121.0')."""
-    keys = ["qualite_eau", "opacite"]
+    keys = ["qualite_eau", "opacite", "bac_vide"]
     cfg = _EAU_PERIOD_MAP.get(period)
     if not cfg:
         return {"labels": [], **{k: [] for k in keys}}
     interval, trunc, label_fmt = cfg
+    # Filtre additif : par defaut on exclut le 'bac vide' (comportement historique).
+    filtre_bac_vide = "" if include_bac_vide else "AND (pred_bac_vide_prob IS NULL OR pred_bac_vide_prob < %s)"
     query = f"""
-      SELECT to_char(bucket, %s) AS label, qualite_eau, opacite
+      SELECT to_char(bucket, %s) AS label, qualite_eau, opacite, bac_vide
       FROM (
         SELECT date_trunc(%s, timestamp) AS bucket,
-               ROUND(AVG(pred_qualite_eau)::numeric, 1) AS qualite_eau,
-               ROUND(AVG(pred_opacite)::numeric, 1)     AS opacite
+               ROUND(AVG(pred_qualite_eau)::numeric, 1)   AS qualite_eau,
+               ROUND(AVG(pred_opacite)::numeric, 1)       AS opacite,
+               ROUND(AVG(pred_bac_vide_prob)::numeric, 2) AS bac_vide
         FROM urls_images
         WHERE numero_automate = CAST(SPLIT_PART(%s, '.', 1) AS INTEGER)
           AND timestamp >= now() - INTERVAL '{interval}'
           AND pred_qualite_eau IS NOT NULL
-          AND (pred_bac_vide_prob IS NULL OR pred_bac_vide_prob < %s)
+          {filtre_bac_vide}
         GROUP BY bucket
       ) t
       ORDER BY bucket;
     """
-    rows = executer_requete_sql(query, (label_fmt, trunc, nom_automate, _EAU_BAC_VIDE_SEUIL))
+    params = [label_fmt, trunc, nom_automate]
+    if not include_bac_vide:
+        params.append(_EAU_BAC_VIDE_SEUIL)
+    rows = executer_requete_sql(query, tuple(params))
     out = {"labels": [r[0].strip() if isinstance(r[0], str) else r[0] for r in rows]}
     out["qualite_eau"] = [float(r[1]) if r[1] is not None else 0 for r in rows]
     out["opacite"]     = [float(r[2]) if r[2] is not None else 0 for r in rows]
+    out["bac_vide"]    = [float(r[3]) if r[3] is not None else None for r in rows]
     return out
 
 
 @app.get("/eau/derniere_photo")
-def eau_derniere_photo(nom_automate: str = Query(..., description="Nom de l'automate")):
-    """Derniere photo AVEC DE L'EAU prise par le recycleur (table urls_images),
-    avec sa qualite predite. On exclut les images 'bac sans eau' et celles sans
-    qualite predite. JSON : {url, timestamp, qualite}. url=None si aucune photo.
+def eau_derniere_photo(nom_automate: str = Query(..., description="Nom de l'automate"),
+                       include_bac_vide: bool = Query(False, description="Inclure les images detectees comme 'bac vide'")):
+    """Derniere photo prise par le recycleur (table urls_images), avec sa qualite
+    et sa prob 'bac vide' predites. Par defaut on exclut les images 'bac sans eau' ;
+    avec include_bac_vide=true on renvoie la toute derniere photo quelle que soit la
+    prediction (le front affiche alors un badge si bac_vide_prob est eleve, ce qui
+    permet de verifier visuellement si le bac est reellement vide).
+    JSON : {url, timestamp, qualite, bac_vide_prob}. url=None si aucune photo.
     Jointure : urls_images.numero_automate (INT) <-> nom_automate (ex '2022121.0')."""
-    query = """
-      SELECT url, timestamp, pred_qualite_eau
+    filtre_bac_vide = "" if include_bac_vide else "AND (pred_bac_vide_prob IS NULL OR pred_bac_vide_prob < %s)"
+    query = f"""
+      SELECT url, timestamp, pred_qualite_eau, pred_bac_vide_prob
       FROM urls_images
       WHERE numero_automate = CAST(SPLIT_PART(%s, '.', 1) AS INTEGER)
         AND url IS NOT NULL
         AND pred_qualite_eau IS NOT NULL
-        AND (pred_bac_vide_prob IS NULL OR pred_bac_vide_prob < %s)
+        {filtre_bac_vide}
       ORDER BY timestamp DESC
       LIMIT 1;
     """
-    rows = executer_requete_sql(query, (nom_automate, _EAU_BAC_VIDE_SEUIL))
+    params = [nom_automate]
+    if not include_bac_vide:
+        params.append(_EAU_BAC_VIDE_SEUIL)
+    rows = executer_requete_sql(query, tuple(params))
     if not rows:
-        return {"url": None, "timestamp": None, "qualite": None}
-    url, ts, qualite = rows[0]
+        return {"url": None, "timestamp": None, "qualite": None, "bac_vide_prob": None}
+    url, ts, qualite, bac_vide_prob = rows[0]
     return {
         "url": url,
         "timestamp": ts.isoformat() if ts is not None else None,
         "qualite": float(qualite) if qualite is not None else None,
+        "bac_vide_prob": float(bac_vide_prob) if bac_vide_prob is not None else None,
     }
 
 
