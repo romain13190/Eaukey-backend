@@ -3954,8 +3954,13 @@ def eau_qualite_eau(period: str, nom_automate: str = Query(..., description="Nom
     if not cfg:
         return {"labels": [], **{k: [] for k in keys}}
     interval, trunc, label_fmt = cfg
-    # Filtre additif : par defaut on exclut le 'bac vide' (comportement historique).
-    filtre_bac_vide = "" if include_bac_vide else "AND (pred_bac_vide_prob IS NULL OR pred_bac_vide_prob < %s)"
+    # Statut "bac vide" effectif = correction humaine (corr_bac_vide) sinon prediction modele.
+    # include_bac_vide=true (front)  : on montre tout SAUF ce qu'un super_admin a confirme vide.
+    # include_bac_vide=false (defaut): comportement historique, on exclut les 'bac vide' effectifs.
+    if include_bac_vide:
+        filtre_bac_vide = "AND corr_bac_vide IS NOT TRUE"
+    else:
+        filtre_bac_vide = "AND COALESCE(corr_bac_vide, pred_bac_vide_prob >= %s) IS NOT TRUE"
     query = f"""
       SELECT to_char(bucket, %s) AS label, qualite_eau, opacite, bac_vide
       FROM (
@@ -3994,12 +3999,16 @@ def eau_derniere_photo(nom_automate: str = Query(..., description="Nom de l'auto
     permet de verifier visuellement si le bac est reellement vide).
     JSON : {url, timestamp, qualite, bac_vide_prob}. url=None si aucune photo.
     Jointure : urls_images.numero_automate (INT) <-> nom_automate (ex '2022121.0')."""
-    filtre_bac_vide = "" if include_bac_vide else "AND (pred_bac_vide_prob IS NULL OR pred_bac_vide_prob < %s)"
+    if include_bac_vide:
+        filtre_bac_vide = "AND corr_bac_vide IS NOT TRUE"
+    else:
+        filtre_bac_vide = "AND COALESCE(corr_bac_vide, pred_bac_vide_prob >= %s) IS NOT TRUE"
     query = f"""
       SELECT id, url, timestamp,
              COALESCE(corr_qualite_eau, pred_qualite_eau) AS qualite,
              pred_bac_vide_prob, validated_by, validated_at,
-             (corr_qualite_eau IS NOT NULL OR corr_opacite IS NOT NULL) AS corrigee
+             (corr_qualite_eau IS NOT NULL OR corr_opacite IS NOT NULL) AS corrigee,
+             corr_bac_vide
       FROM urls_images
       WHERE numero_automate = CAST(SPLIT_PART(%s, '.', 1) AS INTEGER)
         AND url IS NOT NULL
@@ -4014,13 +4023,14 @@ def eau_derniere_photo(nom_automate: str = Query(..., description="Nom de l'auto
     rows = executer_requete_sql(query, tuple(params))
     if not rows:
         return {"url": None, "timestamp": None, "qualite": None, "bac_vide_prob": None}
-    pid, url, ts, qualite, bac_vide_prob, validated_by, validated_at, corrigee = rows[0]
+    pid, url, ts, qualite, bac_vide_prob, validated_by, validated_at, corrigee, corr_bac_vide = rows[0]
     return {
         "id": pid,
         "url": url,
         "timestamp": ts.isoformat() if ts is not None else None,
         "qualite": float(qualite) if qualite is not None else None,
         "bac_vide_prob": float(bac_vide_prob) if bac_vide_prob is not None else None,
+        "corr_bac_vide": corr_bac_vide,
         "validated_by": validated_by,
         "validated_at": validated_at.isoformat() if validated_at is not None else None,
         "corrigee": bool(corrigee),
@@ -4042,7 +4052,8 @@ def eau_photos(request: Request,
     query = f"""
       SELECT id, url, timestamp,
              pred_qualite_eau, pred_opacite, pred_bac_vide_prob,
-             corr_qualite_eau, corr_opacite, validated_by, validated_at
+             corr_qualite_eau, corr_opacite, validated_by, validated_at,
+             corr_bac_vide
       FROM urls_images
       WHERE numero_automate = CAST(SPLIT_PART(%s, '.', 1) AS INTEGER)
         AND url IS NOT NULL
@@ -4052,7 +4063,12 @@ def eau_photos(request: Request,
     """
     rows = executer_requete_sql(query, (nom_automate, limit))
     photos = []
-    for (pid, url, ts, pq, po, bv, cq, co, vby, vat) in rows:
+    for (pid, url, ts, pq, po, bv, cq, co, vby, vat, cbv) in rows:
+        # statut "bac vide" effectif = correction humaine sinon prediction modele
+        if cbv is not None:
+            eff_bac_vide = bool(cbv)
+        else:
+            eff_bac_vide = (bv is not None and bv >= _EAU_BAC_VIDE_SEUIL)
         photos.append({
             "id": pid,
             "url": url,
@@ -4062,9 +4078,11 @@ def eau_photos(request: Request,
             "bac_vide_prob": float(bv) if bv is not None else None,
             "corr_qualite": float(cq) if cq is not None else None,
             "corr_opacite": float(co) if co is not None else None,
+            "corr_bac_vide": cbv,
             # valeur affichee = correction humaine sinon prediction modele
             "qualite": float(cq) if cq is not None else (float(pq) if pq is not None else None),
             "opacite": float(co) if co is not None else (float(po) if po is not None else None),
+            "bac_vide": eff_bac_vide,
             "validated_by": vby,
             "validated_at": vat.isoformat() if vat is not None else None,
         })
@@ -4075,15 +4093,21 @@ class PhotoValidationIn(BaseModel):
     # correction d'une valeur (None = on ne corrige pas cette valeur, on garde l'existant)
     qualite_eau: float | None = None
     opacite: float | None = None
+    # correction du statut "bac vide" : True = reellement vide, False = contient de l'eau,
+    # None = on ne touche pas a la decision existante.
+    bac_vide: bool | None = None
     # reset=true -> efface la correction et la validation (retour 100% modele)
     reset: bool = False
 
 
 @app.put("/eau/photo/{photo_id}/validation")
 def eau_photo_validation(photo_id: int, payload: PhotoValidationIn, request: Request):
-    """Valide / corrige la qualite & l'opacite d'une photo (super_admin uniquement).
-    - qualite_eau / opacite fournis -> ecrit la correction (corr_*).
+    """Valide / corrige la qualite, l'opacite et le statut 'bac vide' d'une photo
+    (super_admin uniquement).
+    - qualite_eau / opacite / bac_vide fournis -> ecrit la correction (corr_*).
     - non fournis -> validation simple : le modele etait bon, corr_* inchanges.
+    - bac_vide=false -> le super_admin indique qu'il y a de l'eau (faux positif modele).
+    - bac_vide=true  -> il confirme que le bac est reellement vide (exclu de la courbe).
     - reset=true -> efface corr_* et la validation (retour a la prediction modele).
     Trace validated_by (email du super_admin) et validated_at (now())."""
     user = _require_super_admin(request)
@@ -4091,33 +4115,42 @@ def eau_photo_validation(photo_id: int, payload: PhotoValidationIn, request: Req
     if payload.reset:
         query = """
           UPDATE urls_images
-          SET corr_qualite_eau = NULL, corr_opacite = NULL,
+          SET corr_qualite_eau = NULL, corr_opacite = NULL, corr_bac_vide = NULL,
               validated_by = NULL, validated_at = NULL
           WHERE id = %s
-          RETURNING id, pred_qualite_eau, pred_opacite,
-                    corr_qualite_eau, corr_opacite, validated_by, validated_at;
+          RETURNING id, pred_qualite_eau, pred_opacite, pred_bac_vide_prob,
+                    corr_qualite_eau, corr_opacite, corr_bac_vide, validated_by, validated_at;
         """
         rows = executer_requete_sql(query, (photo_id,))
     else:
+        # Un bac marque "reellement vide" n'a pas de qualite/opacite a mesurer :
+        # on efface alors les eventuelles corrections qualite/opacite.
+        clear_quality = payload.bac_vide is True
         # corr_* mis a jour uniquement si une valeur est fournie (sinon on garde l'existant)
         query = """
           UPDATE urls_images
-          SET corr_qualite_eau = CASE WHEN %s THEN %s ELSE corr_qualite_eau END,
-              corr_opacite     = CASE WHEN %s THEN %s ELSE corr_opacite END,
+          SET corr_qualite_eau = CASE WHEN %s THEN NULL WHEN %s THEN %s ELSE corr_qualite_eau END,
+              corr_opacite     = CASE WHEN %s THEN NULL WHEN %s THEN %s ELSE corr_opacite END,
+              corr_bac_vide    = CASE WHEN %s THEN %s ELSE corr_bac_vide END,
               validated_by = %s,
               validated_at = now()
           WHERE id = %s
-          RETURNING id, pred_qualite_eau, pred_opacite,
-                    corr_qualite_eau, corr_opacite, validated_by, validated_at;
+          RETURNING id, pred_qualite_eau, pred_opacite, pred_bac_vide_prob,
+                    corr_qualite_eau, corr_opacite, corr_bac_vide, validated_by, validated_at;
         """
         rows = executer_requete_sql(query, (
-            payload.qualite_eau is not None, payload.qualite_eau,
-            payload.opacite is not None, payload.opacite,
+            clear_quality, payload.qualite_eau is not None, payload.qualite_eau,
+            clear_quality, payload.opacite is not None, payload.opacite,
+            payload.bac_vide is not None, payload.bac_vide,
             email, photo_id,
         ))
     if not rows:
         raise HTTPException(status_code=404, detail="Photo introuvable")
-    pid, pq, po, cq, co, vby, vat = rows[0]
+    pid, pq, po, bv, cq, co, cbv, vby, vat = rows[0]
+    if cbv is not None:
+        eff_bac_vide = bool(cbv)
+    else:
+        eff_bac_vide = (bv is not None and bv >= _EAU_BAC_VIDE_SEUIL)
     return {
         "status": "success",
         "id": pid,
@@ -4125,6 +4158,8 @@ def eau_photo_validation(photo_id: int, payload: PhotoValidationIn, request: Req
         "opacite": float(co) if co is not None else (float(po) if po is not None else None),
         "corr_qualite": float(cq) if cq is not None else None,
         "corr_opacite": float(co) if co is not None else None,
+        "corr_bac_vide": cbv,
+        "bac_vide": eff_bac_vide,
         "validated_by": vby,
         "validated_at": vat.isoformat() if vat is not None else None,
     }
