@@ -2456,6 +2456,34 @@ def export_csv(
     )
 
 
+@app.get("/export/premiere-date")
+def export_premiere_date(
+    request: Request,
+    station: str = Query(..., description="Nom automate"),
+    source: str = Query("semaine", description="Table source: semaine, mois, annee"),
+):
+    """Retourne la date de la premiere donnee disponible (mise en route) pour une
+    station, selon la granularite demandee. Admin/Super-admin uniquement."""
+    _require_admin_or_super(request)
+
+    source_config = {
+        "semaine": {"table": "donnees_semaine", "date_col": "jour"},
+        "mois": {"table": "donnees_mois", "date_col": "semaine_debut"},
+        "annee": {"table": "donnees_annees", "date_col": "mois_debut"},
+    }
+    if source not in source_config:
+        raise HTTPException(status_code=400, detail="Source invalide")
+    cfg = source_config[source]
+
+    query = f"SELECT MIN({cfg['date_col']}) FROM {cfg['table']} WHERE nom_automate = %s"
+    rows = executer_requete_sql(query, (station,))
+    premiere = rows[0][0] if rows and rows[0] else None
+    if premiere is None:
+        return {"premiere_date": None}
+    date_str = premiere.strftime("%Y-%m-%d") if hasattr(premiere, "strftime") else str(premiere)
+    return {"premiere_date": date_str}
+
+
 @app.get("/my/automates")
 def list_my_automates(request: Request):
     user = _require_auth(request)
@@ -3949,7 +3977,7 @@ def eau_qualite_eau(period: str, nom_automate: str = Query(..., description="Nom
     diagnostiquer un automate dont toutes les photos sont classees 'bac vide').
     JSON : {labels, qualite_eau, opacite, bac_vide}.
     Jointure : urls_images.numero_automate (INT) <-> automate.nom_automate (ex '2022121.0')."""
-    keys = ["qualite_eau", "opacite", "bac_vide"]
+    keys = ["qualite_eau", "opacite", "bac_vide", "matiere"]
     cfg = _EAU_PERIOD_MAP.get(period)
     if not cfg:
         return {"labels": [], **{k: [] for k in keys}}
@@ -3962,13 +3990,15 @@ def eau_qualite_eau(period: str, nom_automate: str = Query(..., description="Nom
     else:
         filtre_bac_vide = "AND COALESCE(corr_bac_vide, pred_bac_vide_prob >= %s) IS NOT TRUE"
     query = f"""
-      SELECT to_char(bucket, %s) AS label, qualite_eau, opacite, bac_vide
+      SELECT to_char(bucket, %s) AS label, qualite_eau, opacite, bac_vide, matiere
       FROM (
         SELECT date_trunc(%s, timestamp) AS bucket,
                -- valeur affichee = correction humaine (super_admin) sinon prediction modele
                ROUND(AVG(COALESCE(corr_qualite_eau, pred_qualite_eau))::numeric, 1) AS qualite_eau,
                ROUND(AVG(COALESCE(corr_opacite, pred_opacite))::numeric, 1)         AS opacite,
-               ROUND(AVG(pred_bac_vide_prob)::numeric, 2)                           AS bac_vide
+               ROUND(AVG(pred_bac_vide_prob)::numeric, 2)                           AS bac_vide,
+               -- MES : pred_matiere_prob (0..1) remis sur echelle /10, corrige si besoin
+               ROUND(AVG(COALESCE(corr_matiere, pred_matiere_prob * 10))::numeric, 1) AS matiere
         FROM urls_images
         WHERE numero_automate = CAST(SPLIT_PART(%s, '.', 1) AS INTEGER)
           AND timestamp >= now() - INTERVAL '{interval}'
@@ -3986,6 +4016,7 @@ def eau_qualite_eau(period: str, nom_automate: str = Query(..., description="Nom
     out["qualite_eau"] = [float(r[1]) if r[1] is not None else 0 for r in rows]
     out["opacite"]     = [float(r[2]) if r[2] is not None else 0 for r in rows]
     out["bac_vide"]    = [float(r[3]) if r[3] is not None else None for r in rows]
+    out["matiere"]     = [float(r[4]) if r[4] is not None else 0 for r in rows]
     return out
 
 
@@ -4007,8 +4038,9 @@ def eau_derniere_photo(nom_automate: str = Query(..., description="Nom de l'auto
       SELECT id, url, timestamp,
              COALESCE(corr_qualite_eau, pred_qualite_eau) AS qualite,
              pred_bac_vide_prob, validated_by, validated_at,
-             (corr_qualite_eau IS NOT NULL OR corr_opacite IS NOT NULL) AS corrigee,
-             corr_bac_vide
+             (corr_qualite_eau IS NOT NULL OR corr_opacite IS NOT NULL OR corr_matiere IS NOT NULL) AS corrigee,
+             corr_bac_vide,
+             COALESCE(corr_matiere, pred_matiere_prob * 10) AS matiere
       FROM urls_images
       WHERE numero_automate = CAST(SPLIT_PART(%s, '.', 1) AS INTEGER)
         AND url IS NOT NULL
@@ -4023,12 +4055,13 @@ def eau_derniere_photo(nom_automate: str = Query(..., description="Nom de l'auto
     rows = executer_requete_sql(query, tuple(params))
     if not rows:
         return {"url": None, "timestamp": None, "qualite": None, "bac_vide_prob": None}
-    pid, url, ts, qualite, bac_vide_prob, validated_by, validated_at, corrigee, corr_bac_vide = rows[0]
+    pid, url, ts, qualite, bac_vide_prob, validated_by, validated_at, corrigee, corr_bac_vide, matiere = rows[0]
     return {
         "id": pid,
         "url": url,
         "timestamp": ts.isoformat() if ts is not None else None,
         "qualite": float(qualite) if qualite is not None else None,
+        "matiere": float(matiere) if matiere is not None else None,
         "bac_vide_prob": float(bac_vide_prob) if bac_vide_prob is not None else None,
         "corr_bac_vide": corr_bac_vide,
         "validated_by": validated_by,
@@ -4053,7 +4086,7 @@ def eau_photos(request: Request,
       SELECT id, url, timestamp,
              pred_qualite_eau, pred_opacite, pred_bac_vide_prob,
              corr_qualite_eau, corr_opacite, validated_by, validated_at,
-             corr_bac_vide
+             corr_bac_vide, pred_matiere_prob, corr_matiere
       FROM urls_images
       WHERE numero_automate = CAST(SPLIT_PART(%s, '.', 1) AS INTEGER)
         AND url IS NOT NULL
@@ -4063,25 +4096,30 @@ def eau_photos(request: Request,
     """
     rows = executer_requete_sql(query, (nom_automate, limit))
     photos = []
-    for (pid, url, ts, pq, po, bv, cq, co, vby, vat, cbv) in rows:
+    for (pid, url, ts, pq, po, bv, cq, co, vby, vat, cbv, pm, cm) in rows:
         # statut "bac vide" effectif = correction humaine sinon prediction modele
         if cbv is not None:
             eff_bac_vide = bool(cbv)
         else:
             eff_bac_vide = (bv is not None and bv >= _EAU_BAC_VIDE_SEUIL)
+        # MES : prediction (prob 0..1) remise sur echelle /10 ; correction humaine prioritaire
+        pred_matiere = float(pm) * 10 if pm is not None else None
         photos.append({
             "id": pid,
             "url": url,
             "timestamp": ts.isoformat() if ts is not None else None,
             "pred_qualite": float(pq) if pq is not None else None,
             "pred_opacite": float(po) if po is not None else None,
+            "pred_matiere": pred_matiere,
             "bac_vide_prob": float(bv) if bv is not None else None,
             "corr_qualite": float(cq) if cq is not None else None,
             "corr_opacite": float(co) if co is not None else None,
+            "corr_matiere": float(cm) if cm is not None else None,
             "corr_bac_vide": cbv,
             # valeur affichee = correction humaine sinon prediction modele
             "qualite": float(cq) if cq is not None else (float(pq) if pq is not None else None),
             "opacite": float(co) if co is not None else (float(po) if po is not None else None),
+            "matiere": float(cm) if cm is not None else pred_matiere,
             "bac_vide": eff_bac_vide,
             "validated_by": vby,
             "validated_at": vat.isoformat() if vat is not None else None,
@@ -4093,71 +4131,92 @@ class PhotoValidationIn(BaseModel):
     # correction d'une valeur (None = on ne corrige pas cette valeur, on garde l'existant)
     qualite_eau: float | None = None
     opacite: float | None = None
+    # correction MES (matiere en suspension), echelle /10
+    matiere: float | None = None
     # correction du statut "bac vide" : True = reellement vide, False = contient de l'eau,
     # None = on ne touche pas a la decision existante.
     bac_vide: bool | None = None
     # reset=true -> efface la correction et la validation (retour 100% modele)
     reset: bool = False
+    # apply_to_hour=true -> applique la meme correction a TOUTES les photos de la meme
+    # heure (meme automate) que la photo de reference (photos toutes les 10 min, quasi
+    # identiques). Sinon on ne touche que la photo ciblee.
+    apply_to_hour: bool = False
 
 
 @app.put("/eau/photo/{photo_id}/validation")
 def eau_photo_validation(photo_id: int, payload: PhotoValidationIn, request: Request):
-    """Valide / corrige la qualite, l'opacite et le statut 'bac vide' d'une photo
+    """Valide / corrige la qualite, l'opacite, la MES et le statut 'bac vide' d'une photo
     (super_admin uniquement).
-    - qualite_eau / opacite / bac_vide fournis -> ecrit la correction (corr_*).
+    - qualite_eau / opacite / matiere / bac_vide fournis -> ecrit la correction (corr_*).
     - non fournis -> validation simple : le modele etait bon, corr_* inchanges.
     - bac_vide=false -> le super_admin indique qu'il y a de l'eau (faux positif modele).
     - bac_vide=true  -> il confirme que le bac est reellement vide (exclu de la courbe).
     - reset=true -> efface corr_* et la validation (retour a la prediction modele).
+    - apply_to_hour=true -> applique a toutes les photos de la meme heure/automate.
     Trace validated_by (email du super_admin) et validated_at (now())."""
     user = _require_super_admin(request)
     email = user.get("email") or ""
-    if payload.reset:
-        query = """
-          UPDATE urls_images
-          SET corr_qualite_eau = NULL, corr_opacite = NULL, corr_bac_vide = NULL,
-              validated_by = NULL, validated_at = NULL
-          WHERE id = %s
-          RETURNING id, pred_qualite_eau, pred_opacite, pred_bac_vide_prob,
-                    corr_qualite_eau, corr_opacite, corr_bac_vide, validated_by, validated_at;
-        """
-        rows = executer_requete_sql(query, (photo_id,))
+    # Cible : la photo seule, ou toutes les photos de la meme heure + meme automate.
+    if payload.apply_to_hour:
+        where = """numero_automate = (SELECT numero_automate FROM urls_images WHERE id = %s)
+                   AND date_trunc('hour', timestamp) =
+                       (SELECT date_trunc('hour', timestamp) FROM urls_images WHERE id = %s)"""
+        where_params = [photo_id, photo_id]
     else:
-        # Un bac marque "reellement vide" n'a pas de qualite/opacite a mesurer :
-        # on efface alors les eventuelles corrections qualite/opacite.
+        where = "id = %s"
+        where_params = [photo_id]
+    returning = """RETURNING id, pred_qualite_eau, pred_opacite, pred_bac_vide_prob, pred_matiere_prob,
+                             corr_qualite_eau, corr_opacite, corr_matiere, corr_bac_vide,
+                             validated_by, validated_at"""
+    if payload.reset:
+        query = f"""
+          UPDATE urls_images
+          SET corr_qualite_eau = NULL, corr_opacite = NULL, corr_matiere = NULL, corr_bac_vide = NULL,
+              validated_by = NULL, validated_at = NULL
+          WHERE {where}
+          {returning};
+        """
+        rows = executer_requete_sql(query, tuple(where_params))
+    else:
+        # Un bac marque "reellement vide" n'a pas de qualite/opacite/MES a mesurer :
+        # on efface alors les eventuelles corrections associees.
         clear_quality = payload.bac_vide is True
-        # corr_* mis a jour uniquement si une valeur est fournie (sinon on garde l'existant)
-        query = """
+        query = f"""
           UPDATE urls_images
           SET corr_qualite_eau = CASE WHEN %s THEN NULL WHEN %s THEN %s ELSE corr_qualite_eau END,
               corr_opacite     = CASE WHEN %s THEN NULL WHEN %s THEN %s ELSE corr_opacite END,
+              corr_matiere     = CASE WHEN %s THEN NULL WHEN %s THEN %s ELSE corr_matiere END,
               corr_bac_vide    = CASE WHEN %s THEN %s ELSE corr_bac_vide END,
               validated_by = %s,
               validated_at = now()
-          WHERE id = %s
-          RETURNING id, pred_qualite_eau, pred_opacite, pred_bac_vide_prob,
-                    corr_qualite_eau, corr_opacite, corr_bac_vide, validated_by, validated_at;
+          WHERE {where}
+          {returning};
         """
-        rows = executer_requete_sql(query, (
+        rows = executer_requete_sql(query, tuple([
             clear_quality, payload.qualite_eau is not None, payload.qualite_eau,
             clear_quality, payload.opacite is not None, payload.opacite,
+            clear_quality, payload.matiere is not None, payload.matiere,
             payload.bac_vide is not None, payload.bac_vide,
-            email, photo_id,
-        ))
+            email,
+        ] + where_params))
     if not rows:
         raise HTTPException(status_code=404, detail="Photo introuvable")
-    pid, pq, po, bv, cq, co, cbv, vby, vat = rows[0]
-    if cbv is not None:
-        eff_bac_vide = bool(cbv)
-    else:
-        eff_bac_vide = (bv is not None and bv >= _EAU_BAC_VIDE_SEUIL)
+    # ligne de reference = la photo ciblee (meme corr partout, mais pred propre a chaque photo)
+    target = next((r for r in rows if r[0] == photo_id), rows[0])
+    pid, pq, po, bv, pm, cq, co, cm, cbv, vby, vat = target
+    eff_bac_vide = bool(cbv) if cbv is not None else (bv is not None and bv >= _EAU_BAC_VIDE_SEUIL)
+    pred_matiere = float(pm) * 10 if pm is not None else None
     return {
         "status": "success",
         "id": pid,
+        "affected": len(rows),
         "qualite": float(cq) if cq is not None else (float(pq) if pq is not None else None),
         "opacite": float(co) if co is not None else (float(po) if po is not None else None),
+        "matiere": float(cm) if cm is not None else pred_matiere,
         "corr_qualite": float(cq) if cq is not None else None,
         "corr_opacite": float(co) if co is not None else None,
+        "corr_matiere": float(cm) if cm is not None else None,
         "corr_bac_vide": cbv,
         "bac_vide": eff_bac_vide,
         "validated_by": vby,
