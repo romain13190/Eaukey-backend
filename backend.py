@@ -4040,7 +4040,8 @@ def eau_derniere_photo(nom_automate: str = Query(..., description="Nom de l'auto
              pred_bac_vide_prob, validated_by, validated_at,
              (corr_qualite_eau IS NOT NULL OR corr_opacite IS NOT NULL OR corr_matiere IS NOT NULL) AS corrigee,
              corr_bac_vide,
-             COALESCE(corr_matiere, pred_matiere_prob * 10) AS matiere
+             COALESCE(corr_matiere, pred_matiere_prob * 10) AS matiere,
+             COALESCE(corr_opacite, pred_opacite) AS opacite
       FROM urls_images
       WHERE numero_automate = CAST(SPLIT_PART(%s, '.', 1) AS INTEGER)
         AND url IS NOT NULL
@@ -4055,12 +4056,13 @@ def eau_derniere_photo(nom_automate: str = Query(..., description="Nom de l'auto
     rows = executer_requete_sql(query, tuple(params))
     if not rows:
         return {"url": None, "timestamp": None, "qualite": None, "bac_vide_prob": None}
-    pid, url, ts, qualite, bac_vide_prob, validated_by, validated_at, corrigee, corr_bac_vide, matiere = rows[0]
+    pid, url, ts, qualite, bac_vide_prob, validated_by, validated_at, corrigee, corr_bac_vide, matiere, opacite = rows[0]
     return {
         "id": pid,
         "url": url,
         "timestamp": ts.isoformat() if ts is not None else None,
         "qualite": float(qualite) if qualite is not None else None,
+        "opacite": float(opacite) if opacite is not None else None,
         "matiere": float(matiere) if matiere is not None else None,
         "bac_vide_prob": float(bac_vide_prob) if bac_vide_prob is not None else None,
         "corr_bac_vide": corr_bac_vide,
