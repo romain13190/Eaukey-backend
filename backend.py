@@ -4226,6 +4226,99 @@ def eau_photo_validation(photo_id: int, payload: PhotoValidationIn, request: Req
     }
 
 
+# ---------------------------------------------------------------------------
+# Assistant SAV (Wardian) - proxy backend SSE
+# ---------------------------------------------------------------------------
+# La cle Wardian (wsk_...) est un SECRET serveur : elle ne doit JAMAIS etre
+# exposee au navigateur. Le front appelle /sav/message avec son token Eaukey ;
+# on injecte ici l'Authorization Wardian et on re-streame le flux SSE tel quel.
+# external_user_id est derive cote serveur => isolation par utilisateur garantie
+# et non spoofable par le client (cf. spec Wardian sections 4 et 6).
+
+_WARDIAN_API_BASE = os.getenv("WARDIAN_API_BASE", "https://app.wardian-ai.com").rstrip("/")
+_WARDIAN_AGENT_ID = os.getenv("WARDIAN_AGENT_ID", "")
+_WARDIAN_API_KEY = os.getenv("WARDIAN_API_KEY", "")
+
+
+class SavMessageIn(BaseModel):
+    message: str
+    conversation_id: Optional[str] = None
+
+
+@app.post("/sav/message")
+async def sav_message(payload: SavMessageIn, request: Request):
+    """Proxy SSE vers l'agent SAV Wardian (read-only).
+
+    - Auth : utilisateur Eaukey connecte (_require_auth).
+    - external_user_id derive cote serveur (eaukey-user-<id>) : conversations
+      isolees par utilisateur, impossible a usurper depuis le front.
+    - Re-streame le Content-Type text/event-stream de Wardian sans le modifier.
+    """
+    user = _require_auth(request)
+
+    if not _WARDIAN_API_KEY or not _WARDIAN_AGENT_ID:
+        raise HTTPException(status_code=503, detail="Assistant SAV non configure")
+
+    message = (payload.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message vide")
+
+    body = {
+        "message": message,
+        "external_user_id": f"eaukey-user-{user['id']}",
+        "conversation_id": payload.conversation_id or None,
+    }
+    url = f"{_WARDIAN_API_BASE}/api/v1/agents/{_WARDIAN_AGENT_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {_WARDIAN_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    import httpx
+    from fastapi.responses import StreamingResponse
+
+    client = httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=10.0))
+    try:
+        req = client.build_request("POST", url, headers=headers, json=body)
+        upstream = await client.send(req, stream=True)
+    except httpx.HTTPError:
+        await client.aclose()
+        raise HTTPException(status_code=502, detail="Assistant SAV injoignable")
+
+    # Non-200 => pas de flux, corps JSON {"detail": "..."}. On lit et on propage.
+    if upstream.status_code != 200:
+        raw = await upstream.aread()
+        await upstream.aclose()
+        await client.aclose()
+        detail = "Assistant SAV indisponible"
+        try:
+            detail = json.loads(raw.decode("utf-8", "replace")).get("detail", detail)
+        except Exception:
+            pass
+        # 409 (conversation a redemarrer) et 429 (quota) sont utiles au front ;
+        # 401/403/404 = mauvaise config cote serveur => on masque en 502.
+        status = upstream.status_code if upstream.status_code in (409, 429) else 502
+        raise HTTPException(status_code=status, detail=detail)
+
+    async def _relay():
+        try:
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        _relay(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # desactive le buffering proxy (SSE)
+        },
+    )
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8011"))
