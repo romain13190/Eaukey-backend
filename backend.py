@@ -4387,7 +4387,10 @@ def parc_etat(request: Request):
            r.derniere,
            round(extract(epoch FROM ({maintenant} - r.derniere)) / 60)::int AS minutes
     FROM   automate a
-    LEFT   JOIN recent r ON r.nom_automate = a.nom_automate
+    -- trim() obligatoire : `automate.nom_automate` contient des espaces en trop
+    -- pour certaines lignes (ex. '20260300.0 '), pas `mesures.nom_automate`. Sans
+    -- trim la jointure echoue et un automate parfaitement actif s'affiche en muet.
+    LEFT   JOIN recent r ON trim(r.nom_automate) = trim(a.nom_automate)
     ORDER  BY r.derniere DESC NULLS LAST, a.client, a.nom_automate;
     """.format(maintenant=_PARC_MAINTENANT, fenetre=_PARC_SEUIL_ALERTE_MIN)
 
@@ -4436,10 +4439,10 @@ def parc_derniere_donnee(request: Request,
         """
         SELECT max(horodatage)
         FROM   mesures
-        WHERE  nom_automate = %s
+        WHERE  trim(nom_automate) = %s
           AND  horodatage > {maintenant} - (%s || ' days')::interval;
         """.format(maintenant=_PARC_MAINTENANT),
-        (nom_automate, jours),
+        (nom_automate.strip(), jours),
     )
 
     derniere = row[0] if row else None
