@@ -74,6 +74,27 @@ async def _force_cors_headers(request, call_next):
         resp.headers.setdefault("Vary", "Origin")
     return resp
 
+# =============================================================================
+# FUSEAU HORAIRE : a lire avant d'ecrire une requete sur les mesures
+# =============================================================================
+# La base tourne en UTC, mais `mesures.horodatage` et `moyenne.rounded_timestamp`
+# sont des timestamps SANS fuseau qui contiennent de l'heure locale de Paris.
+# Comparer ces colonnes a `now()` decale donc la fenetre de 1h (hiver) a 2h (ete).
+#
+# Symptome constate le 27/07/2026 : a 14h37, les graphiques "Jour" s'arretaient a
+# 12h37. Les donnees etaient bien en base, la condition `horodatage < now()` les
+# excluait.
+#
+# Regle : face a une colonne timestamp SANS fuseau contenant de l'heure de Paris,
+# toujours comparer a `(now() AT TIME ZONE 'Europe/Paris')`, qui gere aussi le
+# passage heure d'ete / heure d'hiver.
+#
+# EXCEPTION : `password_reset_tokens.expires_at` est aussi un timestamp sans
+# fuseau, mais il est ecrit en UTC depuis Python (datetime.utcnow). Il doit rester
+# compare a `NOW()` brut, sinon tous les liens de reinitialisation de mot de passe
+# expirent 2h trop tot. Ne pas "harmoniser" ces lignes.
+# =============================================================================
+
 _DB_DSN = {
     "dbname": os.getenv("DB_NAME"),
     "user": os.getenv("DB_USER"),
@@ -422,8 +443,8 @@ def renvoi_jour_delta_m3(nom_automate: str = Query(..., description="Nom de l'au
       ROUND(AVG(compteur_eau_inst_renvoi_pc)::numeric, 1) AS inst_pc
     FROM mesures
     WHERE nom_automate = %s
-      AND horodatage   >= now() - INTERVAL '24 hours'
-      AND horodatage   <  now()
+      AND horodatage   >= (now() AT TIME ZONE 'Europe/Paris') - INTERVAL '24 hours'
+      AND horodatage   <  (now() AT TIME ZONE 'Europe/Paris')
     GROUP  BY heure
     ORDER  BY heure;
     """
@@ -467,8 +488,8 @@ def adoucie_jour_delta_m3(nom_automate: str = Query(..., description="Nom de l'a
       ROUND(AVG(compteur_eau_inst_adoucie_pc)::numeric, 1) AS inst_pc
     FROM mesures
     WHERE nom_automate = %s
-      AND horodatage   >= now() - INTERVAL '24 hours'
-      AND horodatage   <  now()
+      AND horodatage   >= (now() AT TIME ZONE 'Europe/Paris') - INTERVAL '24 hours'
+      AND horodatage   <  (now() AT TIME ZONE 'Europe/Paris')
     GROUP  BY heure
     ORDER  BY heure;
     """
@@ -512,8 +533,8 @@ def relevage_jour_delta_m3(nom_automate: str = Query(..., description="Nom de l'
       ROUND(AVG(compteur_eau_inst_relevage_pc)::numeric, 1)  AS inst_pc
     FROM mesures
     WHERE nom_automate = %s
-      AND horodatage   >= now() - INTERVAL '24 hours'
-      AND horodatage   <  now()
+      AND horodatage   >= (now() AT TIME ZONE 'Europe/Paris') - INTERVAL '24 hours'
+      AND horodatage   <  (now() AT TIME ZONE 'Europe/Paris')
     GROUP  BY heure
     ORDER  BY heure;
     """
@@ -561,7 +582,7 @@ def avg_pression5_jour(nom_automate: str = Query(..., description="Nom de l'auto
             AVG(avg_pression5) AS moyenne_pression
         FROM moyenne
         WHERE nom_automate = %s
-          AND rounded_timestamp >= NOW() - INTERVAL '24 hours'
+          AND rounded_timestamp >= (now() AT TIME ZONE 'Europe/Paris') - INTERVAL '24 hours'
         GROUP BY EXTRACT(HOUR FROM rounded_timestamp)
         ORDER BY heure;
     """
@@ -600,8 +621,8 @@ def temps_reel_taux_recyclage(nom_automate: str = Query(..., description="Nom de
             MAX(horodatage) AS dernier_ts
         FROM mesures
         WHERE nom_automate = %s
-          AND horodatage >  date_trunc('hour', NOW()) - INTERVAL '24 hours'
-          AND horodatage <= date_trunc('hour', NOW())
+          AND horodatage >  date_trunc('hour', (now() AT TIME ZONE 'Europe/Paris')) - INTERVAL '24 hours'
+          AND horodatage <= date_trunc('hour', (now() AT TIME ZONE 'Europe/Paris'))
           AND compteur_eau_renvoi_m3 IS NOT NULL
           AND compteur_eau_adoucie_m3 IS NOT NULL
     )
@@ -633,8 +654,8 @@ def taux_recyclage_jour(nom_automate: str = Query(..., description="Nom de l'aut
     query = """
     WITH hours AS (
         SELECT generate_series(
-            date_trunc('hour', NOW()) - INTERVAL '23 hours',
-            date_trunc('hour', NOW()),
+            date_trunc('hour', (now() AT TIME ZONE 'Europe/Paris')) - INTERVAL '23 hours',
+            date_trunc('hour', (now() AT TIME ZONE 'Europe/Paris')),
             INTERVAL '1 hour'
         ) AS heure
     ),
@@ -642,7 +663,7 @@ def taux_recyclage_jour(nom_automate: str = Query(..., description="Nom de l'aut
         SELECT horodatage, compteur_eau_renvoi_m3, compteur_eau_adoucie_m3
         FROM mesures
         WHERE nom_automate = %s
-          AND horodatage > NOW() - INTERVAL '48 hours'
+          AND horodatage > (now() AT TIME ZONE 'Europe/Paris') - INTERVAL '48 hours'
           AND compteur_eau_renvoi_m3 IS NOT NULL
           AND compteur_eau_adoucie_m3 IS NOT NULL
     )
@@ -735,8 +756,8 @@ def taux_desinfection_jour(nom_automate: str = Query(..., description="Nom de l'
         ROUND(AVG(chlore_mv / 3.0)::numeric, 2) AS taux_desinfection
     FROM   mesures
     WHERE  nom_automate = %s
-      AND  horodatage  >= now() - INTERVAL '24 hours'
-      AND  horodatage  <  now()
+      AND  horodatage  >= (now() AT TIME ZONE 'Europe/Paris') - INTERVAL '24 hours'
+      AND  horodatage  <  (now() AT TIME ZONE 'Europe/Paris')
     GROUP  BY heure
     ORDER  BY heure;
     """
@@ -767,8 +788,8 @@ def pression_medianes_jour(nom_automate: str = Query(..., description="Nom de l'
             percentile_cont(0.5) WITHIN GROUP (ORDER BY pression5_mbar) AS p5_med_mbar
         FROM   mesures
         WHERE  nom_automate = %s
-          AND  horodatage  >= now() - INTERVAL '24 hours'
-          AND  horodatage  <  now()
+          AND  horodatage  >= (now() AT TIME ZONE 'Europe/Paris') - INTERVAL '24 hours'
+          AND  horodatage  <  (now() AT TIME ZONE 'Europe/Paris')
         GROUP  BY heure
         ORDER  BY heure;
     """
@@ -798,8 +819,8 @@ def pression_all_jour(nom_automate: str = Query(..., description="Nom de l'autom
         percentile_cont(0.5) WITHIN GROUP (ORDER BY pression5_mbar) AS p5_med_mbar
     FROM   mesures
     WHERE  nom_automate = %s
-      AND  horodatage  >= now() - INTERVAL '24 hours'
-      AND  horodatage  <  now()
+      AND  horodatage  >= (now() AT TIME ZONE 'Europe/Paris') - INTERVAL '24 hours'
+      AND  horodatage  <  (now() AT TIME ZONE 'Europe/Paris')
     GROUP  BY heure
     ORDER  BY heure;
     """
@@ -899,8 +920,8 @@ def volumes_all_jour(nom_automate: str = Query(..., description="Nom de l'automa
       ROUND(AVG(compteur_eau_inst_relevage_pc)::numeric, 1) AS relevage_pc
     FROM mesures
     WHERE nom_automate = %s
-      AND horodatage   >= now() - INTERVAL '24 hours'
-      AND horodatage   <  now()
+      AND horodatage   >= (now() AT TIME ZONE 'Europe/Paris') - INTERVAL '24 hours'
+      AND horodatage   <  (now() AT TIME ZONE 'Europe/Paris')
     GROUP  BY heure
     ORDER  BY heure;
     """
@@ -1005,8 +1026,8 @@ def temperature_jour(nom_automate: str = Query(..., description="Nom de l'automa
         percentile_cont(0.5) WITHIN GROUP (ORDER BY temperature_deg) AS temp_med_C
     FROM   mesures
     WHERE  nom_automate = %s
-      AND  horodatage  >= now() - INTERVAL '24 hours'
-      AND  horodatage  <  now()
+      AND  horodatage  >= (now() AT TIME ZONE 'Europe/Paris') - INTERVAL '24 hours'
+      AND  horodatage  <  (now() AT TIME ZONE 'Europe/Paris')
       AND  temperature_deg / 10.0 BETWEEN 0 AND 60
     GROUP  BY heure
     ORDER  BY heure;
@@ -1041,8 +1062,8 @@ def chlore_jour(nom_automate: str = Query(..., description="Nom de l'automate"))
         percentile_cont(0.5) WITHIN GROUP (ORDER BY chlore_mv) AS chlore_med_mv
     FROM   mesures
     WHERE  nom_automate = %s
-      AND  horodatage  >= now() - INTERVAL '24 hours'
-      AND  horodatage  <  now()
+      AND  horodatage  >= (now() AT TIME ZONE 'Europe/Paris') - INTERVAL '24 hours'
+      AND  horodatage  <  (now() AT TIME ZONE 'Europe/Paris')
       AND  chlore_mv BETWEEN 0 AND 2000
     GROUP  BY heure
     ORDER  BY heure;
@@ -1077,8 +1098,8 @@ def ph_jour(nom_automate: str = Query(..., description="Nom de l'automate")):
         percentile_cont(0.5) WITHIN GROUP (ORDER BY ph) AS ph_mediane
     FROM   mesures
     WHERE  nom_automate = %s
-      AND  horodatage   >= now() - INTERVAL '24 hours'
-      AND  horodatage   <  now()
+      AND  horodatage   >= (now() AT TIME ZONE 'Europe/Paris') - INTERVAL '24 hours'
+      AND  horodatage   <  (now() AT TIME ZONE 'Europe/Paris')
       AND  ph / 100.0 BETWEEN 2 AND 12
     GROUP  BY heure
     ORDER  BY heure;
@@ -1133,8 +1154,8 @@ def compteur_elec_jour(nom_automate: str = Query(..., description="Nom de l'auto
             compteur_electrique_kwh
         FROM   mesures
         WHERE  nom_automate = %s
-          AND  horodatage  >= now() - INTERVAL '24 hours'
-          AND  horodatage  <  now()
+          AND  horodatage  >= (now() AT TIME ZONE 'Europe/Paris') - INTERVAL '24 hours'
+          AND  horodatage  <  (now() AT TIME ZONE 'Europe/Paris')
     ),
     deltas AS (
         SELECT
@@ -1191,8 +1212,8 @@ def ratio_kwh_m3_jour(nom_automate: str = Query(..., description="Nom de l'autom
             compteur_eau_relevage_m3
         FROM   mesures
         WHERE  nom_automate = %s
-          AND  horodatage  >= now() - INTERVAL '24 hours'
-          AND  horodatage  <  now()
+          AND  horodatage  >= (now() AT TIME ZONE 'Europe/Paris') - INTERVAL '24 hours'
+          AND  horodatage  <  (now() AT TIME ZONE 'Europe/Paris')
     ),
     deltas AS (
         SELECT
@@ -1301,8 +1322,8 @@ def conductivite_jour(nom_automate: str = Query(..., description="Nom de l'autom
         ROUND((percentile_cont(0.5) WITHIN GROUP (ORDER BY conductivite_renvoi))::numeric, 1)     AS cond_r
     FROM   mesures
     WHERE  nom_automate = %s
-      AND  horodatage  >= now() - INTERVAL '24 hours'
-      AND  horodatage  <  now()
+      AND  horodatage  >= (now() AT TIME ZONE 'Europe/Paris') - INTERVAL '24 hours'
+      AND  horodatage  <  (now() AT TIME ZONE 'Europe/Paris')
     GROUP  BY heure
     ORDER  BY heure;
     """
@@ -1379,8 +1400,8 @@ def hauteur_cuve_traitement_jour(nom_automate: str = Query(..., description="Nom
         ROUND((percentile_cont(0.5) WITHIN GROUP (ORDER BY hauteur_cuve_traitement_pc))::numeric, 1) AS h_pc
     FROM   mesures
     WHERE  nom_automate = %s
-      AND  horodatage  >= now() - INTERVAL '24 hours'
-      AND  horodatage  <  now()
+      AND  horodatage  >= (now() AT TIME ZONE 'Europe/Paris') - INTERVAL '24 hours'
+      AND  horodatage  <  (now() AT TIME ZONE 'Europe/Paris')
       AND  hauteur_cuve_traitement_pc BETWEEN 0 AND 150
     GROUP  BY heure
     ORDER  BY heure;
@@ -1411,8 +1432,8 @@ def hauteur_cuve_disconnection_jour(nom_automate: str = Query(..., description="
         ROUND((percentile_cont(0.5) WITHIN GROUP (ORDER BY hauteur_cuve_disconnection_pc))::numeric, 1) AS h_pc
     FROM   mesures
     WHERE  nom_automate = %s
-      AND  horodatage  >= now() - INTERVAL '24 hours'
-      AND  horodatage  <  now()
+      AND  horodatage  >= (now() AT TIME ZONE 'Europe/Paris') - INTERVAL '24 hours'
+      AND  horodatage  <  (now() AT TIME ZONE 'Europe/Paris')
       AND  hauteur_cuve_disconnection_pc BETWEEN 0 AND 150
     GROUP  BY heure
     ORDER  BY heure;
@@ -3667,7 +3688,7 @@ def automates_types():
                debit1_m3h IS NOT NULL OR hygro1_pc IS NOT NULL OR pression1_pa IS NOT NULL
              ) THEN 'air' ELSE 'eau' END AS type
       FROM mesures
-      WHERE horodatage > now() - INTERVAL '7 days'
+      WHERE horodatage > (now() AT TIME ZONE 'Europe/Paris') - INTERVAL '7 days'
       GROUP BY nom_automate;
     """
     rows = executer_requete_sql(query)
@@ -3714,8 +3735,8 @@ def _air_series_jour(nom_automate: str, aggrs: list) -> dict:
       {agg_sql}
       FROM mesures
       WHERE nom_automate = %s
-        AND horodatage >= now() - INTERVAL '24 hours'
-        AND horodatage <  now()
+        AND horodatage >= (now() AT TIME ZONE 'Europe/Paris') - INTERVAL '24 hours'
+        AND horodatage <  (now() AT TIME ZONE 'Europe/Paris')
       GROUP BY heure
       ORDER BY heure;
     """
@@ -3765,8 +3786,8 @@ def air_volume_air(period: str, nom_automate: str = Query(..., description="Nom 
               LEAST(GREATEST(EXTRACT(EPOCH FROM (horodatage - LAG(horodatage) OVER w)) / 3600.0, 0), {_AIR_DT_CAP_H}) AS dt_h
             FROM mesures
             WHERE nom_automate = %s
-              AND horodatage >= now() - INTERVAL '24 hours'
-              AND horodatage <  now()
+              AND horodatage >= (now() AT TIME ZONE 'Europe/Paris') - INTERVAL '24 hours'
+              AND horodatage <  (now() AT TIME ZONE 'Europe/Paris')
             WINDOW w AS (ORDER BY horodatage)
           )
           SELECT heure,
@@ -3896,7 +3917,7 @@ def air_temps_reel(metric: str, nom_automate: str = Query(..., description="Nom 
               LAG(debit1_m3h) OVER w AS l1, LAG(debit2_m3h) OVER w AS l2, LAG(debit3_m3h) OVER w AS l3,
               LEAST(GREATEST(EXTRACT(EPOCH FROM (horodatage - LAG(horodatage) OVER w)) / 3600.0, 0), {_AIR_DT_CAP_H}) AS dt_h
             FROM mesures
-            WHERE nom_automate = %s AND horodatage >= now() - INTERVAL '24 hours' AND horodatage < now()
+            WHERE nom_automate = %s AND horodatage >= (now() AT TIME ZONE 'Europe/Paris') - INTERVAL '24 hours' AND horodatage < (now() AT TIME ZONE 'Europe/Paris')
             WINDOW w AS (ORDER BY horodatage)
           )
           SELECT
@@ -4317,6 +4338,118 @@ async def sav_message(payload: SavMessageIn, request: Request):
             "X-Accel-Buffering": "no",  # desactive le buffering proxy (SSE)
         },
     )
+
+
+# =============================================================================
+# ETAT DU PARC (interne : admin / super_admin)
+# =============================================================================
+# Objectif : savoir en un coup d'oeil quels automates remontent encore des
+# donnees. Lecture seule, aucune ecriture, aucun automate n'est modifie.
+#
+# ATTENTION PERF : `mesures` fait ~235M de lignes. La requete "derniere mesure
+# de chaque automate" (ORDER BY horodatage DESC LIMIT 1) s'ecroule justement sur
+# les automates silencieux, car le planner remonte l'index `horodatage` a
+# l'envers en filtrant. On borne donc toujours la fenetre temporelle : un
+# automate absent du resultat est un automate sans donnees dans la fenetre,
+# ce qui est exactement l'information recherchee.
+# Voir CLAUDE.md, section "Piege d'index sur mesures".
+
+# ATTENTION FUSEAU : `mesures.horodatage` est un timestamp SANS fuseau qui
+# contient de l'heure locale de Paris, alors que la base tourne en UTC. Comparer
+# `horodatage` a `(now() AT TIME ZONE 'Europe/Paris')` introduit donc un decalage de 1h a 2h selon la saison
+# (verifie le 27/07/2026 : (now() AT TIME ZONE 'Europe/Paris') = 12:29 UTC, max(horodatage) = 14:29). La bonne
+# reference est `now() AT TIME ZONE 'Europe/Paris'`, qui gere aussi le passage
+# heure d'ete / heure d'hiver.
+_PARC_MAINTENANT = "(now() AT TIME ZONE 'Europe/Paris')"
+
+_PARC_SEUIL_OK_MIN = 15      # vert  : vu il y a moins de 15 min
+_PARC_SEUIL_ALERTE_MIN = 120  # orange jusqu'a 2h, rouge au-dela
+
+
+@app.get("/parc/etat")
+def parc_etat(request: Request):
+    """Etat de remontee de donnees de tous les automates.
+
+    Statuts : "ok" (< 15 min), "attention" (15 min a 2h), "muet" (> 2h ou jamais).
+    """
+    _require_admin_or_super(request)
+
+    query = """
+    WITH recent AS (
+        SELECT nom_automate, max(horodatage) AS derniere
+        FROM   mesures
+        WHERE  horodatage > {maintenant} - INTERVAL '{fenetre} minutes'
+        GROUP  BY nom_automate
+    )
+    SELECT a.nom_automate,
+           a.client,
+           a.lieu,
+           r.derniere,
+           round(extract(epoch FROM ({maintenant} - r.derniere)) / 60)::int AS minutes
+    FROM   automate a
+    LEFT   JOIN recent r ON r.nom_automate = a.nom_automate
+    ORDER  BY r.derniere DESC NULLS LAST, a.client, a.nom_automate;
+    """.format(maintenant=_PARC_MAINTENANT, fenetre=_PARC_SEUIL_ALERTE_MIN)
+
+    rows = executer_requete_sql(query)
+
+    automates = []
+    compteurs = {"ok": 0, "attention": 0, "muet": 0}
+    for nom, client, lieu, derniere, minutes in rows:
+        if derniere is None:
+            statut = "muet"
+            minutes = None
+        elif minutes is not None and minutes <= _PARC_SEUIL_OK_MIN:
+            statut = "ok"
+        else:
+            statut = "attention"
+        compteurs[statut] += 1
+        automates.append({
+            "nom_automate": (nom or "").strip(),
+            "client": (client or "").strip() or None,
+            "lieu": (lieu or "").strip() or None,
+            "derniere_mesure": derniere.isoformat() if derniere else None,
+            "minutes": minutes,
+            "statut": statut,
+        })
+
+    return {
+        "automates": automates,
+        "compteurs": compteurs,
+        "total": len(automates),
+        "seuils": {"ok_min": _PARC_SEUIL_OK_MIN, "alerte_min": _PARC_SEUIL_ALERTE_MIN},
+    }
+
+
+@app.get("/parc/etat/{nom_automate}/derniere")
+def parc_derniere_donnee(request: Request,
+                         nom_automate: str,
+                         jours: int = Query(30, ge=1, le=90)):
+    """Date de la derniere mesure d'UN automate, sur une fenetre bornee.
+
+    Appelee a la demande (clic sur un automate muet), jamais en masse : la
+    fenetre est bornee a 90 jours max pour rester dans les clous cote perf.
+    """
+    _require_admin_or_super(request)
+
+    row = executer_requete_sql_one(
+        """
+        SELECT max(horodatage)
+        FROM   mesures
+        WHERE  nom_automate = %s
+          AND  horodatage > {maintenant} - (%s || ' days')::interval;
+        """.format(maintenant=_PARC_MAINTENANT),
+        (nom_automate, jours),
+    )
+
+    derniere = row[0] if row else None
+    return {
+        "nom_automate": nom_automate,
+        "derniere_mesure": derniere.isoformat() if derniere else None,
+        "fenetre_jours": jours,
+        # None + trouve=False : aucune donnee sur la fenetre, pas "jamais de donnee"
+        "trouve": derniere is not None,
+    }
 
 
 if __name__ == "__main__":
