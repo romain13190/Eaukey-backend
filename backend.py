@@ -2326,11 +2326,30 @@ def _require_admin_or_super(request: Request) -> dict:
     return user
 
 
+# Prix du m3 d'eau, utilise pour convertir les m3 recycles en euros economises.
+#
+# Valeur par defaut : 4,69 EUR TTC/m3 = prix moyen national francais (2,32 EUR
+# d'eau potable + 2,37 EUR d'assainissement collectif), rapport SISPEA 2025 sur
+# donnees 2023 : https://www.eaufrance.fr/
+#
+# Les deux composantes comptent : un m3 recycle est un m3 qui n'est ni achete au
+# reseau, ni rejete a l'egout.
+#
+# C'est une MOYENNE NATIONALE : le prix reel va de ~2 EUR/m3 a plus de 8 EUR/m3
+# selon la commune. Pour un chiffre juste sur un site donne, surcharger la
+# variable d'environnement PRIX_EAU_M3 avec le prix lu sur la facture d'eau du
+# client. Le chiffre est presente comme une estimation cote frontend.
+_PRIX_EAU_M3 = float(os.getenv("PRIX_EAU_M3", "4.69"))
+
+
 @app.get("/volumes/total")
 def volumes_total(request: Request):
     """Total m3 recyclés (renvoi - adoucie) pour toutes les stations accessibles par l'utilisateur.
     Lit depuis la table cache_volumes_total (précalculée par ETL_volumes_total).
-    Les stations dont la difference est negative sont exclues du total."""
+    Les stations dont la difference est negative sont exclues du total.
+
+    Renvoie aussi l'economie estimee en euros (m3 recycles x prix du m3).
+    Champs ajoutes, la reponse reste compatible avec l'existant."""
     user = _require_auth(request)
     roles = [r.lower() for r in user.get("roles", [])]
 
@@ -2343,7 +2362,12 @@ def volumes_total(request: Request):
     else:
         orgs = _get_orgs_for_user(user["id"])
         if not orgs:
-            return {"total_recycle_m3": 0, "nb_stations": 0}
+            return {
+                "total_recycle_m3": 0,
+                "nb_stations": 0,
+                "prix_eau_m3": _PRIX_EAU_M3,
+                "economie_eur": 0,
+            }
         org_names = [o[1] for o in orgs]
         placeholders = ",".join(["%s"] * len(org_names))
         rows = executer_requete_sql(
@@ -2365,6 +2389,8 @@ def volumes_total(request: Request):
     return {
         "total_recycle_m3": round(total, 1),
         "nb_stations": nb,
+        "prix_eau_m3": _PRIX_EAU_M3,
+        "economie_eur": round(total * _PRIX_EAU_M3),
     }
 
 
