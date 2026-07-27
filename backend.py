@@ -4367,7 +4367,7 @@ async def sav_message(payload: SavMessageIn, request: Request):
 
 
 # =============================================================================
-# ETAT DU PARC (interne : admin / super_admin)
+# REMONTEE DE DONNEES (page /parc, interne : admin / super_admin)
 # =============================================================================
 # Objectif : savoir en un coup d'oeil quels automates remontent encore des
 # donnees. Lecture seule, aucune ecriture, aucun automate n'est modifie.
