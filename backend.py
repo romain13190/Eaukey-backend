@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query, HTTPException, Request, BackgroundTasks
+from fastapi import FastAPI, Query, HTTPException, Request, BackgroundTasks, Depends
 import logging  # v2 - force redeploy with taux_recyclage endpoint
 from typing import List, Tuple, Optional, Union
 from pydantic import BaseModel, Field
@@ -22,8 +22,73 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 load_dotenv()
 
-# Création de l'instance FastAPI
-app = FastAPI()
+# =============================================================================
+# SECURITE (2026-10-14) : authentification obligatoire par defaut
+# =============================================================================
+# Avant ce correctif, la plupart des routes (mesures, liste des stations avec les
+# e-mails clients, creation/suppression d'automates, messagerie) etaient
+# accessibles sans jeton. Desormais TOUTE route exige un jeton valide, sauf la
+# liste blanche _PUBLIC_ROUTES. En plus, pour un utilisateur non admin :
+#   - un parametre `nom_automate` (query ou chemin) doit designer une station de
+#     ses organisations (meme regle que /my/automates) ;
+#   - un parametre `client_id` / `client` doit etre son client ou une de ses
+#     organisations ;
+#   - les routes de _ADMIN_ONLY_ROUTES sont refusees.
+# Une nouvelle route est donc protegee par defaut. Pour en ouvrir une, l'ajouter
+# explicitement a _PUBLIC_ROUTES.
+_PUBLIC_ROUTES = {
+    ("POST", "/auth/login"),
+    ("POST", "/auth/register"),          # cree un compte "client" sans station : il ne voit rien tant qu'un admin ne l'a pas rattache
+    ("POST", "/auth/forgot-password"),
+    ("POST", "/auth/reset-password"),
+    ("GET", "/auth/verify-reset-token"),
+}
+_ADMIN_ONLY_ROUTES = {
+    ("POST", "/automate"),
+    ("PUT", "/automate/{nom_automate}"),
+    ("DELETE", "/automate/{nom_automate}"),
+    ("GET", "/conversations"),
+    ("POST", "/conversations"),
+    ("GET", "/conversations/{conversation_id}/messages"),
+    ("POST", "/conversations/{conversation_id}/messages"),
+    ("GET", "/notifications/admin/{client_id}"),
+    ("GET", "/notifications/admin_all"),
+    ("POST", "/messages_admin/{client_id}/marquer_non_lu"),
+}
+
+
+def _security_gate(request: Request):
+    """Dependance globale executee avant chaque route (voir bloc ci-dessus)."""
+    if request.method == "OPTIONS":
+        return
+    route = request.scope.get("route")
+    path = getattr(route, "path", request.url.path)
+    key = (request.method, path)
+    if key in _PUBLIC_ROUTES:
+        return
+    user = _require_auth(request)
+    request.state.user = user
+    if _is_admin_user(user):
+        return
+    if key in _ADMIN_ONLY_ROUTES:
+        raise HTTPException(status_code=403, detail="Accès réservé à l'admin")
+    params = dict(request.query_params)
+    params.update(request.path_params)
+    nom = params.get("nom_automate")
+    if nom and nom not in _user_automates(user):
+        raise HTTPException(status_code=403, detail="Accès refusé à cette station")
+    client = params.get("client_id") or params.get("client")
+    if client and str(client).strip().lower() not in _user_clients(user):
+        raise HTTPException(status_code=403, detail="Accès refusé à ce client")
+
+
+# Création de l'instance FastAPI (documentation /docs et /openapi.json desactivees en production)
+app = FastAPI(
+    dependencies=[Depends(_security_gate)],
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 
 
 def _load_env_file(path: Path) -> None:
@@ -349,13 +414,17 @@ def fetch_annee_simple(nom_automate: str, column: str) -> dict:
 # Endpoint : liste des automates avec email pour filtrage côté front
 # ---------------------------------------------------------------------------
 @app.get("/recherche/automate_LCA")
-def liste_automates():
+def liste_automates(request: Request):
     query = """
         SELECT client, numero_automate, nom_automate, lieu, email, email2, email3
         FROM automate
         ORDER BY client NULLS LAST, nom_automate
     """
     rows = executer_requete_sql(query)
+    user = _require_auth(request)
+    if not _is_admin_user(user):
+        visibles = _user_automates(user)
+        rows = [r for r in rows if r[2] in visibles]
     return [
         {
             "client": r[0],
@@ -1902,12 +1971,28 @@ def _get_roles_for_user(user_id: int) -> list[str]:
     return [r[0] for r in rows if r and r[0]]
 
 
+# Cache des utilisateurs authentifies (jeton -> utilisateur) : evite 2 a 4 requetes SQL
+# transatlantiques par appel. Un changement de role ou une desactivation est pris en
+# compte au plus tard apres _AUTH_CACHE_TTL secondes.
+_AUTH_CACHE_TTL = 60
+_AUTH_CACHE: dict[str, tuple[float, dict]] = {}
+_AUTH_CACHE_LOCK = threading.Lock()
+
+
 def _require_auth(request: Request) -> dict:
+    cached = getattr(request.state, "user", None)
+    if cached:
+        return cached
     auth = request.headers.get("authorization") or ""
     if not auth.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Bearer token manquant")
     token = auth.split(" ", 1)[1].strip()
     payload = _verify_token(token)
+    now = time.time()
+    with _AUTH_CACHE_LOCK:
+        hit = _AUTH_CACHE.get(token)
+    if hit and hit[0] > now:
+        return dict(hit[1])
     user_id = payload.get("sub")
     if not user_id:
         raise HTTPException(status_code=401, detail="Token invalide")
@@ -1918,7 +2003,45 @@ def _require_auth(request: Request) -> dict:
     if not row or not row[2]:
         raise HTTPException(status_code=401, detail="Utilisateur inactif")
     roles = _get_roles_for_user(row[0])
-    return {"id": row[0], "email": row[1], "roles": roles, "client_id": row[3]}
+    user = {"id": row[0], "email": row[1], "roles": roles, "client_id": row[3]}
+    if not _is_admin_user(user):
+        orgs = _get_orgs_for_user(row[0])
+        org_names = [o[1] for o in orgs]
+        automates = set()
+        if org_names:
+            placeholders = ",".join(["%s"] * len(org_names))
+            automates = {
+                r[0]
+                for r in executer_requete_sql(
+                    f"SELECT nom_automate FROM automate WHERE lower(client) IN ({placeholders})",
+                    tuple(n.lower() for n in org_names),
+                )
+            }
+        clients = {n.strip().lower() for n in org_names if n}
+        if row[3] is not None:
+            clients.add(str(row[3]).strip().lower())
+        user["_automates"] = automates
+        user["_clients"] = clients
+    with _AUTH_CACHE_LOCK:
+        if len(_AUTH_CACHE) > 5000:
+            _AUTH_CACHE.clear()
+        _AUTH_CACHE[token] = (now + _AUTH_CACHE_TTL, user)
+    return dict(user)
+
+
+def _is_admin_user(user: dict) -> bool:
+    roles = [r.lower() for r in user.get("roles", [])]
+    return "admin" in roles or "super_admin" in roles
+
+
+def _user_automates(user: dict) -> set:
+    """Stations visibles par un utilisateur non admin (meme regle que /my/automates)."""
+    return user.get("_automates") or set()
+
+
+def _user_clients(user: dict) -> set:
+    """Clients (en minuscules) qu'un utilisateur non admin peut consulter : ses organisations + son client_id."""
+    return user.get("_clients") or set()
 
 
 def _get_orgs_for_user(user_id: int) -> list[tuple[int, str]]:
@@ -2985,13 +3108,15 @@ class ClientConversation(BaseModel):
     client_name: str
 
 @app.get("/clients", response_model=List[ClientConversation])
-def get_clients(is_admin: bool = False):
+def get_clients(request: Request, is_admin: bool = False):
     """
     Renvoie la liste des clients (= conversations disponibles).
     - Admin: tous les clients
     - Client: juste le sien
     """
     if is_admin:
+        if not _is_admin_user(_require_auth(request)):
+            raise HTTPException(status_code=403, detail="Accès réservé à l'admin")
         query = "SELECT DISTINCT client FROM automate WHERE client IS NOT NULL ORDER BY client"
         rows = executer_requete_sql(query)
         return [{"client_id": r[0], "client_name": r[0]} for r in rows]
@@ -3577,8 +3702,10 @@ def get_messages_for_client(client_id: str):
     ]
 
 @app.post("/messages/{client_id}", response_model=MessageOut)
-def post_message_for_client(client_id: str, message: MessageIn):
+def post_message_for_client(client_id: str, message: MessageIn, request: Request):
     """Ajoute un message pour un client."""
+    if not _is_admin_user(_require_auth(request)) and message.sender_id in ADMIN_SENDER_IDS:
+        message.sender_id = CLIENT_SENDER_IDS[0]
     query = """
         INSERT INTO messages (client_id, sender_id, content, file_url, is_read) 
         VALUES (%s, %s, %s, %s, false) 
@@ -3701,9 +3828,18 @@ _AIR_TYPES_CACHE = {"ts": 0.0, "data": None}
 _AIR_TYPES_TTL = 300  # secondes
 
 @app.get("/automates/types")
-def automates_types():
+def automates_types(request: Request):
     """Retourne {nom_automate: 'air'|'eau'} d'apres les grandeurs remontees sur 7 jours.
-    Un automate est 'air' s'il remonte debit/hygro/pression_pa ; sinon 'eau'."""
+    Un automate est 'air' s'il remonte debit/hygro/pression_pa ; sinon 'eau'.
+    Un utilisateur non admin ne recoit que ses stations."""
+    user = _require_auth(request)
+    if not _is_admin_user(user):
+        visibles = _user_automates(user)
+        return {k: v for k, v in _automates_types_all().items() if k in visibles}
+    return _automates_types_all()
+
+
+def _automates_types_all() -> dict:
     now_ts = time.time()
     if _AIR_TYPES_CACHE["data"] is not None and (now_ts - _AIR_TYPES_CACHE["ts"]) < _AIR_TYPES_TTL:
         return _AIR_TYPES_CACHE["data"]
