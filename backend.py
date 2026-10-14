@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from datetime import date, datetime
 import decimal
 import os
+import re
 import secrets
 import time
 from pathlib import Path
@@ -108,32 +109,39 @@ def _load_env_file(path: Path) -> None:
 _load_env_file(Path(__file__).with_name(".env"))
 
 
-# Origines autorisées
+# Origines autorisées (navigateurs). Les appels serveur a serveur n'envoient pas
+# d'en-tete Origin et ne sont pas concernes par le CORS.
 origins = [
+    "https://app.eaukey.net",
     "https://my-app-zeta-blue.vercel.app",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "http://38.242.210.207:3000",
-    "https://38.242.210.207:3000",
-    "https://backend-eaukey.duckdns.org",
-    "http://backend-eaukey.duckdns.org",
 ]
+# Origines supplementaires sans redeploiement du code : CORS_EXTRA_ORIGINS="https://a,https://b"
+origins += [o.strip() for o in os.getenv("CORS_EXTRA_ORIGINS", "").split(",") if o.strip()]
+# Previews et alias Vercel de l'equipe eaukeys-projects (projet my-app)
+_ORIGIN_REGEX = r"^https://my-app(-[a-z0-9-]+)?-eaukeys-projects\.vercel\.app$"
+
+
+def _origin_allowed(origin: str) -> bool:
+    return origin in origins or re.fullmatch(_ORIGIN_REGEX, origin) is not None
+
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    allow_origin_regex=".*",  # fallback to accept any origin if not listed
+    allow_origin_regex=_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],  # Autorisez toutes les méthodes (GET, POST, etc.)
     allow_headers=["*"],  # Autorisez tous les en-têtes
 )
 
-# Filet de sécurité CORS (si jamais une réponse passe hors CORSMiddleware)
+# Filet de sécurité CORS (si jamais une réponse passe hors CORSMiddleware, ex. erreur 500)
 @app.middleware("http")
 async def _force_cors_headers(request, call_next):
     resp = await call_next(request)
     origin = request.headers.get("origin")
-    if origin and "access-control-allow-origin" not in resp.headers:
+    if origin and _origin_allowed(origin) and "access-control-allow-origin" not in resp.headers:
         resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Access-Control-Allow-Credentials"] = "true"
         resp.headers.setdefault("Vary", "Origin")
