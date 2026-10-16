@@ -2752,6 +2752,47 @@ class PanneIn(BaseModel):
     probleme: str = Field(..., min_length=1)
     date_debut: datetime
     date_fin: Optional[datetime] = None
+    # Fiche de résolution (optionnelle, cf. migrations/007_pannes_resolution.sql)
+    cause: Optional[str] = Field(None, max_length=2000)
+    action_realisee: Optional[str] = Field(None, max_length=4000)
+    pieces_changees: Optional[str] = Field(None, max_length=1000)
+    deplacement: Optional[bool] = None
+    intervenant: Optional[str] = Field(None, max_length=200)
+    partage_sav: bool = True
+
+
+_PANNE_COLS = (
+    "id, client, lieu, nom_automate, panne, probleme, date_debut, date_fin, created_by, "
+    "cause, action_realisee, pieces_changees, deplacement, intervenant, partage_sav"
+)
+
+
+def _clean_opt(v: Optional[str]) -> Optional[str]:
+    v = (v or "").strip()
+    return v or None
+
+
+def _panne_to_dict(r) -> dict:
+    def _fmt(dt_val):
+        return dt_val.isoformat() if hasattr(dt_val, "isoformat") else dt_val
+
+    return {
+        "id": r[0],
+        "client": r[1],
+        "lieu": r[2],
+        "nom_automate": r[3],
+        "panne": r[4],
+        "probleme": r[5],
+        "date_debut": _fmt(r[6]),
+        "date_fin": _fmt(r[7]),
+        "created_by": r[8],
+        "cause": r[9],
+        "action_realisee": r[10],
+        "pieces_changees": r[11],
+        "deplacement": r[12],
+        "intervenant": r[13],
+        "partage_sav": r[14],
+    }
 
 
 def _validate_automate(client: str, lieu: str, nom_automate: str):
@@ -2869,30 +2910,8 @@ def pannes_automate(
 @app.get("/pannes")
 def lister_pannes(request: Request):
     _require_admin(request)
-    rows = executer_requete_sql(
-        """
-        SELECT id, client, lieu, nom_automate, panne, probleme, date_debut, date_fin, created_by
-        FROM pannes
-        ORDER BY id DESC;
-        """
-    )
-    def _fmt(dt_val):
-        return dt_val.isoformat() if hasattr(dt_val, "isoformat") else dt_val
-
-    return [
-        {
-            "id": r[0],
-            "client": r[1],
-            "lieu": r[2],
-            "nom_automate": r[3],
-            "panne": r[4],
-            "probleme": r[5],
-            "date_debut": _fmt(r[6]),
-            "date_fin": _fmt(r[7]),
-            "created_by": r[8],
-        }
-        for r in rows
-    ]
+    rows = executer_requete_sql(f"SELECT {_PANNE_COLS} FROM pannes ORDER BY id DESC;")
+    return [_panne_to_dict(r) for r in rows]
 
 
 @app.post("/pannes")
@@ -2905,10 +2924,11 @@ def creer_panne(p: PanneIn, request: Request):
     _validate_automate(p.client, p.lieu, p.nom_automate)
 
     row = executer_requete_sql_one(
-        """
-        INSERT INTO pannes (client, lieu, nom_automate, panne, probleme, date_debut, date_fin, created_by)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        RETURNING id;
+        f"""
+        INSERT INTO pannes (client, lieu, nom_automate, panne, probleme, date_debut, date_fin, created_by,
+                            cause, action_realisee, pieces_changees, deplacement, intervenant, partage_sav)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING {_PANNE_COLS};
         """,
         (
             p.client,
@@ -2919,22 +2939,17 @@ def creer_panne(p: PanneIn, request: Request):
             p.date_debut,
             p.date_fin,
             email or "",
+            _clean_opt(p.cause),
+            _clean_opt(p.action_realisee),
+            _clean_opt(p.pieces_changees),
+            p.deplacement,
+            _clean_opt(p.intervenant) or email or None,
+            p.partage_sav,
         ),
     )
     if row is None:
         raise HTTPException(status_code=500, detail="Insertion panne échouée")
-
-    return {
-        "id": row[0],
-        "client": p.client,
-        "lieu": p.lieu,
-        "nom_automate": p.nom_automate,
-        "panne": p.panne,
-        "probleme": p.probleme,
-        "date_debut": p.date_debut.isoformat(),
-        "date_fin": p.date_fin.isoformat() if p.date_fin else None,
-        "created_by": email or "",
-    }
+    return _panne_to_dict(row)
 
 
 @app.put("/pannes/{panne_id}")
@@ -2947,7 +2962,7 @@ def maj_panne(panne_id: int, p: PanneIn, request: Request):
     _validate_automate(p.client, p.lieu, p.nom_automate)
 
     row = executer_requete_sql_one(
-        """
+        f"""
         UPDATE pannes
         SET client = %s,
             lieu = %s,
@@ -2955,9 +2970,16 @@ def maj_panne(panne_id: int, p: PanneIn, request: Request):
             panne = %s,
             probleme = %s,
             date_debut = %s,
-            date_fin = %s
+            date_fin = %s,
+            cause = %s,
+            action_realisee = %s,
+            pieces_changees = %s,
+            deplacement = %s,
+            intervenant = %s,
+            partage_sav = %s,
+            updated_at = now()
         WHERE id = %s
-        RETURNING id, client, lieu, nom_automate, panne, probleme, date_debut, date_fin, created_by;
+        RETURNING {_PANNE_COLS};
         """,
         (
             p.client,
@@ -2967,26 +2989,18 @@ def maj_panne(panne_id: int, p: PanneIn, request: Request):
             p.probleme,
             p.date_debut,
             p.date_fin,
+            _clean_opt(p.cause),
+            _clean_opt(p.action_realisee),
+            _clean_opt(p.pieces_changees),
+            p.deplacement,
+            _clean_opt(p.intervenant),
+            p.partage_sav,
             panne_id,
         ),
     )
     if row is None:
         raise HTTPException(status_code=404, detail="Panne introuvable")
-
-    def _fmt(dt_val):
-        return dt_val.isoformat() if hasattr(dt_val, "isoformat") else dt_val
-
-    return {
-        "id": row[0],
-        "client": row[1],
-        "lieu": row[2],
-        "nom_automate": row[3],
-        "panne": row[4],
-        "probleme": row[5],
-        "date_debut": _fmt(row[6]),
-        "date_fin": _fmt(row[7]),
-        "created_by": row[8],
-    }
+    return _panne_to_dict(row)
 
 
 @app.options("/pannes/{panne_id}")
