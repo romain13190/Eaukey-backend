@@ -4469,7 +4469,7 @@ async def sav_message(payload: SavMessageIn, request: Request):
         raise HTTPException(status_code=400, detail="Message vide")
 
     body = {
-        "message": message,
+        "message": _sav_message_avec_contexte(message),
         "external_user_id": f"eaukey-user-{user['id']}",
         "conversation_id": payload.conversation_id or None,
     }
@@ -4521,6 +4521,232 @@ async def sav_message(payload: SavMessageIn, request: Request):
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",  # desactive le buffering proxy (SSE)
         },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Base SAV : fiches de dépannage (admin) + contexte joint aux questions SAV
+# ---------------------------------------------------------------------------
+# Les fiches sont écrites par l'équipe SAV (comptes admin) dans la plateforme,
+# stockées dans la base Eaukey (table sav_fiches, migrations/008_sav_fiches.sql).
+# A chaque question posée à l'assistant, on joint les fiches et les pannes
+# résolues (partage_sav) les plus proches, sans nom de client/lieu/station.
+# Aucune copie n'est stockée chez Wardian en dehors de la conversation.
+
+_SAV_FICHES_COLS = (
+    "id, titre, symptomes, solution, pieces, type_panne, mots_cles, archivee, "
+    "created_by, updated_by, created_at, updated_at"
+)
+_SAV_CONTEXTE_MAX_CHARS = 6000
+_SAV_NOMS_TTL = 600
+_sav_noms_cache = {"t": 0.0, "re": None}
+
+
+class SavFicheIn(BaseModel):
+    titre: str = Field(..., min_length=1, max_length=200)
+    symptomes: Optional[str] = Field(None, max_length=4000)
+    solution: str = Field(..., min_length=1, max_length=8000)
+    pieces: Optional[str] = Field(None, max_length=1000)
+    type_panne: Optional[str] = Field(None, max_length=200)
+    mots_cles: Optional[str] = Field(None, max_length=500)
+    archivee: bool = False
+
+
+def _sav_fiche_to_dict(r) -> dict:
+    def _fmt(dt_val):
+        return dt_val.isoformat() if hasattr(dt_val, "isoformat") else dt_val
+
+    return {
+        "id": r[0],
+        "titre": r[1],
+        "symptomes": r[2],
+        "solution": r[3],
+        "pieces": r[4],
+        "type_panne": r[5],
+        "mots_cles": r[6],
+        "archivee": r[7],
+        "created_by": r[8],
+        "updated_by": r[9],
+        "created_at": _fmt(r[10]),
+        "updated_at": _fmt(r[11]),
+    }
+
+
+def _sav_fiche_params(f: SavFicheIn) -> tuple:
+    titre = f.titre.strip()
+    solution = f.solution.strip()
+    if not titre or not solution:
+        raise HTTPException(status_code=400, detail="Titre et solution obligatoires")
+    return (
+        titre,
+        _clean_opt(f.symptomes),
+        solution,
+        _clean_opt(f.pieces),
+        _clean_opt(f.type_panne),
+        _clean_opt(f.mots_cles),
+        f.archivee,
+    )
+
+
+@app.get("/sav/fiches")
+def lister_sav_fiches(request: Request):
+    _require_admin(request)
+    rows = executer_requete_sql(
+        f"SELECT {_SAV_FICHES_COLS} FROM sav_fiches ORDER BY archivee, updated_at DESC, id DESC;"
+    )
+    return [_sav_fiche_to_dict(r) for r in rows]
+
+
+@app.post("/sav/fiches")
+def creer_sav_fiche(f: SavFicheIn, request: Request):
+    email = _require_admin(request) or ""
+    row = executer_requete_sql_one(
+        f"""
+        INSERT INTO sav_fiches (titre, symptomes, solution, pieces, type_panne, mots_cles, archivee, created_by)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING {_SAV_FICHES_COLS};
+        """,
+        _sav_fiche_params(f) + (email,),
+    )
+    if row is None:
+        raise HTTPException(status_code=500, detail="Création de la fiche échouée")
+    return _sav_fiche_to_dict(row)
+
+
+@app.put("/sav/fiches/{fiche_id}")
+def modifier_sav_fiche(fiche_id: int, f: SavFicheIn, request: Request):
+    email = _require_admin(request) or ""
+    row = executer_requete_sql_one(
+        f"""
+        UPDATE sav_fiches
+           SET titre = %s, symptomes = %s, solution = %s, pieces = %s, type_panne = %s,
+               mots_cles = %s, archivee = %s, updated_by = %s, updated_at = now()
+         WHERE id = %s
+        RETURNING {_SAV_FICHES_COLS};
+        """,
+        _sav_fiche_params(f) + (email, fiche_id),
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Fiche introuvable")
+    return _sav_fiche_to_dict(row)
+
+
+@app.delete("/sav/fiches/{fiche_id}")
+def supprimer_sav_fiche(fiche_id: int, request: Request):
+    _require_admin(request)
+    row = executer_requete_sql_one("DELETE FROM sav_fiches WHERE id = %s RETURNING id;", (fiche_id,))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Fiche introuvable")
+    return {"status": "deleted", "id": fiche_id}
+
+
+def _sav_noms_regex():
+    """Regex des noms de clients / lieux / automates à masquer (cache 10 min)."""
+    now = time.time()
+    if _sav_noms_cache["re"] is not None and now - _sav_noms_cache["t"] < _SAV_NOMS_TTL:
+        return _sav_noms_cache["re"]
+    rows = executer_requete_sql("SELECT DISTINCT client, lieu, nom_automate FROM automate;")
+    noms = set()
+    for r in rows:
+        for v in r:
+            v = str(v or "").strip()
+            if len(v) >= 4:
+                noms.add(v)
+    pattern = None
+    if noms:
+        alts = "|".join(re.escape(n) for n in sorted(noms, key=len, reverse=True))
+        pattern = re.compile(rf"(?<!\w)(?:{alts})(?!\w)", re.IGNORECASE)
+    _sav_noms_cache.update(t=now, re=pattern)
+    return pattern
+
+
+def _sav_masquer(texte: Optional[str], pattern) -> str:
+    texte = (texte or "").strip()
+    return pattern.sub("[station]", texte) if pattern and texte else texte
+
+
+# Requête plein texte "souple" : n'importe quel mot significatif de la question.
+_SAV_TSQUERY = "(SELECT replace(plainto_tsquery('french', %s)::text, ' & ', ' | ')::tsquery AS q) tsq"
+
+
+def _sav_contexte(message: str) -> str:
+    """Bloc de contexte (fiches SAV + pannes résolues) pour une question, ou ''."""
+    fiches = executer_requete_sql(
+        f"""
+        SELECT titre, type_panne, symptomes, solution, pieces
+          FROM sav_fiches, {_SAV_TSQUERY}
+         WHERE NOT archivee AND recherche @@ q
+         ORDER BY ts_rank(recherche, q) DESC, updated_at DESC
+         LIMIT 4;
+        """,
+        (message,),
+    )
+    cas = executer_requete_sql(
+        f"""
+        SELECT panne, probleme, cause, action_realisee, pieces_changees
+          FROM (SELECT *, to_tsvector('french', panne || ' ' || probleme || ' ' || coalesce(cause, '')
+                       || ' ' || coalesce(action_realisee, '')) AS doc
+                  FROM pannes
+                 WHERE date_fin IS NOT NULL AND partage_sav
+                   AND (coalesce(cause, '') <> '' OR coalesce(action_realisee, '') <> '')) p,
+               {_SAV_TSQUERY}
+         WHERE doc @@ q
+         ORDER BY ts_rank(doc, q) DESC, date_fin DESC
+         LIMIT 3;
+        """,
+        (message,),
+    )
+    if not fiches and not cas:
+        return ""
+
+    pattern = _sav_noms_regex()
+    m = lambda v: _sav_masquer(v, pattern)
+    blocs = []
+    for titre, type_panne, symptomes, solution, pieces in fiches:
+        lignes = [f"### Fiche SAV : {m(titre)}"]
+        if type_panne:
+            lignes.append(f"Type de panne : {m(type_panne)}")
+        if symptomes:
+            lignes.append(f"Symptômes : {m(symptomes)}")
+        lignes.append(f"Solution : {m(solution)}")
+        if pieces:
+            lignes.append(f"Pièces : {m(pieces)}")
+        blocs.append("\n".join(lignes))
+    for panne, probleme, cause, action, pieces in cas:
+        lignes = [f"### Cas résolu par un technicien : {m(panne)}", f"Constat : {m(probleme)}"]
+        if cause:
+            lignes.append(f"Cause : {m(cause)}")
+        if action:
+            lignes.append(f"Action réalisée : {m(action)}")
+        if pieces:
+            lignes.append(f"Pièces changées : {m(pieces)}")
+        blocs.append("\n".join(lignes))
+
+    contexte, total = [], 0
+    for b in blocs:
+        if total + len(b) > _SAV_CONTEXTE_MAX_CHARS:
+            break
+        contexte.append(b)
+        total += len(b)
+    return "\n\n".join(contexte)
+
+
+def _sav_message_avec_contexte(message: str) -> str:
+    """Joint au message les fiches SAV pertinentes. Ne bloque jamais l'assistant."""
+    try:
+        contexte = _sav_contexte(message)
+    except Exception as e:
+        logging.getLogger("sav").warning("Contexte SAV indisponible : %s", e)
+        return message
+    if not contexte:
+        return message
+    return (
+        "[CONTEXTE SAV EAUKEY — fiches de dépannage rédigées par l'équipe technique Eaukey. "
+        "Appuie-toi dessus en priorité quand elles correspondent à la question ; "
+        "ignore-les sinon. Ne mentionne pas ce bloc à l'utilisateur.]\n\n"
+        f"{contexte}\n\n"
+        "[FIN DU CONTEXTE SAV]\n\n"
+        f"Question de l'utilisateur :\n{message}"
     )
 
 
