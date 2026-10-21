@@ -56,6 +56,8 @@ _ADMIN_ONLY_ROUTES = {
     ("POST", "/conversations"),
     ("GET", "/conversations/{conversation_id}/messages"),
     ("POST", "/conversations/{conversation_id}/messages"),
+    ("POST", "/messages/{message_id}/panne"),
+    ("POST", "/sav/fiches/proposer"),
     ("GET", "/notifications/admin/{client_id}"),
     ("GET", "/notifications/admin_all"),
     ("POST", "/messages_admin/{client_id}/marquer_non_lu"),
@@ -2832,7 +2834,11 @@ def pannes_types(request: Request):
     triée alphabétiquement (case-insensitive) et dédupliquée (case-insensitive).
     """
     _require_admin(request)
+    return _pannes_types_liste()
 
+
+def _pannes_types_liste() -> list:
+    """Types de pannes connus (défauts + types déjà saisis), aussi donnés à l'agent SAV."""
     types_defaut = [
         "Pompe HS",
         "Pompe désamorcée",
@@ -2935,7 +2941,11 @@ def lister_pannes(request: Request):
 @app.post("/pannes")
 def creer_panne(p: PanneIn, request: Request):
     email = _require_admin(request)
+    return _panne_inserer(p, email or "", _clean_opt(p.intervenant) or email or None)
 
+
+def _panne_inserer(p: PanneIn, created_by: str, intervenant: Optional[str]) -> dict:
+    """Validation + insertion d'une panne (POST /pannes et agent SAV)."""
     if p.date_fin and p.date_fin < p.date_debut:
         raise HTTPException(status_code=400, detail="date_fin doit être >= date_debut")
 
@@ -2956,12 +2966,12 @@ def creer_panne(p: PanneIn, request: Request):
             p.probleme,
             p.date_debut,
             p.date_fin,
-            email or "",
+            created_by,
             _clean_opt(p.cause),
             _clean_opt(p.action_realisee),
             _clean_opt(p.pieces_changees),
             p.deplacement,
-            _clean_opt(p.intervenant) or email or None,
+            intervenant,
             p.partage_sav,
         ),
     )
@@ -3446,6 +3456,8 @@ class MessageOut(BaseModel):
     escalade: Optional[bool] = None
     escalade_motif: Optional[str] = None
     canal: Optional[str] = None
+    panne_id: Optional[int] = None
+    panne_suggeree: Optional[dict] = None
 
 class ClientConversation(BaseModel):
     client_id: str
@@ -4026,7 +4038,8 @@ def get_messages_for_client(client_id: str, request: Request):
     """Récupère tous les messages pour un client donné."""
     is_admin = _is_admin_user(_require_auth(request))
     query = """
-        SELECT id, client_id, sender_id, content, file_url, created_at, is_read, escalade, escalade_motif, canal
+        SELECT id, client_id, sender_id, content, file_url, created_at, is_read, escalade, escalade_motif, canal,
+               panne_id, panne_suggeree
         FROM messages 
         WHERE client_id = %s 
         ORDER BY created_at
@@ -4046,6 +4059,9 @@ def get_messages_for_client(client_id: str, request: Request):
             # Le motif est une note pour l'équipe : jamais renvoyé au client.
             "escalade_motif": r[8] if is_admin else None,
             "canal": r[9] or "app",
+            "panne_id": r[10],
+            # Panne détectée, station à préciser : note pour l'équipe, jamais renvoyée au client.
+            "panne_suggeree": r[11] if is_admin else None,
         }
         for r in rows
     ]
@@ -4083,6 +4099,30 @@ def post_message_for_client(client_id: str, message: MessageIn, request: Request
         "created_at": row[1].isoformat() if hasattr(row[1], "isoformat") else row[1],
         "is_read": False,
     }
+
+class MessagePanneIn(BaseModel):
+    panne_id: int
+
+
+@app.post("/messages/{message_id}/panne")
+def lier_message_panne(message_id: int, payload: MessagePanneIn, request: Request):
+    """Lie une panne (créée par l'équipe depuis une « panne suggérée ») à la réponse de
+    l'assistant qui l'a détectée, et efface la suggestion (admin)."""
+    _require_admin(request)
+    msg = executer_requete_sql_one("SELECT client_id FROM messages WHERE id = %s;", (message_id,))
+    if msg is None:
+        raise HTTPException(status_code=404, detail="Message introuvable")
+    panne = executer_requete_sql_one("SELECT client FROM pannes WHERE id = %s;", (payload.panne_id,))
+    if panne is None:
+        raise HTTPException(status_code=404, detail="Panne introuvable")
+    if str(panne[0] or "").strip().lower() != str(msg[0] or "").strip().lower():
+        raise HTTPException(status_code=400, detail="La panne ne concerne pas ce client")
+    executer_requete_sql(
+        "UPDATE messages SET panne_id = %s, panne_suggeree = NULL WHERE id = %s;",
+        (payload.panne_id, message_id),
+    )
+    return {"status": "ok", "id": message_id, "panne_id": payload.panne_id}
+
 
 # -------------------
 # NOTIFICATIONS & MARQUAGE LU
@@ -5311,7 +5351,12 @@ async def sav_message(payload: SavMessageIn, request: Request):
 #   - l'agent ne fait appel à un humain que si c'est nécessaire (consigne
 #     _CHAT_AGENT_CONSIGNE) : il commence alors sa réponse par [ESCALADE: motif],
 #     le marqueur est retiré, le message est marqué `escalade` et l'équipe est
-#     prévenue par e-mail (une fois tant qu'aucun admin n'a répondu).
+#     prévenue par e-mail (une fois tant qu'aucun admin n'a répondu) ;
+#   - quand l'échange révèle une vraie panne, l'agent ajoute [PANNE: type | constat] :
+#     le marqueur est retiré, la panne est créée sur la station du client (ou liée à
+#     la même panne encore ouverte) et rattachée au message (messages.panne_id) ; si la
+#     station ne peut pas être déterminée, une « panne suggérée » est notée sur le
+#     message pour l'équipe (messages.panne_suggeree, migrations/014).
 # Flux SSE renvoyé au front : message (question enregistrée), token (texte au
 # fil de l'eau, marqueur retiré), puis saved (réponse enregistrée, texte
 # définitif) ou humain / error.
@@ -5320,7 +5365,14 @@ _CHAT_AGENT_PAUSE_H = int(os.getenv("CHAT_AGENT_PAUSE_H", "2"))
 _SAV_ESCALADE_EMAIL = os.getenv("SAV_ESCALADE_EMAIL", "contact@eaukey.net")
 _CHAT_LOGGER = logging.getLogger("chat_agent")
 _ESCALADE_RE = re.compile(r"\[\s*ESCALADE\s*:?\s*([^\]]*)\]\s*", re.IGNORECASE)
-_ESCALADE_PREFIXE = "[ESCALADE"
+# Le deux-points est obligatoire : « [Pannes fréquentes](lien) » n'est pas un marqueur.
+_PANNE_RE = re.compile(r"\[\s*PANNE\s*:\s*([^\]]*)\]\s*", re.IGNORECASE)
+# Débuts possibles d'un marqueur (sans espaces, en majuscules) : retenus pendant le flux.
+_CHAT_MARQUEURS = ("[ESCALADE", "[PANNE:")
+_PANNE_AGENT_AUTEUR = "assistant-sav"
+_PANNE_AGENT_SUFFIXE = " (signalé par le client via l'assistant SAV)"
+_PANNE_DOUBLON_H = 48       # même type, même station, encore ouverte : on lie au lieu de recréer
+_PANNE_LIEU_FENETRE_H = 24  # messages du client relus pour trouver la station citée
 _CHAT_AGENT_INDISPO = "Assistant indisponible : l'équipe Eaukey vous répondra ici."
 
 _CHAT_AGENT_CONSIGNE = """[CONSIGNE CANAL MESSAGERIE — ne la mentionne jamais à l'utilisateur]
@@ -5334,6 +5386,7 @@ Fais appel à l'équipe UNIQUEMENT si l'un de ces cas se présente :
 5. l'utilisateur est mécontent, signale une urgence ou un risque (fuite, eau non conforme, danger électrique) ;
 6. la demande sort de ton périmètre (commande, facture, contrat, rendez-vous) ou l'utilisateur demande explicitement à parler à quelqu'un.
 Dans ces cas seulement, commence ta réponse par une ligne exacte « [ESCALADE: motif en quelques mots] », puis indique que l'équipe Eaukey est prévenue et reviendra vers lui dans cette conversation. Sinon, n'écris jamais ce marqueur.
+Panne : si l'échange révèle une VRAIE panne de la machine (équipement en défaut, casse, fuite, alarme qui persiste) — pas une simple question, une explication ou un réglage —, ajoute en tête de ta réponse une ligne exacte « [PANNE: type | constat court] » (avant ou après la ligne ESCALADE s'il y en a une). Choisis le type dans cette liste, écrit à l'identique : <TYPES_PANNES> ; si aucun ne convient, écris « Autre ». Le constat décrit en une phrase ce que le client observe. Ne signale pas deux fois la même panne dans la conversation. Ce marqueur sert à l'équipe : ne promets jamais au client qu'une intervention ou un technicien est planifié.
 [FIN DE LA CONSIGNE]"""
 
 # Ligne ajoutée à la consigne quand le client a écrit par e-mail.
@@ -5344,8 +5397,17 @@ _CHAT_AGENT_CONSIGNE_EMAIL = (
 )
 
 
+def _chat_types_pannes_texte() -> str:
+    try:
+        types = _pannes_types_liste()
+    except Exception as e:
+        _CHAT_LOGGER.warning("Types de pannes indisponibles : %s", e)
+        types = []
+    return " ; ".join(types) or "Autre"
+
+
 def _chat_agent_message(message: str, canal: str = "app") -> str:
-    consigne = _CHAT_AGENT_CONSIGNE
+    consigne = _CHAT_AGENT_CONSIGNE.replace("<TYPES_PANNES>", _chat_types_pannes_texte())
     if canal == "email":
         consigne = consigne.replace("[FIN DE LA CONSIGNE]", f"{_CHAT_AGENT_CONSIGNE_EMAIL}\n[FIN DE LA CONSIGNE]")
     return f"{consigne}\n\n{_sav_message_avec_contexte(message)}"
@@ -5360,14 +5422,138 @@ def _chat_extraire_escalade(texte: str) -> tuple[str, Optional[str]]:
     return _ESCALADE_RE.sub("", texte).strip(), motif
 
 
-def _chat_debut_marqueur_possible(texte: str) -> bool:
-    """Vrai tant que le début de la réponse peut encore être un marqueur [ESCALADE: ...] incomplet."""
-    debut = texte.lstrip()
-    if len(debut) >= 400:
+def _chat_extraire_panne(texte: str) -> tuple[str, Optional[dict]]:
+    """Retire le marqueur [PANNE: type | constat] (où qu'il soit) ; renvoie (texte, {type, constat} ou None)."""
+    m = _PANNE_RE.search(texte)
+    if not m:
+        return texte.strip(), None
+    type_panne, _, constat = (m.group(1) or "").partition("|")
+    panne = {"type": " ".join(type_panne.split())[:200], "constat": " ".join(constat.split())[:500]}
+    return _PANNE_RE.sub("", texte).strip(), panne
+
+
+def _chat_marqueur_incomplet(fragment: str) -> bool:
+    """Vrai si `fragment` (qui commence par « [ ») peut encore devenir un marqueur [ESCALADE…] / [PANNE: …]."""
+    if "]" in fragment or len(fragment) >= 400:
         return False
-    if len(debut) < len(_ESCALADE_PREFIXE):
-        return _ESCALADE_PREFIXE.startswith(debut.upper())
-    return debut.upper().startswith(_ESCALADE_PREFIXE) and "]" not in debut
+    tete = "".join(fragment.split()).upper()
+    return any(m.startswith(tete) or tete.startswith(m) for m in _CHAT_MARQUEURS)
+
+
+def _chat_texte_diffusable(texte: str) -> str:
+    """Partie de la réponse montrable pendant le flux : marqueurs complets retirés, et
+    marqueur peut-être en cours d'écriture (fin du texte) retenu jusqu'à son « ] »."""
+    i = texte.rfind("[")
+    if i >= 0 and _chat_marqueur_incomplet(texte[i:]):
+        texte = texte[:i]
+    return _PANNE_RE.sub("", _ESCALADE_RE.sub("", texte)).lstrip()
+
+
+def _chat_type_panne(propose: str, constat: str, question: str) -> tuple[str, str]:
+    """Type connu (sinon « Autre », le type proposé passe dans le constat) et constat non vide."""
+    connus = {t.casefold(): t for t in _pannes_types_liste()}
+    type_panne = connus.get((propose or "").strip().casefold())
+    if type_panne is None:
+        if propose and propose.strip().casefold() != "autre":
+            constat = f"{propose.strip()} : {constat}" if constat else propose.strip()
+        type_panne = "Autre"
+    if not constat:
+        constat = " ".join((question or "").split())[:300] or type_panne
+    return type_panne, constat
+
+
+def _chat_sans_accents(texte: str) -> str:
+    import unicodedata
+    t = unicodedata.normalize("NFKD", texte or "")
+    return "".join(c for c in t if not unicodedata.combining(c)).casefold()
+
+
+def _chat_station_panne(client_id: str) -> Optional[tuple]:
+    """(client, lieu, nom_automate) de la station concernée, ou None si on ne peut pas savoir.
+
+    Une seule station pour ce client : c'est elle. Plusieurs : on relit les messages du
+    client des dernières 24 h, du plus récent au plus ancien ; le premier qui cite un nom
+    de lieu (ou d'automate) désigne la station s'il n'en désigne qu'une (sinon : ambigu).
+    """
+    stations = [
+        s for s in executer_requete_sql(
+            "SELECT client, lieu, nom_automate FROM automate "
+            "WHERE lower(trim(client)) = lower(trim(%s)) ORDER BY nom_automate;",
+            (client_id,),
+        )
+        if s and s[1] and s[2]
+    ]
+    if len(stations) <= 1:
+        return stations[0] if stations else None
+    noms = []  # (nom normalisé, station)
+    for s in stations:
+        for nom in (s[1], s[2]):
+            n = _chat_sans_accents(" ".join(str(nom).split()))
+            if len(n) >= 3:
+                noms.append((n, s))
+    msgs = executer_requete_sql(
+        """
+        SELECT content FROM messages
+        WHERE client_id = %s AND sender_id = ANY(%s)
+          AND created_at::timestamptz > now() - make_interval(hours => %s)
+        ORDER BY created_at::timestamptz DESC, id DESC;
+        """,
+        (client_id, list(CLIENT_SENDER_IDS), _PANNE_LIEU_FENETRE_H),
+    )
+    for (content,) in msgs:
+        texte = _chat_sans_accents(content or "")
+        trouves = [(n, s) for n, s in noms if re.search(rf"(?<!\w){re.escape(n)}(?!\w)", texte)]
+        # « Aix » ne compte pas quand « Aix Nord » est cité.
+        trouves = [(n, s) for n, s in trouves if not any(n != m and n in m for m, _ in trouves)]
+        retenues = {s[2]: s for _, s in trouves}
+        if retenues:
+            return next(iter(retenues.values())) if len(retenues) == 1 else None
+    return None
+
+
+def _chat_traiter_panne(client_id: str, message_id: int, panne: dict, question: str) -> Optional[int]:
+    """Panne détectée par l'agent : création (ou panne ouverte identique) liée au message,
+    sinon « panne suggérée » notée sur le message pour l'équipe. Ne lève jamais."""
+    try:
+        type_panne, constat = _chat_type_panne(panne.get("type", ""), panne.get("constat", ""), question)
+        station = _chat_station_panne(client_id)
+        panne_id = None
+        if station is not None:
+            client, lieu, nom_automate = station
+            row = executer_requete_sql_one(
+                """
+                SELECT id FROM pannes
+                WHERE nom_automate = %s AND date_fin IS NULL AND lower(trim(panne)) = lower(%s)
+                  AND date_debut >= now() - make_interval(hours => %s)
+                ORDER BY id DESC LIMIT 1;
+                """,
+                (nom_automate, type_panne, _PANNE_DOUBLON_H),
+            )
+            if row is not None:
+                panne_id = row[0]
+            else:
+                try:
+                    cree = _panne_inserer(
+                        PanneIn(client=client, lieu=lieu, nom_automate=nom_automate, panne=type_panne,
+                                probleme=constat + _PANNE_AGENT_SUFFIXE,
+                                date_debut=datetime.now(dt.timezone.utc), partage_sav=False),
+                        _PANNE_AGENT_AUTEUR, None,
+                    )
+                    panne_id = cree["id"]
+                except HTTPException as e:
+                    _CHAT_LOGGER.warning("Panne non créée (client %s) : %s", client_id, e.detail)
+        if panne_id is not None:
+            executer_requete_sql(
+                "UPDATE messages SET panne_id = %s, panne_suggeree = NULL WHERE id = %s;", (panne_id, message_id)
+            )
+            return panne_id
+        executer_requete_sql(
+            "UPDATE messages SET panne_suggeree = %s::jsonb WHERE id = %s;",
+            (json.dumps({"type": type_panne, "constat": constat}, ensure_ascii=False), message_id),
+        )
+    except Exception as e:
+        _CHAT_LOGGER.error("Traitement de la panne détectée en echec (client %s) : %s", client_id, e)
+    return None
 
 
 def _chat_humain_actif(client_id: str) -> bool:
@@ -5465,6 +5651,22 @@ async def _chat_prevenir_equipe(client_id: str, motif: str, question: str, repon
         _CHAT_LOGGER.error("Echec e-mail d'escalade (client %s) : %s", client_id, e)
 
 
+def _wardian_trame(frame: str) -> tuple:
+    """(événement, données) d'une trame SSE Wardian ; (None, None) pour un commentaire / keepalive."""
+    ev = data = None
+    for line in frame.split("\n"):
+        if line.startswith("event:"):
+            ev = line[6:].strip()
+        elif line.startswith("data:"):
+            try:
+                data = json.loads(line[5:].strip())
+            except ValueError:
+                data = None
+    if not ev or not isinstance(data, dict):
+        return None, None
+    return ev, data
+
+
 def _sse(event: str, data: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
 
@@ -5502,8 +5704,7 @@ async def _chat_agent_evenements(client_id: str, content: str, canal: str = "app
     message = _chat_agent_message(content, canal)
     conv_id = _chat_conv_get(client_id)
     texte = ""        # réponse complète de l'agent
-    envoye = 0        # caractères de `texte` déjà transmis au front
-    retenue = True    # on retient le début tant qu'il peut s'agir du marqueur
+    diffuse = ""      # texte (marqueurs retirés) déjà transmis au front
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=10.0)) as client:
         for essai in range(2):
@@ -5529,16 +5730,8 @@ async def _chat_agent_evenements(client_id: str, content: str, canal: str = "app
                         buf += chunk
                         *frames, buf = buf.split("\n\n")
                         for frame in frames:
-                            ev = data = None
-                            for line in frame.split("\n"):
-                                if line.startswith("event:"):
-                                    ev = line[6:].strip()
-                                elif line.startswith("data:"):
-                                    try:
-                                        data = json.loads(line[5:].strip())
-                                    except ValueError:
-                                        data = None
-                            if not ev or not isinstance(data, dict):
+                            ev, data = _wardian_trame(frame)
+                            if not ev:
                                 continue  # ": keepalive" et commentaires
                             if ev in ("conversation", "done") and data.get("conversation_id"):
                                 if data["conversation_id"] != conv_id:
@@ -5546,16 +5739,11 @@ async def _chat_agent_evenements(client_id: str, content: str, canal: str = "app
                                     _chat_conv_set(client_id, conv_id)
                             elif ev == "token":
                                 texte += data.get("delta") or ""
-                                if retenue:
-                                    if _chat_debut_marqueur_possible(texte):
-                                        continue
-                                    retenue = False
-                                    visible, _ = _chat_extraire_escalade(texte)
-                                    if visible:
-                                        yield ("token", {"delta": visible})
-                                elif len(texte) > envoye:
-                                    yield ("token", {"delta": texte[envoye:]})
-                                envoye = len(texte)
+                                # Marqueurs [ESCALADE…] / [PANNE: …] jamais montrés, même découpés en tokens.
+                                visible = _chat_texte_diffusable(texte)
+                                if len(visible) > len(diffuse) and visible.startswith(diffuse):
+                                    yield ("token", {"delta": visible[len(diffuse):]})
+                                    diffuse = visible
                             elif ev == "error":
                                 _CHAT_LOGGER.warning("Wardian error (client %s) : %s", client_id, data)
                                 yield ("error", {"message": _CHAT_AGENT_INDISPO})
@@ -5567,6 +5755,7 @@ async def _chat_agent_evenements(client_id: str, content: str, canal: str = "app
                 return
 
     reponse, motif = _chat_extraire_escalade(texte)
+    reponse, panne = _chat_extraire_panne(reponse)
     if not reponse:
         yield ("error", {"message": _CHAT_AGENT_INDISPO})
         return
@@ -5574,6 +5763,9 @@ async def _chat_agent_evenements(client_id: str, content: str, canal: str = "app
     deja_signale = escalade and _chat_escalade_en_attente(client_id)
     saved = _chat_inserer_message(client_id, AGENT_SENDER_ID, reponse, escalade, motif,
                                  canal, adresse)
+    if panne is not None and saved:
+        # Rien de nouveau pour le client : la panne (ou la suggestion) est visible de l'équipe.
+        _chat_traiter_panne(client_id, saved[0], panne, content)
     yield ("saved", {
         "id": saved[0] if saved else None,
         "created_at": _iso(saved[1]) if saved else None,
@@ -5798,7 +5990,7 @@ def chat_rouvrir(client_id: str, request: Request):
 
 _SAV_FICHES_COLS = (
     "id, titre, symptomes, solution, pieces, type_panne, mots_cles, archivee, "
-    "created_by, updated_by, created_at, updated_at"
+    "created_by, updated_by, created_at, updated_at, brouillon, source_client_id"
 )
 _SAV_CONTEXTE_MAX_CHARS = 6000
 _SAV_NOMS_TTL = 600
@@ -5813,6 +6005,8 @@ class SavFicheIn(BaseModel):
     type_panne: Optional[str] = Field(None, max_length=200)
     mots_cles: Optional[str] = Field(None, max_length=500)
     archivee: bool = False
+    # Brouillon proposé par l'assistant (migrations/014). PUT : absent = inchangé, false = publier.
+    brouillon: Optional[bool] = None
 
 
 def _sav_fiche_to_dict(r) -> dict:
@@ -5832,6 +6026,8 @@ def _sav_fiche_to_dict(r) -> dict:
         "updated_by": r[9],
         "created_at": _fmt(r[10]),
         "updated_at": _fmt(r[11]),
+        "brouillon": bool(r[12]),
+        "source_client_id": r[13],
     }
 
 
@@ -5855,7 +6051,7 @@ def _sav_fiche_params(f: SavFicheIn) -> tuple:
 def lister_sav_fiches(request: Request):
     _require_admin(request)
     rows = executer_requete_sql(
-        f"SELECT {_SAV_FICHES_COLS} FROM sav_fiches ORDER BY archivee, updated_at DESC, id DESC;"
+        f"SELECT {_SAV_FICHES_COLS} FROM sav_fiches ORDER BY brouillon DESC, archivee, updated_at DESC, id DESC;"
     )
     return [_sav_fiche_to_dict(r) for r in rows]
 
@@ -5865,11 +6061,12 @@ def creer_sav_fiche(f: SavFicheIn, request: Request):
     email = _require_admin(request) or ""
     row = executer_requete_sql_one(
         f"""
-        INSERT INTO sav_fiches (titre, symptomes, solution, pieces, type_panne, mots_cles, archivee, created_by)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO sav_fiches (titre, symptomes, solution, pieces, type_panne, mots_cles, archivee, created_by,
+                                brouillon)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING {_SAV_FICHES_COLS};
         """,
-        _sav_fiche_params(f) + (email,),
+        _sav_fiche_params(f) + (email, bool(f.brouillon)),
     )
     if row is None:
         raise HTTPException(status_code=500, detail="Création de la fiche échouée")
@@ -5883,11 +6080,12 @@ def modifier_sav_fiche(fiche_id: int, f: SavFicheIn, request: Request):
         f"""
         UPDATE sav_fiches
            SET titre = %s, symptomes = %s, solution = %s, pieces = %s, type_panne = %s,
-               mots_cles = %s, archivee = %s, updated_by = %s, updated_at = now()
+               mots_cles = %s, archivee = %s, updated_by = %s, updated_at = now(),
+               brouillon = COALESCE(%s, brouillon)
          WHERE id = %s
         RETURNING {_SAV_FICHES_COLS};
         """,
-        _sav_fiche_params(f) + (email, fiche_id),
+        _sav_fiche_params(f) + (email, f.brouillon, fiche_id),
     )
     if row is None:
         raise HTTPException(status_code=404, detail="Fiche introuvable")
@@ -5901,6 +6099,146 @@ def supprimer_sav_fiche(fiche_id: int, request: Request):
     if row is None:
         raise HTTPException(status_code=404, detail="Fiche introuvable")
     return {"status": "deleted", "id": fiche_id}
+
+
+# ---------------------------------------------------------------------------
+# Fiches proposées par l'assistant (brouillons) : POST /sav/fiches/proposer
+# ---------------------------------------------------------------------------
+# Un admin demande, depuis une conversation résolue, un brouillon de fiche à
+# l'agent Wardian (appel non streamé, nouvelle conversation à chaque fois, sous
+# un external_user_id dédié). Le brouillon n'est JAMAIS joint aux questions des
+# clients (_sav_contexte exclut les brouillons) tant qu'un admin ne l'a pas publié.
+# Suite prévue : proposition automatique à la clôture d'une conversation.
+
+_SAV_REDACTION_USER = "eaukey-redaction-fiches"
+_SAV_PROPOSITION_NB_MESSAGES = 30
+_SAV_REDACTION_CONSIGNE = """[CONSIGNE RÉDACTION DE FICHE SAV — tâche interne pour l'équipe Eaukey : aucun client ne lira ta réponse]
+Voici un échange de la messagerie SAV Eaukey entre un client, l'assistant SAV et l'équipe Eaukey. Rédige à partir de cet échange une fiche de dépannage réutilisable pour d'autres clients.
+Règles :
+- généralise : décris le problème et la solution pour n'importe quelle station, pas pour ce client ;
+- retire tout nom de client, de lieu, de station, d'automate ou de personne, toute adresse, e-mail ou numéro de téléphone ;
+- ne garde que les étapes réellement données dans l'échange (par l'assistant ou l'équipe) : n'invente aucune étape, valeur ni pièce ;
+- si l'échange ne contient aucune solution exploitable, mets "solution" à "" (chaîne vide).
+Réponds UNIQUEMENT par un objet JSON, sans texte autour, de la forme :
+{"titre": "le problème en quelques mots", "symptomes": "ce que voit le client", "solution": "étapes numérotées, une par ligne", "pieces": "pièces concernées, ou chaîne vide", "type_panne": "un type de cette liste, ou chaîne vide", "mots_cles": "autres façons de décrire le problème, séparées par des virgules"}
+Types de panne : <TYPES_PANNES>
+[FIN DE LA CONSIGNE]"""
+
+
+class SavPropositionIn(BaseModel):
+    client_id: str = Field(..., min_length=1, max_length=200)
+
+
+async def _wardian_reponse_complete(message: str, external_user_id: str) -> str:
+    """Appel à l'agent Wardian sans flux : agrège les tokens SSE (nouvelle conversation).
+    Lève HTTPException 503 (non configuré) ou 502 (injoignable / erreur)."""
+    import httpx
+
+    if not _WARDIAN_API_KEY or not _WARDIAN_AGENT_ID:
+        raise HTTPException(status_code=503, detail="Assistant SAV non configure")
+    url = f"{_WARDIAN_API_BASE}/api/v1/agents/{_WARDIAN_AGENT_ID}/messages"
+    headers = {"Authorization": f"Bearer {_WARDIAN_API_KEY}", "Content-Type": "application/json"}
+    body = {"message": message, "external_user_id": external_user_id, "conversation_id": None}
+    texte = ""
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=10.0)) as client:
+            async with client.stream("POST", url, headers=headers, json=body) as up:
+                if up.status_code != 200:
+                    _CHAT_LOGGER.warning("Wardian HTTP %s (%s)", up.status_code, external_user_id)
+                    raise HTTPException(status_code=502, detail="Assistant SAV indisponible")
+                buf = ""
+                async for chunk in up.aiter_text():
+                    buf += chunk
+                    *frames, buf = buf.split("\n\n")
+                    for frame in frames:
+                        ev, data = _wardian_trame(frame)
+                        if ev == "token":
+                            texte += data.get("delta") or ""
+                        elif ev == "error":
+                            _CHAT_LOGGER.warning("Wardian error (%s) : %s", external_user_id, data)
+                            raise HTTPException(status_code=502, detail="Assistant SAV indisponible")
+    except httpx.HTTPError as e:
+        _CHAT_LOGGER.warning("Wardian injoignable (%s) : %s", external_user_id, e)
+        raise HTTPException(status_code=502, detail="Assistant SAV injoignable")
+    return texte
+
+
+def _sav_extraire_json_fiche(texte: str) -> Optional[dict]:
+    """Objet JSON de la réponse de l'agent : bloc ```json, ou du premier « { » au dernier « } »."""
+    texte = texte or ""
+    candidats = [m.group(1) for m in re.finditer(r"```(?:json)?\s*(.*?)```", texte, re.S | re.I)]
+    debut, fin = texte.find("{"), texte.rfind("}")
+    if debut >= 0 and fin > debut:
+        candidats.append(texte[debut:fin + 1])
+    for c in candidats:
+        try:
+            d = json.loads(c.strip())
+        except ValueError:
+            continue
+        if isinstance(d, dict):
+            return d
+    return None
+
+
+def _sav_champ_propose(v, max_len: int, sep: str = ", ") -> Optional[str]:
+    if isinstance(v, (list, tuple)):
+        v = sep.join(str(x).strip() for x in v if x is not None and str(x).strip())
+    if v is None or isinstance(v, (dict, bool)):
+        return None
+    v = str(v).strip()
+    return v[:max_len] or None
+
+
+@app.post("/sav/fiches/proposer")
+async def proposer_sav_fiche(payload: SavPropositionIn, request: Request):
+    """Brouillon de fiche SAV rédigé par l'agent Wardian à partir des 30 derniers messages
+    d'un fil /chat (admin). Enregistré `brouillon` : à relire et publier dans /base-sav."""
+    _require_admin(request)
+    client_id = payload.client_id.strip()
+    rows = executer_requete_sql(
+        """
+        SELECT sender_id, content FROM messages
+        WHERE client_id = %s AND coalesce(trim(content), '') <> ''
+        ORDER BY created_at::timestamptz DESC, id DESC
+        LIMIT %s;
+        """,
+        (client_id, _SAV_PROPOSITION_NB_MESSAGES),
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="Aucun message dans cette conversation")
+
+    # Noms de clients / lieux / stations masqués avant envoi (l'agent doit aussi généraliser).
+    pattern = _sav_noms_regex()
+    lignes = []
+    for sender_id, content in reversed(rows):
+        qui = ("Assistant SAV" if sender_id == AGENT_SENDER_ID
+               else "Équipe Eaukey" if sender_id in ADMIN_SENDER_IDS else "Client")
+        lignes.append(f"{qui} : {_sav_masquer(str(content)[:2000], pattern)}")
+    consigne = _SAV_REDACTION_CONSIGNE.replace("<TYPES_PANNES>", _chat_types_pannes_texte())
+    message = f"{consigne}\n\n[ÉCHANGE]\n" + "\n\n".join(lignes) + "\n[FIN DE L'ÉCHANGE]"
+
+    texte = await _wardian_reponse_complete(message, _SAV_REDACTION_USER)
+    d = _sav_extraire_json_fiche(texte)
+    if d is None:
+        raise HTTPException(status_code=502, detail="Réponse de l'assistant illisible : aucune fiche créée")
+    m = lambda v, n, sep=", ": _sav_masquer(_sav_champ_propose(v, n, sep), pattern) or None
+    titre, solution = m(d.get("titre"), 200), m(d.get("solution"), 8000, "\n")
+    if not titre or not solution:
+        raise HTTPException(status_code=422, detail="L'échange ne contient pas de solution exploitable : aucune fiche créée")
+
+    row = executer_requete_sql_one(
+        f"""
+        INSERT INTO sav_fiches (titre, symptomes, solution, pieces, type_panne, mots_cles, archivee,
+                                created_by, brouillon, source_client_id)
+        VALUES (%s, %s, %s, %s, %s, %s, false, %s, true, %s)
+        RETURNING {_SAV_FICHES_COLS};
+        """,
+        (titre, m(d.get("symptomes"), 4000), solution, m(d.get("pieces"), 1000),
+         m(d.get("type_panne"), 200), m(d.get("mots_cles"), 500), _PANNE_AGENT_AUTEUR, client_id),
+    )
+    if row is None:
+        raise HTTPException(status_code=500, detail="Création du brouillon échouée")
+    return _sav_fiche_to_dict(row)
 
 
 def _sav_noms_regex():
@@ -5938,7 +6276,7 @@ def _sav_contexte(message: str) -> str:
         f"""
         SELECT titre, type_panne, symptomes, solution, pieces
           FROM sav_fiches, {_SAV_TSQUERY}
-         WHERE NOT archivee AND recherche @@ q
+         WHERE NOT archivee AND NOT brouillon AND recherche @@ q
          ORDER BY ts_rank(recherche, q) DESC, updated_at DESC
          LIMIT 4;
         """,
