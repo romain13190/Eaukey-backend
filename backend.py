@@ -56,6 +56,10 @@ _ADMIN_ONLY_ROUTES = {
     ("GET", "/notifications/admin_all"),
     ("POST", "/messages_admin/{client_id}/marquer_non_lu"),
     ("GET", "/chat/escalades"),
+    ("GET", "/chat/boite"),
+    ("GET", "/chat/boite/compteur"),
+    ("POST", "/chat/{client_id}/traite"),
+    ("DELETE", "/chat/{client_id}/traite"),
 }
 
 
@@ -4620,7 +4624,7 @@ def _chat_humain_actif(client_id: str) -> bool:
 
 
 def _chat_escalade_en_attente(client_id: str) -> bool:
-    """Une escalade déjà signalée, sans réponse d'un admin depuis ?"""
+    """Une escalade déjà signalée, sans réponse d'un admin ni « traité » depuis ?"""
     row = executer_requete_sql_one(
         """
         SELECT 1 FROM messages e
@@ -4629,6 +4633,10 @@ def _chat_escalade_en_attente(client_id: str) -> bool:
             SELECT 1 FROM messages a
             WHERE a.client_id = e.client_id AND a.sender_id = ANY(%s)
               AND a.created_at::timestamptz > e.created_at::timestamptz
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM chat_fils f
+            WHERE f.client_id = e.client_id AND f.traite_at >= e.created_at::timestamptz
           )
         LIMIT 1;
         """,
@@ -4833,7 +4841,7 @@ async def chat_agent(client_id: str, payload: ChatAgentIn, request: Request):
 
 @app.get("/chat/escalades")
 def chat_escalades(request: Request):
-    """Fils où l'agent a demandé l'équipe et où aucun admin n'a répondu depuis (admin)."""
+    """Fils où l'agent a demandé l'équipe, sans réponse d'un admin ni « traité » depuis (admin)."""
     _require_admin(request)
     rows = executer_requete_sql(
         """
@@ -4845,11 +4853,161 @@ def chat_escalades(request: Request):
             WHERE a.client_id = e.client_id AND a.sender_id = ANY(%s)
               AND a.created_at::timestamptz > e.created_at::timestamptz
           )
+          AND NOT EXISTS (
+            SELECT 1 FROM chat_fils f
+            WHERE f.client_id = e.client_id AND f.traite_at >= e.created_at::timestamptz
+          )
         GROUP BY e.client_id;
         """,
         (list(ADMIN_SENDER_IDS),),
     )
     return {str(r[0]): _iso(r[1]) for r in rows if r and r[0] is not None}
+
+
+# ---------------------------------------------------------------------------
+# Boîte de réception de l'équipe (M3)
+# ---------------------------------------------------------------------------
+# Un fil par client (table messages). Statut d'un fil, du plus urgent au moins urgent :
+#   equipe_demandee : l'assistant a demandé l'équipe (escalade en attente) ;
+#   non_lu          : message(s) du client non lus par l'équipe ;
+#   assistant       : le dernier message du client a reçu une réponse de l'assistant ;
+#   a_jour          : rien à faire (traité, ou dernier message de l'équipe).
+# « Marquer traité » (chat_fils.traite_at) lève l'escalade et marque lus les messages
+# du client ; un nouveau message du client rouvre le fil de lui-même.
+
+_CHAT_STATUTS_A_TRAITER = ("equipe_demandee", "non_lu")
+
+
+def _chat_boite_fils() -> list[dict]:
+    rows = executer_requete_sql(
+        """
+        WITH dernier AS (
+          SELECT DISTINCT ON (client_id) client_id, sender_id, content, created_at::timestamptz AS at
+          FROM messages
+          WHERE client_id IS NOT NULL
+          ORDER BY client_id, created_at::timestamptz DESC, id DESC
+        ),
+        stats AS (
+          SELECT client_id,
+                 count(*) FILTER (WHERE NOT coalesce(is_read, false) AND sender_id = ANY(%(clients)s)) AS non_lus,
+                 max(created_at::timestamptz) FILTER (WHERE sender_id = ANY(%(clients)s)) AS dernier_client,
+                 count(*) AS total
+          FROM messages
+          WHERE client_id IS NOT NULL
+          GROUP BY client_id
+        ),
+        esc AS (
+          SELECT e.client_id, max(e.created_at::timestamptz) AS at,
+                 (array_agg(e.escalade_motif ORDER BY e.created_at::timestamptz DESC))[1] AS motif
+          FROM messages e
+          WHERE e.escalade
+            AND NOT EXISTS (
+              SELECT 1 FROM messages a
+              WHERE a.client_id = e.client_id AND a.sender_id = ANY(%(admins)s)
+                AND a.created_at::timestamptz > e.created_at::timestamptz
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM chat_fils f
+              WHERE f.client_id = e.client_id AND f.traite_at >= e.created_at::timestamptz
+            )
+          GROUP BY e.client_id
+        )
+        SELECT d.client_id, d.sender_id, d.content, d.at, s.non_lus, s.dernier_client, s.total,
+               esc.at, esc.motif, f.traite_at, f.traite_par
+        FROM dernier d
+        JOIN stats s ON s.client_id = d.client_id
+        LEFT JOIN esc ON esc.client_id = d.client_id
+        LEFT JOIN chat_fils f ON f.client_id = d.client_id
+        ORDER BY d.at DESC;
+        """,
+        {"clients": list(CLIENT_SENDER_IDS), "admins": list(ADMIN_SENDER_IDS)},
+    )
+    fils = []
+    for (client_id, sender_id, content, at, non_lus, dernier_client, total,
+         esc_at, motif, traite_at, traite_par) in rows:
+        traite = traite_at is not None and (dernier_client is None or traite_at >= dernier_client)
+        if esc_at is not None:
+            statut = "equipe_demandee"
+        elif non_lus and not traite:
+            statut = "non_lu"
+        elif sender_id == AGENT_SENDER_ID and not traite:
+            statut = "assistant"
+        else:
+            statut = "a_jour"
+        if sender_id == AGENT_SENDER_ID:
+            auteur = "assistant"
+        elif sender_id in ADMIN_SENDER_IDS:
+            auteur = "equipe"
+        else:
+            auteur = "client"
+        apercu = " ".join((content or "").split())
+        fils.append({
+            "client_id": str(client_id),
+            "statut": statut,
+            "dernier_message": {
+                "auteur": auteur,
+                "apercu": apercu[:140] + ("…" if len(apercu) > 140 else ""),
+                "created_at": _iso(at),
+            },
+            "non_lus": int(non_lus or 0),
+            "messages": int(total or 0),
+            "escalade_motif": motif if esc_at is not None else None,
+            "traite_at": _iso(traite_at),
+            "traite_par": traite_par,
+        })
+    return fils
+
+
+@app.get("/chat/boite")
+def chat_boite(request: Request):
+    """Fils de la messagerie avec leur statut, les plus urgents d'abord (admin)."""
+    _require_admin(request)
+    ordre = {"equipe_demandee": 0, "non_lu": 1, "assistant": 2, "a_jour": 3}
+    fils = _chat_boite_fils()
+    fils.sort(key=lambda f: ordre[f["statut"]])  # tri stable : le plus récent d'abord dans chaque statut
+    return fils
+
+
+@app.get("/chat/boite/compteur")
+def chat_boite_compteur(request: Request):
+    """Nombre de fils à traiter (équipe demandée ou non lus) pour le badge du menu (admin)."""
+    _require_admin(request)
+    fils = _chat_boite_fils()
+    return {
+        "a_traiter": sum(1 for f in fils if f["statut"] in _CHAT_STATUTS_A_TRAITER),
+        "equipe_demandee": sum(1 for f in fils if f["statut"] == "equipe_demandee"),
+    }
+
+
+@app.post("/chat/{client_id}/traite")
+def chat_marquer_traite(client_id: str, request: Request):
+    """Marque le fil comme traité : lève l'escalade et marque lus les messages du client (admin)."""
+    email = _require_admin(request)
+    row = executer_requete_sql_one(
+        """
+        INSERT INTO chat_fils (client_id, traite_at, traite_par)
+        VALUES (%s, now(), %s)
+        ON CONFLICT (client_id) DO UPDATE SET traite_at = now(), traite_par = EXCLUDED.traite_par
+        RETURNING traite_at;
+        """,
+        (client_id, email),
+    )
+    executer_requete_sql(
+        "UPDATE messages SET is_read = true WHERE client_id = %s AND is_read = false AND sender_id = ANY(%s)",
+        (client_id, list(CLIENT_SENDER_IDS)),
+    )
+    return {"client_id": client_id, "traite_at": _iso(row[0]) if row else None, "traite_par": email}
+
+
+@app.delete("/chat/{client_id}/traite")
+def chat_rouvrir(client_id: str, request: Request):
+    """Annule « traité » : le fil retrouve son statut (admin)."""
+    _require_admin(request)
+    executer_requete_sql_one(
+        "UPDATE chat_fils SET traite_at = NULL, traite_par = NULL WHERE client_id = %s RETURNING client_id;",
+        (client_id,),
+    )
+    return {"client_id": client_id, "traite_at": None}
 
 
 # ---------------------------------------------------------------------------
