@@ -3020,6 +3020,247 @@ def supprimer_panne(panne_id: int, request: Request):
     return {"status": "deleted", "id": panne_id}
 
 
+# ---------------------------------------------------------------------------
+# ENDPOINTS ALERTES (ADMIN-ONLY) — tâches A1/A2, migrations/010_alertes.sql
+# ---------------------------------------------------------------------------
+# Les alertes sont écrites par l'API d'ingestion App Engine (POST /api/alertes,
+# envoyé par les automates) : une ligne par station + code, les répétitions dans
+# la fenêtre de regroupement incrémentent `occurrences`. Ici, l'équipe les
+# consulte, les classe (panne, seuil, information, maintenance), suit leur
+# statut (nouvelle, vue, traitee, ignoree) et peut en faire une panne
+# (POST /alertes/{id}/panne, même logique que POST /pannes).
+
+_ALERTE_STATUTS = ("nouvelle", "vue", "traitee", "ignoree")
+_ALERTE_CLASSES = ("panne", "seuil", "information", "maintenance")
+_ALERTE_NIVEAUX = ("info", "avertissement", "critique")
+
+_ALERTE_COLS = (
+    "a.id, a.nom_automate, am.client, am.lieu, a.code, a.libelle, a.niveau, a.classe, a.statut, "
+    "a.valeur, a.unite, a.occurrences, a.premiere_at, a.derniere_at, a.recue_at, a.panne_id, "
+    "a.commentaire, a.traitee_par, a.traitee_at"
+)
+_ALERTE_FROM = (
+    "FROM alertes a LEFT JOIN LATERAL (SELECT client, lieu FROM automate "
+    "WHERE automate.nom_automate = a.nom_automate LIMIT 1) am ON TRUE"
+)
+
+
+def _alerte_to_dict(r) -> dict:
+    def _fmt(v):
+        return v.isoformat() if hasattr(v, "isoformat") else v
+
+    return {
+        "id": r[0],
+        "nom_automate": r[1],
+        "client": r[2],
+        "lieu": r[3],
+        "code": r[4],
+        "libelle": r[5],
+        "niveau": r[6],
+        "classe": r[7],
+        "statut": r[8],
+        "valeur": r[9],
+        "unite": r[10],
+        "occurrences": r[11],
+        "premiere_at": _fmt(r[12]),
+        "derniere_at": _fmt(r[13]),
+        "recue_at": _fmt(r[14]),
+        "panne_id": r[15],
+        "commentaire": r[16],
+        "traitee_par": r[17],
+        "traitee_at": _fmt(r[18]),
+    }
+
+
+def _alerte_liste_param(valeur: Optional[str], autorises: tuple, nom: str) -> list:
+    if not valeur:
+        return []
+    items = [v.strip().lower() for v in valeur.split(",") if v.strip()]
+    for v in items:
+        if v not in autorises:
+            raise HTTPException(status_code=400, detail=f"{nom} invalide : {v}")
+    return items
+
+
+def _alerte_get(alerte_id: int):
+    return executer_requete_sql_one(f"SELECT {_ALERTE_COLS} {_ALERTE_FROM} WHERE a.id = %s;", (alerte_id,))
+
+
+@app.get("/alertes")
+def lister_alertes(
+    request: Request,
+    statut: Optional[str] = Query(None, description="Un ou plusieurs statuts séparés par des virgules"),
+    classe: Optional[str] = Query(None, description="Une ou plusieurs classes séparées par des virgules"),
+    niveau: Optional[str] = Query(None, description="Un ou plusieurs niveaux séparés par des virgules"),
+    nom_automate: Optional[str] = Query(None),
+    client: Optional[str] = Query(None),
+    du: Optional[date] = Query(None, description="Dernière occurrence à partir de ce jour (heure de Paris)"),
+    au: Optional[date] = Query(None, description="Première occurrence jusqu'à ce jour inclus (heure de Paris)"),
+    limit: int = Query(300, ge=1, le=1000),
+):
+    _require_admin(request)
+    where, params = [], []
+    for col, val, autorises, nom in (
+        ("a.statut", statut, _ALERTE_STATUTS, "statut"),
+        ("a.classe", classe, _ALERTE_CLASSES, "classe"),
+        ("a.niveau", niveau, _ALERTE_NIVEAUX, "niveau"),
+    ):
+        items = _alerte_liste_param(val, autorises, nom)
+        if items:
+            where.append(f"{col} = ANY(%s)")
+            params.append(items)
+    if nom_automate:
+        where.append("a.nom_automate = %s")
+        params.append(nom_automate)
+    if client:
+        where.append("lower(am.client) = lower(%s)")
+        params.append(client)
+    if du:
+        where.append("a.derniere_at >= (%s::date::timestamp AT TIME ZONE 'Europe/Paris')")
+        params.append(du)
+    if au:
+        where.append("a.premiere_at < ((%s::date + 1)::timestamp AT TIME ZONE 'Europe/Paris')")
+        params.append(au)
+    sql = f"SELECT {_ALERTE_COLS} {_ALERTE_FROM}"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY a.derniere_at DESC, a.id DESC LIMIT %s;"
+    params.append(limit)
+    return [_alerte_to_dict(r) for r in executer_requete_sql(sql, tuple(params))]
+
+
+@app.get("/alertes/compteurs")
+def compteurs_alertes(request: Request):
+    """Compteurs pour le badge du menu et les onglets de la page Alertes."""
+    _require_admin(request)
+    rows = executer_requete_sql("SELECT statut, classe, count(*) FROM alertes GROUP BY statut, classe;")
+    par_statut = {s: 0 for s in _ALERTE_STATUTS}
+    nouvelles_par_classe = {c: 0 for c in _ALERTE_CLASSES}
+    for statut, classe, n in rows:
+        par_statut[statut] = par_statut.get(statut, 0) + n
+        if statut == "nouvelle":
+            nouvelles_par_classe[classe] = nouvelles_par_classe.get(classe, 0) + n
+    return {
+        "nouvelles": par_statut.get("nouvelle", 0),
+        "a_traiter": par_statut.get("nouvelle", 0) + par_statut.get("vue", 0),
+        "par_statut": par_statut,
+        "nouvelles_par_classe": nouvelles_par_classe,
+    }
+
+
+class AlertesVuesIn(BaseModel):
+    ids: Optional[List[int]] = Field(None, max_length=1000)
+
+
+@app.post("/alertes/vues")
+def marquer_alertes_vues(body: AlertesVuesIn, request: Request):
+    """Passe en « vue » les alertes nouvelles (toutes, ou seulement `ids`)."""
+    _require_admin(request)
+    if body.ids is not None:
+        rows = executer_requete_sql(
+            "UPDATE alertes SET statut = 'vue', updated_at = now() "
+            "WHERE statut = 'nouvelle' AND id = ANY(%s) RETURNING id;",
+            (body.ids,),
+        )
+    else:
+        rows = executer_requete_sql(
+            "UPDATE alertes SET statut = 'vue', updated_at = now() WHERE statut = 'nouvelle' RETURNING id;"
+        )
+    return {"status": "ok", "modifiees": len(rows)}
+
+
+@app.get("/alertes/{alerte_id}")
+def detail_alerte(alerte_id: int, request: Request):
+    _require_admin(request)
+    row = _alerte_get(alerte_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Alerte introuvable")
+    out = _alerte_to_dict(row)
+    occ = executer_requete_sql(
+        "SELECT horodatage, niveau, valeur, recue_at FROM alertes_occurrences "
+        "WHERE alerte_id = %s ORDER BY horodatage DESC LIMIT 100;",
+        (alerte_id,),
+    )
+    out["historique"] = [
+        {"horodatage": h.isoformat(), "niveau": n, "valeur": v, "recue_at": r.isoformat()} for h, n, v, r in occ
+    ]
+    out["panne"] = None
+    if out["panne_id"]:
+        p = executer_requete_sql_one(f"SELECT {_PANNE_COLS} FROM pannes WHERE id = %s;", (out["panne_id"],))
+        out["panne"] = _panne_to_dict(p) if p else None
+    return out
+
+
+class AlerteMajIn(BaseModel):
+    statut: Optional[str] = None
+    classe: Optional[str] = None
+    commentaire: Optional[str] = Field(None, max_length=2000)
+
+
+@app.patch("/alertes/{alerte_id}")
+def maj_alerte(alerte_id: int, body: AlerteMajIn, request: Request):
+    email = _require_admin(request)
+    sets, params = [], []
+    if body.statut is not None:
+        statut = body.statut.strip().lower()
+        if statut not in _ALERTE_STATUTS:
+            raise HTTPException(status_code=400, detail="statut invalide")
+        sets.append("statut = %s")
+        params.append(statut)
+        if statut in ("traitee", "ignoree"):
+            sets.append("traitee_par = %s, traitee_at = now()")
+            params.append(email or None)
+        else:
+            sets.append("traitee_par = NULL, traitee_at = NULL")
+    if body.classe is not None:
+        classe = body.classe.strip().lower()
+        if classe not in _ALERTE_CLASSES:
+            raise HTTPException(status_code=400, detail="classe invalide")
+        sets.append("classe = %s")
+        params.append(classe)
+    if body.commentaire is not None:
+        sets.append("commentaire = %s")
+        params.append(_clean_opt(body.commentaire))
+    if not sets:
+        raise HTTPException(status_code=400, detail="Rien à modifier")
+    row = executer_requete_sql_one(
+        f"UPDATE alertes SET {', '.join(sets)}, updated_at = now() WHERE id = %s RETURNING id;",
+        tuple(params) + (alerte_id,),
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Alerte introuvable")
+    return _alerte_to_dict(_alerte_get(alerte_id))
+
+
+@app.post("/alertes/{alerte_id}/panne")
+def alerte_vers_panne(alerte_id: int, p: PanneIn, request: Request):
+    """Crée une panne à partir d'une alerte (même logique que POST /pannes) et lie l'alerte.
+
+    Le formulaire de panne du front est pré-rempli avec la station, le libellé et
+    l'horodatage de l'alerte ; l'utilisateur peut tout modifier sauf la station.
+    """
+    email = _require_admin(request)
+    row = _alerte_get(alerte_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Alerte introuvable")
+    alerte = _alerte_to_dict(row)
+    if alerte["panne_id"]:
+        raise HTTPException(status_code=409, detail=f"Cette alerte est déjà liée à la panne {alerte['panne_id']}")
+    if str(p.nom_automate) != str(alerte["nom_automate"]):
+        raise HTTPException(status_code=400, detail="La panne doit concerner la station de l'alerte")
+    panne = creer_panne(p, request)
+    lie = executer_requete_sql_one(
+        "UPDATE alertes SET panne_id = %s, classe = 'panne', statut = 'traitee', traitee_par = %s, "
+        "traitee_at = now(), updated_at = now() WHERE id = %s AND panne_id IS NULL RETURNING id;",
+        (panne["id"], email or None, alerte_id),
+    )
+    if lie is None:
+        # Course avec un autre utilisateur : on retire la panne qui vient d'être créée.
+        executer_requete_sql("DELETE FROM pannes WHERE id = %s;", (panne["id"],))
+        raise HTTPException(status_code=409, detail="Cette alerte vient d'être liée à une autre panne")
+    return {"panne": panne, "alerte": _alerte_to_dict(_alerte_get(alerte_id))}
+
+
 @app.get("/conversations", response_model=List[ConversationOut])
 def get_conversations(user_id: Optional[str] = None, is_admin: bool = False):
     """Renvoie toutes les conversations.
