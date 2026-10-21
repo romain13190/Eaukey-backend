@@ -56,12 +56,12 @@ _ADMIN_ONLY_ROUTES = {
     ("POST", "/conversations"),
     ("GET", "/conversations/{conversation_id}/messages"),
     ("POST", "/conversations/{conversation_id}/messages"),
+    ("POST", "/messages/{message_id}/panne"),
+    ("POST", "/sav/fiches/proposer"),
     ("GET", "/notifications/admin/{client_id}"),
     ("GET", "/notifications/admin_all"),
     ("POST", "/messages_admin/{client_id}/marquer_non_lu"),
     ("GET", "/chat/escalades"),
-    ("POST", "/messages/{message_id}/panne"),
-    ("POST", "/sav/fiches/proposer"),
 }
 
 
