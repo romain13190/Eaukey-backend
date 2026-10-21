@@ -43,11 +43,15 @@ _PUBLIC_ROUTES = {
     ("POST", "/auth/forgot-password"),
     ("POST", "/auth/reset-password"),
     ("GET", "/auth/verify-reset-token"),
+    ("POST", "/canaux/email/entrant"),   # webhook du fournisseur e-mail : protégé par EMAIL_ENTRANT_SECRET
 }
 _ADMIN_ONLY_ROUTES = {
     ("POST", "/automate"),
     ("PUT", "/automate/{nom_automate}"),
     ("DELETE", "/automate/{nom_automate}"),
+    ("GET", "/clients/{client_id}/contacts"),
+    ("POST", "/clients/{client_id}/contacts"),
+    ("DELETE", "/clients/{client_id}/contacts/{contact_id}"),
     ("GET", "/conversations"),
     ("POST", "/conversations"),
     ("GET", "/conversations/{conversation_id}/messages"),
@@ -3127,6 +3131,7 @@ class MessageOut(BaseModel):
     is_read: Optional[bool] = None
     escalade: Optional[bool] = None
     escalade_motif: Optional[str] = None
+    canal: Optional[str] = None
 
 class ClientConversation(BaseModel):
     client_id: str
@@ -3707,7 +3712,7 @@ def get_messages_for_client(client_id: str, request: Request):
     """Récupère tous les messages pour un client donné."""
     is_admin = _is_admin_user(_require_auth(request))
     query = """
-        SELECT id, client_id, sender_id, content, file_url, created_at, is_read, escalade, escalade_motif
+        SELECT id, client_id, sender_id, content, file_url, created_at, is_read, escalade, escalade_motif, canal
         FROM messages 
         WHERE client_id = %s 
         ORDER BY created_at
@@ -3726,14 +3731,21 @@ def get_messages_for_client(client_id: str, request: Request):
             "escalade": bool(r[7]),
             # Le motif est une note pour l'équipe : jamais renvoyé au client.
             "escalade_motif": r[8] if is_admin else None,
+            "canal": r[9] or "app",
         }
         for r in rows
     ]
 
 @app.post("/messages/{client_id}", response_model=MessageOut)
-def post_message_for_client(client_id: str, message: MessageIn, request: Request):
-    """Ajoute un message pour un client."""
-    if not _is_admin_user(_require_auth(request)) and message.sender_id in ADMIN_SENDER_IDS:
+def post_message_for_client(client_id: str, message: MessageIn, request: Request,
+                            background_tasks: BackgroundTasks):
+    """Ajoute un message pour un client.
+
+    Réponse d'un admin à un client qui a écrit par e-mail : elle part aussi par
+    e-mail, en tâche de fond (voir bloc « Canal e-mail »).
+    """
+    is_admin = _is_admin_user(_require_auth(request))
+    if not is_admin and message.sender_id in ADMIN_SENDER_IDS:
         message.sender_id = CLIENT_SENDER_IDS[0]
     query = """
         INSERT INTO messages (client_id, sender_id, content, file_url, is_read) 
@@ -3743,7 +3755,9 @@ def post_message_for_client(client_id: str, message: MessageIn, request: Request
     row = executer_requete_sql_one(query, (client_id, message.sender_id, message.content, message.file_url))
     if not row:
         raise HTTPException(status_code=500, detail="Failed to insert message")
-    
+    if is_admin and message.sender_id in ADMIN_SENDER_IDS and (message.content or "").strip():
+        background_tasks.add_task(_email_relayer_reponse_equipe, client_id, row[0], message.content)
+
     return {
         "id": row[0],
         "client_id": client_id,
@@ -4570,9 +4584,19 @@ Fais appel à l'équipe UNIQUEMENT si l'un de ces cas se présente :
 Dans ces cas seulement, commence ta réponse par une ligne exacte « [ESCALADE: motif en quelques mots] », puis indique que l'équipe Eaukey est prévenue et reviendra vers lui dans cette conversation. Sinon, n'écris jamais ce marqueur.
 [FIN DE LA CONSIGNE]"""
 
+# Ligne ajoutée à la consigne quand le client a écrit par e-mail.
+_CHAT_AGENT_CONSIGNE_EMAIL = (
+    "Canal : e-mail. L'utilisateur t'a écrit par e-mail et lira ta réponse dans sa boîte mail, "
+    "sans l'application : fais une réponse autonome, compréhensible sans le fil précédent, "
+    "en texte simple (paragraphes courts, listes à tirets ; pas de tableau, de titre ni de mise en forme markdown complexe)."
+)
 
-def _chat_agent_message(message: str) -> str:
-    return f"{_CHAT_AGENT_CONSIGNE}\n\n{_sav_message_avec_contexte(message)}"
+
+def _chat_agent_message(message: str, canal: str = "app") -> str:
+    consigne = _CHAT_AGENT_CONSIGNE
+    if canal == "email":
+        consigne = consigne.replace("[FIN DE LA CONSIGNE]", f"{_CHAT_AGENT_CONSIGNE_EMAIL}\n[FIN DE LA CONSIGNE]")
+    return f"{consigne}\n\n{_sav_message_avec_contexte(message)}"
 
 
 def _chat_extraire_escalade(texte: str) -> tuple[str, Optional[str]]:
@@ -4646,14 +4670,16 @@ def _chat_conv_set(client_id: str, conv_id: Optional[str]) -> None:
 
 
 def _chat_inserer_message(client_id: str, sender_id: int, content: str,
-                          escalade: bool = False, motif: Optional[str] = None):
+                          escalade: bool = False, motif: Optional[str] = None,
+                          canal: str = "app", adresse: Optional[str] = None):
     return executer_requete_sql_one(
         """
-        INSERT INTO messages (client_id, sender_id, content, is_read, escalade, escalade_motif)
-        VALUES (%s, %s, %s, false, %s, %s)
+        INSERT INTO messages (client_id, sender_id, content, is_read, escalade, escalade_motif,
+                              canal, canal_adresse)
+        VALUES (%s, %s, %s, false, %s, %s, %s, %s)
         RETURNING id, created_at;
         """,
-        (client_id, sender_id, content, escalade, motif),
+        (client_id, sender_id, content, escalade, motif, canal, adresse),
     )
 
 
@@ -4695,6 +4721,113 @@ class ChatAgentIn(BaseModel):
     content: str = Field(..., min_length=1, max_length=4000)
 
 
+async def _chat_agent_evenements(client_id: str, content: str, canal: str = "app",
+                                 adresse: Optional[str] = None):
+    """Cœur de l'agent SAV dans le fil d'un client, partagé par les canaux (/chat, e-mail).
+
+    La question du client est déjà enregistrée dans messages. Produit des couples
+    (événement, données) : token (texte au fil de l'eau, marqueur retiré), puis
+    saved (réponse enregistrée, texte définitif) ou humain / error. L'escalade
+    (message marqué + e-mail à l'équipe) est gérée ici, pour tous les canaux.
+    `canal` / `adresse` : canal de la réponse (consigne de l'agent, messages.canal).
+    """
+    import httpx
+
+    # Un humain de l'équipe suit le fil : l'agent se tait.
+    if _chat_humain_actif(client_id):
+        yield ("humain", {"detail": "Un membre de l'équipe Eaukey suit votre conversation."})
+        return
+    if not _WARDIAN_API_KEY or not _WARDIAN_AGENT_ID:
+        yield ("error", {"message": _CHAT_AGENT_INDISPO})
+        return
+
+    url = f"{_WARDIAN_API_BASE}/api/v1/agents/{_WARDIAN_AGENT_ID}/messages"
+    headers = {"Authorization": f"Bearer {_WARDIAN_API_KEY}", "Content-Type": "application/json"}
+    message = _chat_agent_message(content, canal)
+    conv_id = _chat_conv_get(client_id)
+    texte = ""        # réponse complète de l'agent
+    envoye = 0        # caractères de `texte` déjà transmis au front
+    retenue = True    # on retient le début tant qu'il peut s'agir du marqueur
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=10.0)) as client:
+        for essai in range(2):
+            body = {
+                "message": message,
+                # Un seul fil par client (partagé par les utilisateurs de ce client).
+                "external_user_id": f"eaukey-chat-{client_id}",
+                "conversation_id": conv_id,
+            }
+            try:
+                async with client.stream("POST", url, headers=headers, json=body) as up:
+                    if up.status_code == 409 and essai == 0:
+                        # Conversation Wardian périmée : on repart sur un fil neuf.
+                        conv_id = None
+                        _chat_conv_set(client_id, None)
+                        continue
+                    if up.status_code != 200:
+                        _CHAT_LOGGER.warning("Wardian HTTP %s (client %s)", up.status_code, client_id)
+                        yield ("error", {"message": _CHAT_AGENT_INDISPO})
+                        return
+                    buf = ""
+                    async for chunk in up.aiter_text():
+                        buf += chunk
+                        *frames, buf = buf.split("\n\n")
+                        for frame in frames:
+                            ev = data = None
+                            for line in frame.split("\n"):
+                                if line.startswith("event:"):
+                                    ev = line[6:].strip()
+                                elif line.startswith("data:"):
+                                    try:
+                                        data = json.loads(line[5:].strip())
+                                    except ValueError:
+                                        data = None
+                            if not ev or not isinstance(data, dict):
+                                continue  # ": keepalive" et commentaires
+                            if ev in ("conversation", "done") and data.get("conversation_id"):
+                                if data["conversation_id"] != conv_id:
+                                    conv_id = data["conversation_id"]
+                                    _chat_conv_set(client_id, conv_id)
+                            elif ev == "token":
+                                texte += data.get("delta") or ""
+                                if retenue:
+                                    if _chat_debut_marqueur_possible(texte):
+                                        continue
+                                    retenue = False
+                                    visible, _ = _chat_extraire_escalade(texte)
+                                    if visible:
+                                        yield ("token", {"delta": visible})
+                                elif len(texte) > envoye:
+                                    yield ("token", {"delta": texte[envoye:]})
+                                envoye = len(texte)
+                            elif ev == "error":
+                                _CHAT_LOGGER.warning("Wardian error (client %s) : %s", client_id, data)
+                                yield ("error", {"message": _CHAT_AGENT_INDISPO})
+                                return
+                break
+            except httpx.HTTPError as e:
+                _CHAT_LOGGER.warning("Wardian injoignable (client %s) : %s", client_id, e)
+                yield ("error", {"message": _CHAT_AGENT_INDISPO})
+                return
+
+    reponse, motif = _chat_extraire_escalade(texte)
+    if not reponse:
+        yield ("error", {"message": _CHAT_AGENT_INDISPO})
+        return
+    escalade = motif is not None
+    deja_signale = escalade and _chat_escalade_en_attente(client_id)
+    saved = _chat_inserer_message(client_id, AGENT_SENDER_ID, reponse, escalade, motif,
+                                 canal, adresse)
+    yield ("saved", {
+        "id": saved[0] if saved else None,
+        "created_at": _iso(saved[1]) if saved else None,
+        "content": reponse,
+        "escalade": escalade,
+    })
+    if escalade and not deja_signale:
+        await _chat_prevenir_equipe(client_id, motif, content, reponse)
+
+
 @app.post("/chat/{client_id}/agent")
 async def chat_agent(client_id: str, payload: ChatAgentIn, request: Request):
     """Message d'un client dans son fil /chat + réponse de l'agent SAV (flux SSE).
@@ -4713,104 +4846,12 @@ async def chat_agent(client_id: str, payload: ChatAgentIn, request: Request):
     if not row:
         raise HTTPException(status_code=500, detail="Failed to insert message")
 
-    import httpx
     from fastapi.responses import StreamingResponse
 
     async def _flux():
         yield _sse("message", {"id": row[0], "created_at": _iso(row[1])})
-
-        # Un humain de l'équipe suit le fil : l'agent se tait.
-        if _chat_humain_actif(client_id):
-            yield _sse("humain", {"detail": "Un membre de l'équipe Eaukey suit votre conversation."})
-            return
-        if not _WARDIAN_API_KEY or not _WARDIAN_AGENT_ID:
-            yield _sse("error", {"message": _CHAT_AGENT_INDISPO})
-            return
-
-        url = f"{_WARDIAN_API_BASE}/api/v1/agents/{_WARDIAN_AGENT_ID}/messages"
-        headers = {"Authorization": f"Bearer {_WARDIAN_API_KEY}", "Content-Type": "application/json"}
-        message = _chat_agent_message(content)
-        conv_id = _chat_conv_get(client_id)
-        texte = ""        # réponse complète de l'agent
-        envoye = 0        # caractères de `texte` déjà transmis au front
-        retenue = True    # on retient le début tant qu'il peut s'agir du marqueur
-
-        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=10.0)) as client:
-            for essai in range(2):
-                body = {
-                    "message": message,
-                    # Un seul fil par client (partagé par les utilisateurs de ce client).
-                    "external_user_id": f"eaukey-chat-{client_id}",
-                    "conversation_id": conv_id,
-                }
-                try:
-                    async with client.stream("POST", url, headers=headers, json=body) as up:
-                        if up.status_code == 409 and essai == 0:
-                            # Conversation Wardian périmée : on repart sur un fil neuf.
-                            conv_id = None
-                            _chat_conv_set(client_id, None)
-                            continue
-                        if up.status_code != 200:
-                            _CHAT_LOGGER.warning("Wardian HTTP %s (client %s)", up.status_code, client_id)
-                            yield _sse("error", {"message": _CHAT_AGENT_INDISPO})
-                            return
-                        buf = ""
-                        async for chunk in up.aiter_text():
-                            buf += chunk
-                            *frames, buf = buf.split("\n\n")
-                            for frame in frames:
-                                ev = data = None
-                                for line in frame.split("\n"):
-                                    if line.startswith("event:"):
-                                        ev = line[6:].strip()
-                                    elif line.startswith("data:"):
-                                        try:
-                                            data = json.loads(line[5:].strip())
-                                        except ValueError:
-                                            data = None
-                                if not ev or not isinstance(data, dict):
-                                    continue  # ": keepalive" et commentaires
-                                if ev in ("conversation", "done") and data.get("conversation_id"):
-                                    if data["conversation_id"] != conv_id:
-                                        conv_id = data["conversation_id"]
-                                        _chat_conv_set(client_id, conv_id)
-                                elif ev == "token":
-                                    texte += data.get("delta") or ""
-                                    if retenue:
-                                        if _chat_debut_marqueur_possible(texte):
-                                            continue
-                                        retenue = False
-                                        visible, _ = _chat_extraire_escalade(texte)
-                                        if visible:
-                                            yield _sse("token", {"delta": visible})
-                                    elif len(texte) > envoye:
-                                        yield _sse("token", {"delta": texte[envoye:]})
-                                    envoye = len(texte)
-                                elif ev == "error":
-                                    _CHAT_LOGGER.warning("Wardian error (client %s) : %s", client_id, data)
-                                    yield _sse("error", {"message": _CHAT_AGENT_INDISPO})
-                                    return
-                    break
-                except httpx.HTTPError as e:
-                    _CHAT_LOGGER.warning("Wardian injoignable (client %s) : %s", client_id, e)
-                    yield _sse("error", {"message": _CHAT_AGENT_INDISPO})
-                    return
-
-        reponse, motif = _chat_extraire_escalade(texte)
-        if not reponse:
-            yield _sse("error", {"message": _CHAT_AGENT_INDISPO})
-            return
-        escalade = motif is not None
-        deja_signale = escalade and _chat_escalade_en_attente(client_id)
-        saved = _chat_inserer_message(client_id, AGENT_SENDER_ID, reponse, escalade, motif)
-        yield _sse("saved", {
-            "id": saved[0] if saved else None,
-            "created_at": _iso(saved[1]) if saved else None,
-            "content": reponse,
-            "escalade": escalade,
-        })
-        if escalade and not deja_signale:
-            await _chat_prevenir_equipe(client_id, motif, content, reponse)
+        async for event, data in _chat_agent_evenements(client_id, content):
+            yield _sse(event, data)
 
     return StreamingResponse(
         _flux(),
@@ -5179,6 +5220,474 @@ def parc_derniere_donnee(request: Request,
         # None + trouve=False : aucune donnee sur la fenetre, pas "jamais de donnee"
         "trouve": derniere is not None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Canal e-mail de la messagerie (M2) : une seule conversation, quel que soit le canal
+# ---------------------------------------------------------------------------
+# Le client écrit à l'adresse SAV (ex. sav@sav.eaukey.net). Le fournisseur e-mail
+# (Brevo Inbound Parsing, Cloudflare Email Worker…) appelle le webhook
+# POST /canaux/email/entrant, protégé par EMAIL_ENTRANT_SECRET (en-tête
+# X-Eaukey-Webhook-Secret ou ?token=) ; sans secret configuré, la route est fermée (503).
+#   - Réponses automatiques, listes, adresses noreply/mailer-daemon/postmaster et nos
+#     propres adresses : ignorées (anti-boucle). Un e-mail rejoué (même Message-ID,
+#     messages.external_id unique) n'est enregistré qu'une fois.
+#   - Expéditeur reconnu (client_contacts, sinon e-mails des stations automate.email/2/3,
+#     un seul client) : le message entre dans le fil /chat du client (canal 'email'),
+#     puis même traitement que /chat (_chat_agent_evenements) ; la réponse de l'agent
+#     repart par e-mail dans le même fil e-mail (Re: sujet, In-Reply-To, References).
+#   - Expéditeur inconnu ou ambigu : AUCUNE réponse automatique (pas de spam en retour),
+#     rien d'enregistré ; l'équipe reçoit l'adresse et le sujet pour rattacher le contact.
+#   - Réponse d'un admin dans le fil (POST /messages) alors que le dernier message du
+#     client est arrivé par e-mail il y a moins de _EMAIL_RELAIS_JOURS jours : elle part
+#     aussi par e-mail à cette adresse.
+# Traitement de l'agent + envoi en tâche de fond : le webhook répond tout de suite.
+
+_EMAIL_ENTRANT_SECRET = os.getenv("EMAIL_ENTRANT_SECRET", "")
+_EMAIL_ENTRANT_ADRESSE = os.getenv("EMAIL_ENTRANT_ADRESSE", "").strip()
+_EMAIL_SAV_FROM = os.getenv("EMAIL_SAV_FROM", "").strip() or _SMTP_FROM
+_EMAIL_LIEN_CHAT = os.getenv("EMAIL_LIEN_CHAT", "https://app.eaukey.net/chat")
+_EMAIL_MAX_OCTETS = 2_000_000       # corps du webhook (pièces jointes non transmises par Brevo)
+_EMAIL_TEXTE_MAX = 4000             # même limite que la messagerie /chat
+_EMAIL_RELAIS_JOURS = 14
+_EMAIL_ALERTE_INCONNU_S = 24 * 3600  # une alerte par adresse inconnue et par jour au plus
+_EMAIL_LOGGER = logging.getLogger("canal_email")
+_EMAIL_RE = re.compile(r"^[^@\s<>()\[\],;:\"]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+$")
+_EMAIL_LOCAL_AUTOMATIQUE = re.compile(r"(no[-_.]?reply|do[-_.]?not[-_.]?reply|mailer[-_.]?daemon|postmaster)", re.IGNORECASE)
+_EMAIL_PIED = f"Vous pouvez répondre à cet e-mail ou continuer sur {_EMAIL_LIEN_CHAT}"
+_email_inconnus_alertes: dict = {}
+
+
+def _email_normaliser_adresse(valeur) -> Optional[str]:
+    """« Nom <Adresse@X.fr> » -> « adresse@x.fr » (None si invalide)."""
+    from email.utils import parseaddr
+    adresse = parseaddr(str(valeur or ""))[1].strip().lower()
+    return adresse if adresse and len(adresse) <= 254 and _EMAIL_RE.match(adresse) else None
+
+
+def _email_entetes(brut) -> dict:
+    """En-têtes du fournisseur (dict, ou liste de {name, value} / [nom, valeur]) -> {nom en minuscules: valeur}."""
+    out = {}
+    if isinstance(brut, dict):
+        paires = brut.items()
+    elif isinstance(brut, list):
+        paires = []
+        for h in brut:
+            if isinstance(h, dict):
+                paires.append((h.get("name") or h.get("Name"), h.get("value") or h.get("Value")))
+            elif isinstance(h, (list, tuple)) and len(h) == 2:
+                paires.append((h[0], h[1]))
+    else:
+        return out
+    for nom, val in paires:
+        if not nom:
+            continue
+        if isinstance(val, list):
+            val = val[0] if val else ""
+        out[str(nom).strip().lower()] = str(val if val is not None else "").strip()
+    return out
+
+
+def _email_nettoyer_texte(texte: str) -> str:
+    """Garde le nouveau message : retire les citations (« > », « Le … a écrit : », « On … wrote: »,
+    en-têtes Outlook) et la signature « -- »."""
+    t = (texte or "").replace("\r\n", "\n").replace("\r", "\n")
+    coupures = [
+        r"(?m)^[ \t]*(?:Le|On)\s[^\n]{0,200}(?:\n[^\n]{0,200})?\s(?:a\s+écrit|wrote)\s*:[ \t]*$",
+        r"(?m)^[ \t]*-{2,}\s*(?:Original Message|Message d'origine|Message original|Forwarded message|Message transféré)\s*-{2,}",
+        r"(?m)^[ \t]*(?:De|From)\s*:[^\n]*\n[ \t]*(?:Envoyé|Sent|Date)\s*:",
+        r"(?m)^-- ?$",
+    ]
+    for motif in coupures:
+        m = re.search(motif, t, re.IGNORECASE)
+        if m:
+            t = t[:m.start()]
+    t = "\n".join(l for l in t.split("\n") if not l.lstrip().startswith(">"))
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    if len(t) > _EMAIL_TEXTE_MAX:
+        t = t[:_EMAIL_TEXTE_MAX - 1].rstrip() + "…"
+    return t
+
+
+def _email_depuis_generique(d: dict) -> dict:
+    entetes = _email_entetes(d.get("headers"))
+    return {
+        "adresse": _email_normaliser_adresse(d.get("from")),
+        "nom": str(d.get("from_name") or "").strip()[:200],
+        "sujet": str(d.get("subject") or "").strip(),
+        "texte": str(d.get("text") or ""),
+        "message_id": str(d.get("message_id") or entetes.get("message-id") or "").strip(),
+        "in_reply_to": str(d.get("in_reply_to") or entetes.get("in-reply-to") or "").strip(),
+        "entetes": entetes,
+    }
+
+
+def _email_depuis_brevo(item: dict) -> dict:
+    expediteur = item.get("From") or {}
+    if not isinstance(expediteur, dict):
+        expediteur = {"Address": expediteur}
+    entetes = _email_entetes(item.get("Headers"))
+    # Brevo extrait déjà le nouveau message (sans citation) : on le préfère au texte brut.
+    texte = item.get("ExtractedMarkdownMessage") or item.get("RawTextBody") or ""
+    return {
+        "adresse": _email_normaliser_adresse(expediteur.get("Address")),
+        "nom": str(expediteur.get("Name") or "").strip()[:200],
+        "sujet": str(item.get("Subject") or "").strip(),
+        "texte": str(texte),
+        "message_id": str(item.get("MessageId") or entetes.get("message-id") or "").strip(),
+        "in_reply_to": str(item.get("InReplyTo") or entetes.get("in-reply-to") or "").strip(),
+        "entetes": entetes,
+    }
+
+
+def _email_nos_adresses() -> set:
+    nos = {_email_normaliser_adresse(a) for a in (_EMAIL_SAV_FROM, _SMTP_FROM, _EMAIL_ENTRANT_ADRESSE, _SAV_ESCALADE_EMAIL)}
+    return {a for a in nos if a}
+
+
+def _email_automatique(mail: dict) -> Optional[str]:
+    """Motif pour lequel l'e-mail ne doit recevoir aucune réponse (anti-boucle), ou None."""
+    h = mail["entetes"]
+    auto = h.get("auto-submitted", "").lower()
+    if auto and auto != "no":
+        return "auto-submitted"
+    if h.get("precedence", "").lower() in ("bulk", "junk", "list", "auto_reply"):
+        return "precedence"
+    if "x-autoreply" in h or "x-autorespond" in h:
+        return "x-autoreply"
+    adresse = mail["adresse"]
+    if adresse in _email_nos_adresses():
+        return "notre adresse"
+    if _EMAIL_LOCAL_AUTOMATIQUE.search(adresse.split("@")[0]):
+        return "adresse automatique"
+    return None
+
+
+def _email_identifier_client(adresse: str) -> Optional[str]:
+    """client_id d'un expéditeur : client_contacts d'abord, puis e-mails des stations (un seul client)."""
+    row = executer_requete_sql_one(
+        "SELECT client_id FROM client_contacts WHERE canal = 'email' AND valeur = %s;", (adresse,)
+    )
+    if row:
+        return row[0]
+    rows = executer_requete_sql(
+        "SELECT client, email, email2, email3 FROM automate WHERE client IS NOT NULL AND trim(client) <> '';"
+    )
+    trouves = {}
+    for client, *emails in rows:
+        for champ in emails:
+            # Un champ peut contenir plusieurs adresses (séparées par ; ou ,)
+            if adresse in {_email_normaliser_adresse(x) for x in re.split(r"[;,\s]+", champ or "") if x}:
+                trouves.setdefault(client.strip().lower(), client)
+    return next(iter(trouves.values())) if len(trouves) == 1 else None
+
+
+def _email_deja_recu(external_id: str) -> bool:
+    return executer_requete_sql_one(
+        "SELECT 1 FROM messages WHERE external_id = %s LIMIT 1;", (external_id,)
+    ) is not None
+
+
+def _email_inserer_question(client_id: str, content: str, mail: dict):
+    """Question reçue par e-mail dans le fil du client ; None si déjà enregistrée (rejeu)."""
+    return executer_requete_sql_one(
+        """
+        INSERT INTO messages (client_id, sender_id, content, is_read, canal, external_id,
+                              canal_adresse, canal_sujet)
+        VALUES (%s, %s, %s, false, 'email', %s, %s, %s)
+        ON CONFLICT (external_id) WHERE external_id IS NOT NULL DO NOTHING
+        RETURNING id, created_at;
+        """,
+        (client_id, CLIENT_SENDER_IDS[0], content, mail["message_id"], mail["adresse"], mail["sujet"][:500]),
+    )
+
+
+def _email_texte_brut(md: str) -> str:
+    """Markdown de l'agent -> texte brut lisible dans une boîte mail."""
+    t = md or ""
+    t = re.sub(r"```[a-zA-Z]*\n?", "", t)
+    t = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", r"\1 (\2)", t)
+    t = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", t)
+    t = re.sub(r"(\*\*|__)(.+?)\1", r"\2", t)
+    t = re.sub(r"(?<![\w*])\*(?!\s)([^*\n]+?)\*(?!\w)", r"\1", t)
+    t = re.sub(r"`([^`]+)`", r"\1", t)
+    t = re.sub(r"(?m)^(\s*)[*+]\s+", r"\1- ", t)
+    t = re.sub(r"(?m)^\s*[-*_]{3,}\s*$", "", t)
+    return re.sub(r"\n{3,}", "\n\n", t).strip()
+
+
+def _email_sujet_re(sujet: str) -> str:
+    sujet = re.sub(r"[\r\n]+", " ", sujet or "").strip()[:200] or "Votre message à Eaukey"
+    return sujet if re.match(r"(?i)^re\s*:", sujet) else f"Re: {sujet}"
+
+
+def _email_id_entete(valeur: str) -> str:
+    v = re.sub(r"[\r\n\s]+", "", valeur or "")
+    return v if not v or v.startswith("<") else f"<{v}>"
+
+
+async def _email_envoyer(destinataire: str, sujet: str, texte: str, in_reply_to: str = "",
+                         references: str = "", automatique: bool = True) -> bool:
+    """Réponse par e-mail dans le fil e-mail du client. Ne lève jamais."""
+    if not _SMTP_HOST or not _SMTP_USER or not _SMTP_PASSWORD:
+        _EMAIL_LOGGER.warning("SMTP non configure : reponse e-mail non envoyee")
+        return False
+    from email.utils import formatdate, make_msgid
+    msg = MIMEText(f"{texte}\n\n--\n{_EMAIL_PIED}\n", "plain", "utf-8")
+    msg["Subject"] = _email_sujet_re(sujet)
+    msg["From"] = _EMAIL_SAV_FROM
+    msg["To"] = destinataire
+    if _EMAIL_ENTRANT_ADRESSE:
+        msg["Reply-To"] = _EMAIL_ENTRANT_ADRESSE
+    msg["Date"] = formatdate(localtime=True)
+    domaine = (_email_normaliser_adresse(_EMAIL_SAV_FROM) or "eaukey.net").split("@")[-1]
+    msg["Message-ID"] = make_msgid(domain=domaine)
+    irt = _email_id_entete(in_reply_to)
+    if irt:
+        msg["In-Reply-To"] = irt
+        refs = " ".join(r for r in re.split(r"\s+", references or "") if r)
+        msg["References"] = f"{refs} {irt}".strip() if irt not in refs else refs
+    if automatique:
+        # RFC 3834 : réponse automatique -> les répondeurs du client ne nous répondent pas.
+        msg["Auto-Submitted"] = "auto-replied"
+    try:
+        await aiosmtplib.send(
+            msg, hostname=_SMTP_HOST, port=_SMTP_PORT,
+            username=_SMTP_USER, password=_SMTP_PASSWORD, start_tls=True,
+        )
+        return True
+    except Exception as e:
+        _EMAIL_LOGGER.error("Echec envoi e-mail SAV : %s", e)
+        return False
+
+
+async def _email_alerte_inconnu(adresse: str, sujet: str) -> None:
+    """Expéditeur non reconnu : l'équipe reçoit l'adresse et le sujet (rien d'autre). Ne lève jamais."""
+    maintenant = time.time()
+    if maintenant - _email_inconnus_alertes.get(adresse, 0) < _EMAIL_ALERTE_INCONNU_S:
+        return
+    _email_inconnus_alertes[adresse] = maintenant
+    if not _SMTP_HOST or not _SMTP_USER or not _SMTP_PASSWORD or not _SAV_ESCALADE_EMAIL:
+        _EMAIL_LOGGER.warning("SMTP non configure : alerte expediteur inconnu non envoyee")
+        return
+    sujet = re.sub(r"[\r\n]+", " ", sujet or "").strip()[:200] or "(sans sujet)"
+    msg = MIMEText(
+        "Un e-mail est arrivé sur l'adresse SAV d'un expéditeur qui n'est rattaché à aucun client "
+        "(ou à plusieurs). L'assistant n'a PAS répondu et le message n'a pas été enregistré.\n\n"
+        f"Expéditeur : {adresse}\nSujet : {sujet}\n\n"
+        "Pour le rattacher : ouvrez la conversation du client dans l'application (/chat), "
+        "encart « Adresses e-mail reconnues », puis demandez-lui de renvoyer son message.\n",
+        "plain", "utf-8",
+    )
+    msg["Subject"] = "[SAV Eaukey] E-mail d'un expéditeur inconnu"
+    msg["From"] = _SMTP_FROM
+    msg["To"] = _SAV_ESCALADE_EMAIL
+    msg["Auto-Submitted"] = "auto-generated"
+    try:
+        await aiosmtplib.send(
+            msg, hostname=_SMTP_HOST, port=_SMTP_PORT,
+            username=_SMTP_USER, password=_SMTP_PASSWORD, start_tls=True,
+        )
+    except Exception as e:
+        _EMAIL_LOGGER.error("Echec alerte expediteur inconnu : %s", e)
+
+
+async def _email_traiter(client_id: str, content: str, mail: dict) -> None:
+    """Tâche de fond : réponse de l'agent (même cœur que /chat) puis envoi par e-mail."""
+    try:
+        saved = None
+        async for event, data in _chat_agent_evenements(client_id, content, "email", mail["adresse"]):
+            if event == "saved":
+                saved = data
+        # humain : l'équipe suit le fil, sa réponse sera relayée par e-mail ;
+        # error : l'équipe voit la question dans la boîte de réception.
+        if not saved:
+            return
+        ok = await _email_envoyer(
+            mail["adresse"], mail["sujet"], _email_texte_brut(saved["content"]),
+            in_reply_to=mail["message_id"], references=mail["entetes"].get("references", ""),
+        )
+        if not ok and saved.get("id"):
+            # Réponse visible dans l'appli seulement : ne pas l'afficher « par e-mail ».
+            executer_requete_sql(
+                "UPDATE messages SET canal = 'app', canal_adresse = NULL WHERE id = %s;", (saved["id"],)
+            )
+    except Exception as e:
+        _EMAIL_LOGGER.error("Traitement e-mail (client %s) en echec : %s", client_id, e)
+
+
+async def _email_relayer_reponse_equipe(client_id: str, message_id: int, contenu: str) -> None:
+    """Réponse d'un admin : part aussi par e-mail si le client écrit par e-mail (< 14 j). Ne lève jamais."""
+    try:
+        row = executer_requete_sql_one(
+            """
+            SELECT canal, canal_adresse, canal_sujet, external_id,
+                   created_at::timestamptz > now() - make_interval(days => %s)
+            FROM messages
+            WHERE client_id = %s AND sender_id = ANY(%s)
+            ORDER BY created_at::timestamptz DESC, id DESC
+            LIMIT 1;
+            """,
+            (_EMAIL_RELAIS_JOURS, client_id, list(CLIENT_SENDER_IDS)),
+        )
+        if not row or row[0] != "email" or not row[1] or not row[4]:
+            return
+        ok = await _email_envoyer(
+            row[1], row[2] or "", f"{contenu.strip()}\n\n— L'équipe Eaukey",
+            in_reply_to=row[3] or "", automatique=False,
+        )
+        if ok:
+            executer_requete_sql(
+                "UPDATE messages SET canal = 'email', canal_adresse = %s WHERE id = %s;", (row[1], message_id)
+            )
+    except Exception as e:
+        _EMAIL_LOGGER.error("Relais e-mail de la reponse equipe (client %s) en echec : %s", client_id, e)
+
+
+def _email_recevoir(mail: dict, background_tasks: BackgroundTasks) -> str:
+    """Traite un e-mail entrant normalisé ; renvoie le résultat (pour le journal du fournisseur)."""
+    if not mail["adresse"]:
+        return "ignore: expediteur invalide"
+    motif = _email_automatique(mail)
+    if motif:
+        return f"ignore: {motif}"
+    content = _email_nettoyer_texte(mail["texte"]) or _email_nettoyer_texte(mail["sujet"])
+    if not content:
+        return "ignore: vide"
+    if not mail["message_id"]:
+        # Sans Message-ID (format générique) : identifiant stable dérivé du contenu.
+        empreinte = hashlib.sha256(
+            "\n".join((mail["adresse"], mail["sujet"], content, mail["entetes"].get("date", ""))).encode("utf-8")
+        ).hexdigest()[:40]
+        mail["message_id"] = f"sans-id-{empreinte}"
+        mail["sans_id"] = True
+    mail["message_id"] = mail["message_id"][:500]
+    if _email_deja_recu(mail["message_id"]):
+        return "doublon"
+    client_id = _email_identifier_client(mail["adresse"])
+    if not client_id:
+        background_tasks.add_task(_email_alerte_inconnu, mail["adresse"], mail["sujet"])
+        return "inconnu"
+    if not _email_inserer_question(client_id, content, mail):
+        return "doublon"
+    if mail.get("sans_id"):
+        mail["message_id"] = ""  # pas d'In-Reply-To inventé
+    background_tasks.add_task(_email_traiter, client_id, content, mail)
+    return "enregistre"
+
+
+@app.post("/canaux/email/entrant")
+async def canal_email_entrant(request: Request, background_tasks: BackgroundTasks,
+                              token: Optional[str] = None):
+    """Webhook du fournisseur e-mail (route publique, protégée par EMAIL_ENTRANT_SECRET).
+
+    Formats : générique {from, from_name, subject, text, message_id, in_reply_to, headers}
+    ou Brevo Inbound Parsing {"items": [...]}. Répond 200 dès que l'e-mail est pris en
+    compte (ou volontairement ignoré) : le fournisseur ne le renvoie pas.
+    """
+    if not _EMAIL_ENTRANT_SECRET:
+        raise HTTPException(status_code=503, detail="Canal e-mail non configuré")
+    fourni = request.headers.get("x-eaukey-webhook-secret") or token or ""
+    if not fourni:
+        raise HTTPException(status_code=401, detail="Secret manquant")
+    if not hmac.compare_digest(fourni.encode("utf-8"), _EMAIL_ENTRANT_SECRET.encode("utf-8")):
+        raise HTTPException(status_code=403, detail="Secret invalide")
+
+    longueur = request.headers.get("content-length")
+    if longueur and longueur.isdigit() and int(longueur) > _EMAIL_MAX_OCTETS:
+        raise HTTPException(status_code=413, detail="E-mail trop volumineux")
+    brut = await request.body()
+    if len(brut) > _EMAIL_MAX_OCTETS:
+        raise HTTPException(status_code=413, detail="E-mail trop volumineux")
+    try:
+        payload = json.loads(brut.decode("utf-8"))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="JSON invalide")
+
+    if isinstance(payload, dict) and isinstance(payload.get("items"), list):
+        mails = [_email_depuis_brevo(i) for i in payload["items"][:20] if isinstance(i, dict)]
+    elif isinstance(payload, dict):
+        mails = [_email_depuis_generique(payload)]
+    else:
+        raise HTTPException(status_code=400, detail="Format non reconnu")
+
+    resultats = [_email_recevoir(m, background_tasks) for m in mails]
+    for r in resultats:
+        _EMAIL_LOGGER.info("E-mail entrant : %s", r)
+    return {"recus": len(mails), "resultats": resultats}
+
+
+# --- Adresses reconnues d'un client (admin) ---------------------------------
+
+class ClientContactIn(BaseModel):
+    valeur: str = Field(..., min_length=3, max_length=254)
+    canal: str = "email"
+
+
+def _client_contact_to_dict(r) -> dict:
+    return {"id": r[0], "canal": r[1], "valeur": r[2], "created_by": r[3], "created_at": _iso(r[4])}
+
+
+@app.get("/clients/{client_id}/contacts")
+def client_contacts_liste(client_id: str, request: Request):
+    """Adresses e-mail reconnues pour un client : saisies par l'équipe + e-mails des stations."""
+    _require_admin(request)
+    rows = executer_requete_sql(
+        """
+        SELECT id, canal, valeur, created_by, created_at FROM client_contacts
+        WHERE client_id = %s ORDER BY created_at, id;
+        """,
+        (client_id,),
+    )
+    stations = set()
+    for r in executer_requete_sql(
+        "SELECT email, email2, email3 FROM automate WHERE lower(trim(client)) = lower(trim(%s));", (client_id,)
+    ):
+        for champ in r:
+            stations |= {a for a in (_email_normaliser_adresse(x) for x in re.split(r"[;,\s]+", champ or "") if x) if a}
+    return {"contacts": [_client_contact_to_dict(r) for r in rows], "stations": sorted(stations)}
+
+
+@app.post("/clients/{client_id}/contacts")
+def client_contacts_ajouter(client_id: str, payload: ClientContactIn, request: Request):
+    """Rattache une adresse e-mail à un client (elle ne peut appartenir qu'à un client)."""
+    email_admin = _require_admin(request)
+    if payload.canal != "email":
+        raise HTTPException(status_code=400, detail="Seul le canal e-mail est disponible")
+    adresse = _email_normaliser_adresse(payload.valeur)
+    if not adresse or adresse != payload.valeur.strip().lower():
+        raise HTTPException(status_code=400, detail="Adresse e-mail invalide")
+    row = executer_requete_sql_one(
+        """
+        INSERT INTO client_contacts (client_id, canal, valeur, created_by)
+        VALUES (%s, 'email', %s, %s)
+        ON CONFLICT (canal, valeur) DO NOTHING
+        RETURNING id, canal, valeur, created_by, created_at;
+        """,
+        (client_id, adresse, email_admin),
+    )
+    if row:
+        return _client_contact_to_dict(row)
+    existant = executer_requete_sql_one(
+        "SELECT id, canal, valeur, created_by, created_at, client_id FROM client_contacts WHERE canal = 'email' AND valeur = %s;",
+        (adresse,),
+    )
+    if existant and existant[5] == client_id:
+        return _client_contact_to_dict(existant)
+    if existant:
+        raise HTTPException(status_code=409, detail="Adresse déjà rattachée à un autre client")
+    raise HTTPException(status_code=500, detail="Enregistrement impossible")
+
+
+@app.delete("/clients/{client_id}/contacts/{contact_id}")
+def client_contacts_supprimer(client_id: str, contact_id: int, request: Request):
+    _require_admin(request)
+    row = executer_requete_sql_one(
+        "DELETE FROM client_contacts WHERE id = %s AND client_id = %s RETURNING id;", (contact_id, client_id)
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Contact introuvable")
+    return {"status": "success", "id": row[0]}
 
 
 if __name__ == "__main__":
