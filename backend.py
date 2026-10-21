@@ -3065,7 +3065,8 @@ def create_conversation(conv: ConversationIn):
     row = executer_requete_sql_one(q, (conv.client_id, conv.type))
     if not row:
         raise HTTPException(status_code=500, detail="Failed to create conversation")
-    return {"id": row[0], "client_id": conv.client_id, "type": conv.type, "created_at": row[1]}
+    created_at = row[1].isoformat() if hasattr(row[1], "isoformat") else row[1]
+    return {"id": row[0], "client_id": conv.client_id, "type": conv.type, "created_at": created_at}
 
 
 @app.get("/conversations/{conversation_id}/messages", response_model=List[MessageOut])
@@ -3089,7 +3090,7 @@ def post_message(conversation_id: int, message: MessageIn):
         "sender_id": message.sender_id,
         "content": message.content,
         "file_url": message.file_url,
-        "created_at": row[1],
+        "created_at": row[1].isoformat() if hasattr(row[1], "isoformat") else row[1],
     }
 
 # -------------------
@@ -3764,7 +3765,9 @@ def post_message_for_client(client_id: str, message: MessageIn, request: Request
         "sender_id": message.sender_id,
         "content": message.content,
         "file_url": message.file_url,
-        "created_at": row[1],
+        # messages.created_at est un timestamp : le modèle de réponse attend une chaîne
+        # (sans conversion, la route répondait 500 alors que le message était enregistré).
+        "created_at": row[1].isoformat() if hasattr(row[1], "isoformat") else row[1],
         "is_read": False,
     }
 
