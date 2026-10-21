@@ -5067,6 +5067,121 @@ def _sav_message_avec_contexte(message: str) -> str:
 
 
 # =============================================================================
+# REMONTEE DE DONNEES (page /parc, interne : admin / super_admin)
+# =============================================================================
+# Objectif : savoir en un coup d'oeil quels automates remontent encore des
+# donnees. Lecture seule, aucune ecriture, aucun automate n'est modifie.
+#
+# ATTENTION PERF : `mesures` fait ~235M de lignes. La requete "derniere mesure
+# de chaque automate" (ORDER BY horodatage DESC LIMIT 1) s'ecroule justement sur
+# les automates silencieux, car le planner remonte l'index `horodatage` a
+# l'envers en filtrant. On borne donc toujours la fenetre temporelle : un
+# automate absent du resultat est un automate sans donnees dans la fenetre,
+# ce qui est exactement l'information recherchee.
+# Voir CLAUDE.md, section "Piege d'index sur mesures".
+
+# ATTENTION FUSEAU : `mesures.horodatage` est un timestamp SANS fuseau qui
+# contient de l'heure locale de Paris, alors que la base tourne en UTC. Comparer
+# `horodatage` a `(now() AT TIME ZONE 'Europe/Paris')` introduit donc un decalage de 1h a 2h selon la saison
+# (verifie le 27/07/2026 : (now() AT TIME ZONE 'Europe/Paris') = 12:29 UTC, max(horodatage) = 14:29). La bonne
+# reference est `now() AT TIME ZONE 'Europe/Paris'`, qui gere aussi le passage
+# heure d'ete / heure d'hiver.
+_PARC_MAINTENANT = "(now() AT TIME ZONE 'Europe/Paris')"
+
+_PARC_SEUIL_OK_MIN = 15      # vert  : vu il y a moins de 15 min
+_PARC_SEUIL_ALERTE_MIN = 120  # orange jusqu'a 2h, rouge au-dela
+
+
+@app.get("/parc/etat")
+def parc_etat(request: Request):
+    """Etat de remontee de donnees de tous les automates.
+
+    Statuts : "ok" (< 15 min), "attention" (15 min a 2h), "muet" (> 2h ou jamais).
+    """
+    _require_admin_or_super(request)
+
+    query = """
+    WITH recent AS (
+        SELECT nom_automate, max(horodatage) AS derniere
+        FROM   mesures
+        WHERE  horodatage > {maintenant} - INTERVAL '{fenetre} minutes'
+        GROUP  BY nom_automate
+    )
+    SELECT a.nom_automate,
+           a.client,
+           a.lieu,
+           r.derniere,
+           round(extract(epoch FROM ({maintenant} - r.derniere)) / 60)::int AS minutes
+    FROM   automate a
+    -- trim() obligatoire : `automate.nom_automate` contient des espaces en trop
+    -- pour certaines lignes (ex. '20260300.0 '), pas `mesures.nom_automate`. Sans
+    -- trim la jointure echoue et un automate parfaitement actif s'affiche en muet.
+    LEFT   JOIN recent r ON trim(r.nom_automate) = trim(a.nom_automate)
+    ORDER  BY r.derniere DESC NULLS LAST, a.client, a.nom_automate;
+    """.format(maintenant=_PARC_MAINTENANT, fenetre=_PARC_SEUIL_ALERTE_MIN)
+
+    rows = executer_requete_sql(query)
+
+    automates = []
+    compteurs = {"ok": 0, "attention": 0, "muet": 0}
+    for nom, client, lieu, derniere, minutes in rows:
+        if derniere is None:
+            statut = "muet"
+            minutes = None
+        elif minutes is not None and minutes <= _PARC_SEUIL_OK_MIN:
+            statut = "ok"
+        else:
+            statut = "attention"
+        compteurs[statut] += 1
+        automates.append({
+            "nom_automate": (nom or "").strip(),
+            "client": (client or "").strip() or None,
+            "lieu": (lieu or "").strip() or None,
+            "derniere_mesure": derniere.isoformat() if derniere else None,
+            "minutes": minutes,
+            "statut": statut,
+        })
+
+    return {
+        "automates": automates,
+        "compteurs": compteurs,
+        "total": len(automates),
+        "seuils": {"ok_min": _PARC_SEUIL_OK_MIN, "alerte_min": _PARC_SEUIL_ALERTE_MIN},
+    }
+
+
+@app.get("/parc/etat/{nom_automate}/derniere")
+def parc_derniere_donnee(request: Request,
+                         nom_automate: str,
+                         jours: int = Query(30, ge=1, le=90)):
+    """Date de la derniere mesure d'UN automate, sur une fenetre bornee.
+
+    Appelee a la demande (clic sur un automate muet), jamais en masse : la
+    fenetre est bornee a 90 jours max pour rester dans les clous cote perf.
+    """
+    _require_admin_or_super(request)
+
+    row = executer_requete_sql_one(
+        """
+        SELECT max(horodatage)
+        FROM   mesures
+        WHERE  trim(nom_automate) = %s
+          AND  horodatage > {maintenant} - (%s || ' days')::interval;
+        """.format(maintenant=_PARC_MAINTENANT),
+        (nom_automate.strip(), jours),
+    )
+
+    derniere = row[0] if row else None
+    return {
+        "nom_automate": nom_automate,
+        "derniere_mesure": derniere.isoformat() if derniere else None,
+        "fenetre_jours": jours,
+        # None + trouve=False : aucune donnee sur la fenetre, pas "jamais de donnee"
+        "trouve": derniere is not None,
+    }
+
+
+# =============================================================================
 # PROBLEMES FREQUENTS (tâche S4 « Recommandations aux équipes », page /problemes)
 # =============================================================================
 # Rapport interne (admin) : pannes, escalades de l'assistant SAV et alertes les
@@ -5498,120 +5613,6 @@ def get_rapport_problemes_texte(request: Request, jours: int = Query(30, ge=1, l
     return PlainTextResponse(rapport_problemes_texte(rapport_problemes(jours)),
                              headers={"Cache-Control": "no-store"})
 
-
-# =============================================================================
-# REMONTEE DE DONNEES (page /parc, interne : admin / super_admin)
-# =============================================================================
-# Objectif : savoir en un coup d'oeil quels automates remontent encore des
-# donnees. Lecture seule, aucune ecriture, aucun automate n'est modifie.
-#
-# ATTENTION PERF : `mesures` fait ~235M de lignes. La requete "derniere mesure
-# de chaque automate" (ORDER BY horodatage DESC LIMIT 1) s'ecroule justement sur
-# les automates silencieux, car le planner remonte l'index `horodatage` a
-# l'envers en filtrant. On borne donc toujours la fenetre temporelle : un
-# automate absent du resultat est un automate sans donnees dans la fenetre,
-# ce qui est exactement l'information recherchee.
-# Voir CLAUDE.md, section "Piege d'index sur mesures".
-
-# ATTENTION FUSEAU : `mesures.horodatage` est un timestamp SANS fuseau qui
-# contient de l'heure locale de Paris, alors que la base tourne en UTC. Comparer
-# `horodatage` a `(now() AT TIME ZONE 'Europe/Paris')` introduit donc un decalage de 1h a 2h selon la saison
-# (verifie le 27/07/2026 : (now() AT TIME ZONE 'Europe/Paris') = 12:29 UTC, max(horodatage) = 14:29). La bonne
-# reference est `now() AT TIME ZONE 'Europe/Paris'`, qui gere aussi le passage
-# heure d'ete / heure d'hiver.
-_PARC_MAINTENANT = "(now() AT TIME ZONE 'Europe/Paris')"
-
-_PARC_SEUIL_OK_MIN = 15      # vert  : vu il y a moins de 15 min
-_PARC_SEUIL_ALERTE_MIN = 120  # orange jusqu'a 2h, rouge au-dela
-
-
-@app.get("/parc/etat")
-def parc_etat(request: Request):
-    """Etat de remontee de donnees de tous les automates.
-
-    Statuts : "ok" (< 15 min), "attention" (15 min a 2h), "muet" (> 2h ou jamais).
-    """
-    _require_admin_or_super(request)
-
-    query = """
-    WITH recent AS (
-        SELECT nom_automate, max(horodatage) AS derniere
-        FROM   mesures
-        WHERE  horodatage > {maintenant} - INTERVAL '{fenetre} minutes'
-        GROUP  BY nom_automate
-    )
-    SELECT a.nom_automate,
-           a.client,
-           a.lieu,
-           r.derniere,
-           round(extract(epoch FROM ({maintenant} - r.derniere)) / 60)::int AS minutes
-    FROM   automate a
-    -- trim() obligatoire : `automate.nom_automate` contient des espaces en trop
-    -- pour certaines lignes (ex. '20260300.0 '), pas `mesures.nom_automate`. Sans
-    -- trim la jointure echoue et un automate parfaitement actif s'affiche en muet.
-    LEFT   JOIN recent r ON trim(r.nom_automate) = trim(a.nom_automate)
-    ORDER  BY r.derniere DESC NULLS LAST, a.client, a.nom_automate;
-    """.format(maintenant=_PARC_MAINTENANT, fenetre=_PARC_SEUIL_ALERTE_MIN)
-
-    rows = executer_requete_sql(query)
-
-    automates = []
-    compteurs = {"ok": 0, "attention": 0, "muet": 0}
-    for nom, client, lieu, derniere, minutes in rows:
-        if derniere is None:
-            statut = "muet"
-            minutes = None
-        elif minutes is not None and minutes <= _PARC_SEUIL_OK_MIN:
-            statut = "ok"
-        else:
-            statut = "attention"
-        compteurs[statut] += 1
-        automates.append({
-            "nom_automate": (nom or "").strip(),
-            "client": (client or "").strip() or None,
-            "lieu": (lieu or "").strip() or None,
-            "derniere_mesure": derniere.isoformat() if derniere else None,
-            "minutes": minutes,
-            "statut": statut,
-        })
-
-    return {
-        "automates": automates,
-        "compteurs": compteurs,
-        "total": len(automates),
-        "seuils": {"ok_min": _PARC_SEUIL_OK_MIN, "alerte_min": _PARC_SEUIL_ALERTE_MIN},
-    }
-
-
-@app.get("/parc/etat/{nom_automate}/derniere")
-def parc_derniere_donnee(request: Request,
-                         nom_automate: str,
-                         jours: int = Query(30, ge=1, le=90)):
-    """Date de la derniere mesure d'UN automate, sur une fenetre bornee.
-
-    Appelee a la demande (clic sur un automate muet), jamais en masse : la
-    fenetre est bornee a 90 jours max pour rester dans les clous cote perf.
-    """
-    _require_admin_or_super(request)
-
-    row = executer_requete_sql_one(
-        """
-        SELECT max(horodatage)
-        FROM   mesures
-        WHERE  trim(nom_automate) = %s
-          AND  horodatage > {maintenant} - (%s || ' days')::interval;
-        """.format(maintenant=_PARC_MAINTENANT),
-        (nom_automate.strip(), jours),
-    )
-
-    derniere = row[0] if row else None
-    return {
-        "nom_automate": nom_automate,
-        "derniere_mesure": derniere.isoformat() if derniere else None,
-        "fenetre_jours": jours,
-        # None + trouve=False : aucune donnee sur la fenetre, pas "jamais de donnee"
-        "trouve": derniere is not None,
-    }
 
 
 if __name__ == "__main__":
