@@ -29,6 +29,7 @@ os.environ.update({
     "PGPORT": PORT, "AUTH_SECRET": "test",
 })
 os.environ.pop("RAPPORT_PRIX_M3", None)
+os.environ.pop("PRIX_EAU_M3", None)
 DSN = f"host={HOST} port={PORT} user=postgres dbname=postgres"
 
 SCHEMA = """
@@ -177,7 +178,7 @@ check((a3["eau_recyclee_m3"], a3["taux_recyclage_pct"], a3["donnees_incompletes"
       == (30, 100.0, False, None), "A3 : complet, non signale, pas de sonde pH -> None")
 T = R["total"]
 check((T["eau_recyclee_m3"], T["taux_recyclage_pct"], T["economies_eur"], T["equivalent_piscines_olympiques"])
-      == (420, 95.5, 1890.0, 0.17), "total : 420 m3, 95,5 %, 1890 EUR (4,50 EUR/m3), 0,17 piscine")
+      == (420, 95.5, 1969.8, 0.17), "total : 420 m3, 95,5 %, 1969,80 EUR (4,69 EUR/m3 = PRIX_EAU_M3 de l'appli), 0,17 piscine")
 check((T["energie_kwh"], T["jours_avec_lavage"], T["couverture_pct"], T["donnees_incompletes"])
       == (2400, 60, 77.8, True) and sorted(T["stations_donnees_incompletes"]) == ["A1", "A2"],
       "total : 2400 kWh, 60 jours-station, couverture 77,8 %, stations signalees A1 et A2")
@@ -190,7 +191,7 @@ check(a1["variation_eau_recyclee_pct"] == 40.7 and a2["variation_eau_recyclee_pc
       "variation par station (A1 +40,7 %, A2 sans base M-1)")
 Y = R["cumul_annee"]
 check(Y["eau_recyclee_m3"] == 695 and Y["depuis"] == "2026-07-15" and Y["jusqu_au"] == "2026-09-30"
-      and Y["economies_eur"] == 3127.5, "cumul 2026 : 695 m3 depuis le 15/07 (decembre 2025 exclu)")
+      and Y["economies_eur"] == 3259.55, "cumul 2026 : 695 m3 depuis le 15/07 (decembre 2025 exclu), 3259,55 EUR")
 
 # 3. Pannes
 P = T["pannes"]
@@ -209,9 +210,9 @@ h = get("/rapport/mensuel/html", client="Lavage Alpha", mois="2026-09")
 check(h.status_code == 200 and h.headers["content-type"].startswith("text/html")
       and "Beta" not in h.text and "B1" not in h.text and "Panne Beta" not in h.text,
       "HTML : 200, aucune trace du client B")
-check("septembre 2026" in h.text and "420 m³" in h.text and "1 890 €" in h.text
+check("septembre 2026" in h.text and "420 m³" in h.text and "1 970 €" in h.text
       and "95,5 %" in h.text and "@media print" in h.text and "size:A4" in h.text,
-      "HTML : format francais (1 890 EUR, 95,5 %), CSS d'impression A4")
+      "HTML : format francais (1 970 EUR, 95,5 %), CSS d'impression A4")
 rb = get("/rapport/mensuel", client="Beta Wash", mois="2026-09").json()
 check([s["nom_automate"] for s in rb["stations"]] == ["B1"] and rb["total"]["pannes"]["ouvertes_dans_le_mois"] == 1
       and "A1" not in json.dumps(rb), "rapport B : seulement B1 et sa panne")

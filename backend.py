@@ -5115,7 +5115,7 @@ from zoneinfo import ZoneInfo as _RapportZoneInfo
 from fastapi.responses import HTMLResponse
 
 # --- Valeurs par defaut (decisions Loane du 2026-10-21, faciles a changer) ---
-_RAPPORT_PRIX_M3_DEFAUT = 4.50            # EUR / m3, surchargeable par RAPPORT_PRIX_M3
+_RAPPORT_PRIX_M3_DEFAUT = _PRIX_EAU_M3     # EUR / m3 : même prix que les économies de l'appli (PRIX_EAU_M3), surchargeable par RAPPORT_PRIX_M3
 _RAPPORT_PISCINE_OLYMPIQUE_M3 = 2500.0    # equivalence « piscine olympique »
 _RAPPORT_PH_MIN, _RAPPORT_PH_MAX = 6.5, 8.5
 _RAPPORT_CHLORE_MIN_MG_L, _RAPPORT_CHLORE_MAX_MG_L = 0.2, 2.0
