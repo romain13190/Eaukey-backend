@@ -81,6 +81,9 @@ with psycopg.connect(DSN, autocommit=True) as c:
     mig = open(os.path.join(DEPOT, "migrations/013_canaux.sql")).read()
     c.execute(mig)
     c.execute(mig)  # rejouable
+    p014 = os.path.join(DEPOT, "migrations/014_agent_pannes_fiches.sql")
+    if os.path.exists(p014):
+        c.execute(open(p014).read())
 print("migration 013 : OK (rejouable)")
 
 sys.path.insert(0, DEPOT)
