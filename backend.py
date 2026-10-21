@@ -4254,7 +4254,9 @@ def _pb_stations_noms() -> dict:
 def _pb_fiche_couvre(texte: str) -> bool:
     """Une fiche SAV active couvre-t-elle ce texte (tous ses mots significatifs) ?"""
     row = executer_requete_sql_one(
-        "SELECT count(*) FROM sav_fiches WHERE NOT archivee AND recherche @@ plainto_tsquery('french', %s);",
+        "SELECT count(*) FROM sav_fiches WHERE NOT archivee AND recherche @@ plainto_tsquery('french', %s) "
+        # brouillons de l'assistant (colonne de la migration 014) exclus, avant comme après la 014
+        "AND NOT coalesce((to_jsonb(sav_fiches) ->> 'brouillon')::boolean, false);",
         (texte,),
     )
     return bool(row and row[0])
