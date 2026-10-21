@@ -190,13 +190,22 @@ def _dsn_to_conninfo() -> str:
     return " ".join(f"{k}={v}" for k, v in _DB_DSN.items() if v is not None)
 
 
+_pool_init_lock = threading.Lock()
+
+
 def _get_pool() -> ConnectionPool:
+    # Création sous verrou : au réveil du service (Render free), plusieurs requêtes
+    # arrivent en même temps ; sans verrou, chacune créait son pool et son sémaphore,
+    # et une connexion prise sur l'un était rendue sur l'autre
+    # (« ValueError: Semaphore released too many times » → erreur 500).
     global _pool, _pool_sem
     if _pool is None:
-        max_conn = int(os.getenv("DB_MAX_CONN", "50"))
-        # Pool thread-safe pour supporter le parallélisme FastAPI
-        _pool = ConnectionPool(conninfo=_dsn_to_conninfo(), min_size=1, max_size=max_conn)
-        _pool_sem = threading.BoundedSemaphore(max_conn)
+        with _pool_init_lock:
+            if _pool is None:
+                max_conn = int(os.getenv("DB_MAX_CONN", "50"))
+                # Pool thread-safe pour supporter le parallélisme FastAPI
+                _pool_sem = threading.BoundedSemaphore(max_conn)
+                _pool = ConnectionPool(conninfo=_dsn_to_conninfo(), min_size=1, max_size=max_conn)
     return _pool
 
 
