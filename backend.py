@@ -5237,6 +5237,771 @@ def _sav_message_avec_contexte(message: str) -> str:
 
 
 # =============================================================================
+# RAPPORT DE PERFORMANCE MENSUEL PAR CLIENT (admin) - 2026-10-21
+# =============================================================================
+# Proposition validee : ~/eaukey/docs/RAPPORT_MENSUEL_PROPOSITION.md (V1).
+# Routes (admin uniquement, cf. _ADMIN_ONLY_ROUTES) :
+#   GET /rapport/mensuel?client=...&mois=AAAA-MM          -> JSON
+#   GET /rapport/mensuel/html?client=...&mois=AAAA-MM     -> page HTML imprimable (A4)
+#   GET /rapport/mensuel/clients?mois=AAAA-MM             -> clients ayant des donnees ce mois
+#
+# Regles :
+# - Les chiffres sont calcules ici (SQL agrege), jamais par une IA.
+# - Un rapport ne contient QUE les stations du client (automate.client, compare en
+#   trim + minuscules ; automate.nom_automate est compare en trim).
+# - Mois civil en heure de Paris. `mesures_aggregate.rounded_timestamp` est un
+#   timestamp SANS fuseau en heure de Paris (voir bloc FUSEAU HORAIRE en tete de
+#   fichier) : les bornes du mois sont donc des timestamps naifs 'AAAA-MM-01 00:00'.
+#
+# SOURCE : `mesures_aggregate` (1 ligne par station et par heure, depuis le
+# 23/06/2026). ATTENTION, d'apres ETL_aggregate_horaire.py, les colonnes
+# compteur_eau_renvoi / compteur_eau_adoucie / compteur_electrique y contiennent
+# l'INCREMENT de l'heure (max - min des valeurs non nulles du compteur cumule
+# dans l'heure, arrondi a l'entier, negatif ramene a 0), pas le compteur cumule.
+# Le volume du mois est donc la SOMME des increments horaires. Consequences :
+# - remise a zero d'un compteur : elle apparait comme une heure avec un increment
+#   enorme (ex. 5000 -> 3 dans l'heure = 4997). Toute heure au-dela de
+#   _RAPPORT_MAX_M3_HEURE (ou _RAPPORT_MAX_KWH_HEURE) est ecartee et comptee dans
+#   heures_ecartees ; la station est alors signalee « donnees incompletes » ;
+# - trou de donnees (station muette) : aucune ligne, donc aucun volume compte
+#   pendant le trou. La couverture (heures avec donnees / heures du mois) le
+#   signale, rien n'est extrapole.
+# - pH : avg_ph = mediane horaire de mesures.ph, qui est en pH x 100.
+# - Chlore : avg_chlore = mediane horaire de mesures.chlore_mv (0..2000 dans
+#   l'appli). HYPOTHESE A CONFIRMER : valeur brute / 1000 = mg/L
+#   (_RAPPORT_CHLORE_ECHELLE). 0 = sonde absente / pas de mesure (l'ETL remplace
+#   les manques par 0) : ces heures sont exclues des moyennes de chlore.
+# - Passage heure d'ete / d'hiver : en heure locale naive, un mois compte
+#   toujours jours x 24 creneaux (en mars, le creneau 02:00 n'existe pas : la
+#   couverture plafonne a 99,9 %).
+# =============================================================================
+import calendar as _rapport_calendar
+import html as _rapport_html
+from zoneinfo import ZoneInfo as _RapportZoneInfo
+
+from fastapi.responses import HTMLResponse
+
+# --- Valeurs par defaut (decisions Loane du 2026-10-21, faciles a changer) ---
+# Routes du rapport réservées aux admins (déclarées ici, à côté du code, plutôt que dans
+# la liste centrale : évite les conflits avec les autres PR qui y ajoutent leurs routes).
+_ADMIN_ONLY_ROUTES.update({
+    ("GET", "/rapport/mensuel"),
+    ("GET", "/rapport/mensuel/html"),
+    ("GET", "/rapport/mensuel/clients"),
+})
+_RAPPORT_PRIX_M3_DEFAUT = _PRIX_EAU_M3     # EUR / m3 : même prix que les économies de l'appli (PRIX_EAU_M3), surchargeable par RAPPORT_PRIX_M3
+_RAPPORT_PISCINE_OLYMPIQUE_M3 = 2500.0    # equivalence « piscine olympique »
+_RAPPORT_PH_MIN, _RAPPORT_PH_MAX = 6.5, 8.5
+_RAPPORT_CHLORE_MIN_MG_L, _RAPPORT_CHLORE_MAX_MG_L = 0.2, 2.0
+# --- Unites et filtres ---
+_RAPPORT_PH_ECHELLE = 100.0               # avg_ph brut = pH x 100
+_RAPPORT_PH_VALIDE = (2.0, 12.0)          # meme filtre que /ph/jour
+_RAPPORT_CHLORE_ECHELLE = 1000.0          # HYPOTHESE : avg_chlore brut / 1000 = mg/L
+_RAPPORT_CHLORE_BRUT_MAX = 2000           # meme filtre que /chlore/jour
+_RAPPORT_MAX_M3_HEURE = 50                # au-dela : heure aberrante (remise a zero)
+_RAPPORT_MAX_KWH_HEURE = 200
+# --- Signalement « donnees incompletes » ---
+_RAPPORT_SEUIL_COUVERTURE_PCT = 90.0
+_RAPPORT_JOURS_MUETS_MAX = 1              # >= 2 jours sans aucune donnee : signale
+
+_RAPPORT_MOIS_RE = re.compile(r"^(\d{4})-(0[1-9]|1[0-2])$")
+_RAPPORT_MOIS_FR = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet",
+                    "août", "septembre", "octobre", "novembre", "décembre"]
+
+
+def _rapport_prix_m3(client: str) -> float:
+    """Prix du m3 utilise pour les economies. Point d'extension : un prix par
+    client pourra etre lu ici plus tard (table ou colonne dediee)."""
+    brut = (os.getenv("RAPPORT_PRIX_M3") or "").strip().replace(",", ".")
+    try:
+        prix = float(brut) if brut else _RAPPORT_PRIX_M3_DEFAUT
+    except ValueError:
+        prix = _RAPPORT_PRIX_M3_DEFAUT
+    return prix if prix > 0 else _RAPPORT_PRIX_M3_DEFAUT
+
+
+def _rapport_maintenant() -> dt.datetime:
+    """Heure de Paris, sans fuseau (meme convention que mesures_aggregate)."""
+    return dt.datetime.now(_RapportZoneInfo("Europe/Paris")).replace(tzinfo=None)
+
+
+def _rapport_mois_precedent(ref: Optional[dt.datetime] = None) -> str:
+    ref = ref or _rapport_maintenant()
+    a, m = (ref.year, ref.month - 1) if ref.month > 1 else (ref.year - 1, 12)
+    return f"{a:04d}-{m:02d}"
+
+
+def _rapport_bornes(mois: str) -> tuple:
+    """'AAAA-MM' -> (debut inclus, fin exclue), timestamps naifs heure de Paris."""
+    m = _RAPPORT_MOIS_RE.match((mois or "").strip())
+    if not m:
+        raise HTTPException(status_code=400, detail="Paramètre mois invalide (attendu AAAA-MM)")
+    a, mo = int(m.group(1)), int(m.group(2))
+    debut = dt.datetime(a, mo, 1)
+    fin = dt.datetime(a + 1, 1, 1) if mo == 12 else dt.datetime(a, mo + 1, 1)
+    return debut, fin
+
+
+def _rapport_sql(query: str, params) -> list:
+    """Comme executer_requete_sql, mais une erreur SQL remonte (un rapport ne doit
+    jamais afficher 0 m3 parce que la requete a echoue)."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            rows = cur.fetchall() if cur.description is not None else []
+        conn.commit()
+        return rows
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logging.getLogger("rapport").error("Erreur SQL rapport mensuel : %s", e)
+        raise HTTPException(status_code=500, detail="Erreur de calcul du rapport")
+    finally:
+        _release_connection(conn)
+
+
+def _rapport_stations(client: str) -> list:
+    """Stations du client : [{nom, bruts, lieu, client}], noms trimes."""
+    rows = _rapport_sql(
+        """
+        SELECT trim(nom_automate)                 AS nom,
+               array_agg(DISTINCT nom_automate)   AS bruts,
+               min(NULLIF(trim(lieu), ''))        AS lieu,
+               array_agg(trim(client))            AS graphies
+        FROM   automate
+        WHERE  lower(trim(client)) = lower(trim(%s))
+          AND  NULLIF(trim(nom_automate), '') IS NOT NULL
+        GROUP  BY trim(nom_automate)
+        ORDER  BY 3 NULLS LAST, 1
+        """,
+        (client,),
+    )
+    # Nom affiche du client : la graphie la plus frequente dans automate.
+    graphies = [g for r in rows for g in r[3]]
+    nom_client = max(sorted(set(graphies)), key=graphies.count) if graphies else client
+    return [{"nom": r[0], "bruts": list(r[1]), "lieu": r[2], "client": nom_client} for r in rows]
+
+
+def _rapport_noms_sql(stations: list) -> list:
+    """Noms a passer a `nom_automate = ANY(...)` : formes brutes ET trimees, pour
+    garder l'index de mesures_aggregate (pas de trim() sur la colonne)."""
+    noms = set()
+    for s in stations:
+        noms.add(s["nom"])
+        noms.update(s["bruts"])
+    return sorted(noms)
+
+
+_RAPPORT_SQL_AGREGATS = """
+WITH h AS (
+    SELECT trim(nom_automate)                         AS nom,
+           rounded_timestamp                          AS ts,
+           compteur_eau_renvoi::numeric               AS renvoi,
+           compteur_eau_adoucie::numeric              AS adoucie,
+           compteur_electrique::numeric               AS elec,
+           avg_ph::numeric / %(ph_ech)s               AS ph,
+           avg_chlore::numeric                        AS cl_brut
+    FROM   mesures_aggregate
+    WHERE  nom_automate = ANY(%(noms)s)
+      AND  rounded_timestamp >= %(debut)s
+      AND  rounded_timestamp <  %(fin)s
+), q AS (
+    SELECT h.*,
+           COALESCE(renvoi  BETWEEN 0 AND %(max_m3)s
+                AND adoucie BETWEEN 0 AND %(max_m3)s, false)   AS eau_ok,
+           COALESCE(elec    BETWEEN 0 AND %(max_kwh)s, false)  AS elec_ok,
+           COALESCE(ph BETWEEN %(ph_vmin)s AND %(ph_vmax)s, false) AS ph_ok,
+           COALESCE(cl_brut > 0 AND cl_brut <= %(cl_max)s, false)  AS cl_ok
+    FROM   h
+)
+SELECT nom,
+       count(DISTINCT ts)                                             AS heures,
+       count(DISTINCT ts::date)                                       AS jours_donnees,
+       COALESCE(sum(renvoi)  FILTER (WHERE eau_ok), 0)                AS renvoi,
+       COALESCE(sum(adoucie) FILTER (WHERE eau_ok), 0)                AS adoucie,
+       count(*) FILTER (WHERE NOT eau_ok)                             AS heures_eau_ecartees,
+       COALESCE(sum(elec) FILTER (WHERE elec_ok), 0)                  AS kwh,
+       count(*) FILTER (WHERE NOT elec_ok)                            AS heures_elec_ecartees,
+       count(DISTINCT ts::date) FILTER (WHERE eau_ok AND renvoi > 0)  AS jours_lavage,
+       sum(ph) FILTER (WHERE ph_ok)                                   AS ph_somme,
+       count(*) FILTER (WHERE ph_ok)                                  AS ph_n,
+       count(*) FILTER (WHERE ph_ok AND ph BETWEEN %(ph_min)s AND %(ph_max)s) AS ph_n_plage,
+       sum(cl_brut / %(cl_ech)s) FILTER (WHERE cl_ok)                 AS cl_somme,
+       count(*) FILTER (WHERE cl_ok)                                  AS cl_n,
+       count(*) FILTER (WHERE cl_ok AND cl_brut / %(cl_ech)s
+                        BETWEEN %(cl_min)s AND %(cl_max_mg)s)         AS cl_n_plage,
+       min(ts)                                                        AS premiere_donnee
+FROM   q
+GROUP  BY nom
+"""
+
+_RAPPORT_CLES_AGREGATS = (
+    "heures", "jours_donnees", "renvoi", "adoucie", "heures_eau_ecartees", "kwh",
+    "heures_elec_ecartees", "jours_lavage", "ph_somme", "ph_n", "ph_n_plage",
+    "cl_somme", "cl_n", "cl_n_plage", "premiere_donnee",
+)
+
+
+def _rapport_agregats(stations: list, debut: dt.datetime, fin: dt.datetime) -> dict:
+    """Agregats bruts par station (nom trime) sur [debut, fin). Station sans donnees : absente."""
+    rows = _rapport_sql(_RAPPORT_SQL_AGREGATS, {
+        "noms": _rapport_noms_sql(stations), "debut": debut, "fin": fin,
+        "ph_ech": _RAPPORT_PH_ECHELLE, "ph_vmin": _RAPPORT_PH_VALIDE[0], "ph_vmax": _RAPPORT_PH_VALIDE[1],
+        "ph_min": _RAPPORT_PH_MIN, "ph_max": _RAPPORT_PH_MAX,
+        "cl_ech": _RAPPORT_CHLORE_ECHELLE, "cl_max": _RAPPORT_CHLORE_BRUT_MAX,
+        "cl_min": _RAPPORT_CHLORE_MIN_MG_L, "cl_max_mg": _RAPPORT_CHLORE_MAX_MG_L,
+        "max_m3": _RAPPORT_MAX_M3_HEURE, "max_kwh": _RAPPORT_MAX_KWH_HEURE,
+    })
+    out = {}
+    for r in rows:
+        d = dict(zip(_RAPPORT_CLES_AGREGATS, r[1:]))
+        for k, v in d.items():
+            if isinstance(v, decimal.Decimal):
+                d[k] = float(v)
+        out[r[0]] = d
+    return out
+
+
+def _rapport_pannes(stations: list, debut: dt.datetime, fin: dt.datetime) -> tuple:
+    """(stats par station, liste des pannes du mois). Jointure par nom de station
+    trime : aucune panne d'une autre station ne peut remonter."""
+    noms = [s["nom"] for s in stations]
+    p = {"noms": noms, "debut": debut, "fin": fin}
+    stats = _rapport_sql(
+        """
+        SELECT trim(nom_automate),
+               count(*) FILTER (WHERE date_debut >= %(debut)s AND date_debut < %(fin)s),
+               count(*) FILTER (WHERE date_fin   >= %(debut)s AND date_fin   < %(fin)s),
+               COALESCE(sum(EXTRACT(EPOCH FROM (date_fin - date_debut)) / 3600.0)
+                        FILTER (WHERE date_fin >= %(debut)s AND date_fin < %(fin)s
+                                  AND date_fin >= date_debut), 0),
+               count(*) FILTER (WHERE date_fin >= %(debut)s AND date_fin < %(fin)s
+                                  AND date_fin >= date_debut),
+               count(*) FILTER (WHERE deplacement IS TRUE
+                                  AND ((date_debut >= %(debut)s AND date_debut < %(fin)s)
+                                    OR (date_fin   >= %(debut)s AND date_fin   < %(fin)s))),
+               count(*) FILTER (WHERE date_debut < %(fin)s
+                                  AND (date_fin IS NULL OR date_fin >= %(fin)s))
+        FROM   pannes
+        WHERE  trim(nom_automate) = ANY(%(noms)s)
+        GROUP  BY trim(nom_automate)
+        """,
+        p,
+    )
+    par_station = {}
+    for r in stats:
+        par_station[r[0]] = {
+            "ouvertes": int(r[1]), "resolues": int(r[2]), "delai_somme_h": float(r[3] or 0),
+            "delai_n": int(r[4]), "deplacements": int(r[5]), "en_cours_fin_mois": int(r[6]),
+        }
+    liste = _rapport_sql(
+        """
+        SELECT trim(nom_automate), panne, date_debut, date_fin
+        FROM   pannes
+        WHERE  trim(nom_automate) = ANY(%(noms)s)
+          AND  ((date_debut >= %(debut)s AND date_debut < %(fin)s)
+             OR (date_fin   >= %(debut)s AND date_fin   < %(fin)s))
+        ORDER  BY date_debut, id
+        """,
+        p,
+    )
+    return par_station, [
+        {
+            "nom_automate": r[0], "type": r[1],
+            "date_debut": r[2].isoformat() if hasattr(r[2], "isoformat") else r[2],
+            "date_fin": r[3].isoformat() if hasattr(r[3], "isoformat") else r[3],
+            "resolue_dans_le_mois": bool(r[3] is not None and debut <= _rapport_naif(r[3]) < fin),
+            "duree_h": (round((_rapport_naif(r[3]) - _rapport_naif(r[2])).total_seconds() / 3600, 1)
+                        if r[3] is not None and r[2] is not None else None),
+        }
+        for r in liste
+    ]
+
+
+def _rapport_naif(v):
+    return v.replace(tzinfo=None) if isinstance(v, dt.datetime) else v
+
+
+def _rapport_pct(num, den, nd=1):
+    return round(100.0 * num / den, nd) if den else None
+
+
+def _rapport_variation(cur, prev):
+    if cur is None or prev is None or not prev:
+        return None
+    return round(100.0 * (cur - prev) / prev, 1)
+
+
+_RAPPORT_VIDE = {k: 0 for k in _RAPPORT_CLES_AGREGATS}
+_RAPPORT_VIDE.update({"ph_somme": None, "cl_somme": None, "premiere_donnee": None})
+
+
+def _rapport_somme(agregats: list) -> dict:
+    tot = dict(_RAPPORT_VIDE)
+    for a in agregats:
+        for k in _RAPPORT_CLES_AGREGATS:
+            v = a.get(k)
+            if k == "premiere_donnee":
+                if v is not None and (tot[k] is None or v < tot[k]):
+                    tot[k] = v
+            elif k in ("ph_somme", "cl_somme"):
+                if v is not None:
+                    tot[k] = (tot[k] or 0) + v
+            else:
+                tot[k] += v or 0
+    return tot
+
+
+def _rapport_indicateurs(a: dict, prix: float, heures_attendues: int, jours_periode: int,
+                         nb_stations: int = 1) -> dict:
+    """Indicateurs lisibles a partir des agregats bruts (station ou total)."""
+    renvoi, adoucie = float(a["renvoi"]), float(a["adoucie"])
+    recyclee = max(renvoi - adoucie, 0.0)
+    kwh = float(a["kwh"])
+    taux = None
+    if renvoi > 0:
+        taux = round(min(max(100.0 * recyclee / renvoi, 0.0), 100.0), 1)
+    attendues = heures_attendues * nb_stations
+    couverture = min(_rapport_pct(a["heures"], attendues) or 0.0, 100.0) if attendues else None
+    # jours_donnees d'un total = somme sur les stations : jours sans donnees en moyenne
+    jours_sans = max(jours_periode * nb_stations - int(a["jours_donnees"]), 0)
+    motifs = []
+    if couverture is not None and couverture < _RAPPORT_SEUIL_COUVERTURE_PCT:
+        motifs.append(f"couverture des données {couverture:.1f} % (< {_RAPPORT_SEUIL_COUVERTURE_PCT:.0f} %)"
+                      .replace(".", ",").replace(" %", "\u00a0%"))
+    if nb_stations == 1 and jours_sans > _RAPPORT_JOURS_MUETS_MAX:
+        motifs.append(f"{jours_sans} jours sans aucune donnée")
+    if a["heures_eau_ecartees"]:
+        motifs.append(f"{a['heures_eau_ecartees']} heure(s) de compteur d'eau écartée(s) (remise à zéro ou valeur aberrante)")
+    if a["heures_elec_ecartees"]:
+        motifs.append(f"{a['heures_elec_ecartees']} heure(s) de compteur électrique écartée(s)")
+    return {
+        "eau_renvoyee_m3": round(renvoi, 1),
+        "eau_adoucie_m3": round(adoucie, 1),
+        "eau_recyclee_m3": round(recyclee, 1),
+        "taux_recyclage_pct": taux,
+        "economies_eur": round(recyclee * prix, 2),
+        "equivalent_piscines_olympiques": round(recyclee / _RAPPORT_PISCINE_OLYMPIQUE_M3, 2),
+        "energie_kwh": round(kwh, 1),
+        "kwh_par_m3_recycle": round(kwh / recyclee, 2) if recyclee > 0 else None,
+        "jours_avec_lavage": int(a["jours_lavage"]),
+        "jours_avec_donnees": int(a["jours_donnees"]),
+        "jours_sans_donnees": jours_sans,
+        "heures_avec_donnees": int(a["heures"]),
+        "heures_attendues": attendues,
+        "couverture_pct": couverture,
+        "heures_ecartees": {"eau": int(a["heures_eau_ecartees"]), "electricite": int(a["heures_elec_ecartees"])},
+        "qualite": {
+            "ph_moyen": round(a["ph_somme"] / a["ph_n"], 2) if a["ph_n"] else None,
+            "ph_pct_dans_plage": _rapport_pct(a["ph_n_plage"], a["ph_n"]),
+            "heures_mesure_ph": int(a["ph_n"]),
+            "chlore_moyen_mg_l": round(a["cl_somme"] / a["cl_n"], 2) if a["cl_n"] else None,
+            "chlore_pct_dans_plage": _rapport_pct(a["cl_n_plage"], a["cl_n"]),
+            "heures_mesure_chlore": int(a["cl_n"]),
+        },
+        "premiere_donnee": a["premiere_donnee"].isoformat() if a.get("premiere_donnee") else None,
+        "donnees_incompletes": bool(motifs),
+        "motifs_incompletude": motifs,
+    }
+
+
+def _rapport_pannes_indic(stats: list) -> dict:
+    t = {"ouvertes": 0, "resolues": 0, "delai_somme_h": 0.0, "delai_n": 0, "deplacements": 0,
+         "en_cours_fin_mois": 0}
+    for s in stats:
+        for k in t:
+            t[k] += s.get(k, 0)
+    return {
+        "ouvertes_dans_le_mois": t["ouvertes"],
+        "resolues_dans_le_mois": t["resolues"],
+        "delai_moyen_resolution_h": round(t["delai_somme_h"] / t["delai_n"], 1) if t["delai_n"] else None,
+        "deplacements": t["deplacements"],
+        "en_cours_fin_de_mois": t["en_cours_fin_mois"],
+    }
+
+
+def rapport_mensuel(client: str, mois: str) -> dict:
+    """Indicateurs V1 du mois civil `mois` ('AAAA-MM', heure de Paris) pour les
+    stations du client `client` : detail par station + total client."""
+    client = (client or "").strip()
+    if not client:
+        raise HTTPException(status_code=400, detail="Paramètre client obligatoire")
+    debut, fin = _rapport_bornes(mois)
+    maintenant = _rapport_maintenant()
+    if debut > maintenant:
+        raise HTTPException(status_code=400, detail="Mois futur : aucun rapport possible")
+    stations = _rapport_stations(client)
+    if not stations:
+        raise HTTPException(status_code=404, detail="Client inconnu ou sans station")
+
+    mois_en_cours = maintenant < fin
+    fin_effective = min(fin, maintenant.replace(minute=0, second=0, microsecond=0)) if mois_en_cours else fin
+    heures_attendues = max(int((fin_effective - debut).total_seconds() // 3600), 0)
+    jours_periode = (fin_effective - debut).days + (1 if mois_en_cours else 0)
+    jours_periode = min(jours_periode, _rapport_calendar.monthrange(debut.year, debut.month)[1])
+
+    mois_prec = f"{debut.year - 1:04d}-12" if debut.month == 1 else f"{debut.year:04d}-{debut.month - 1:02d}"
+    debut_prec, fin_prec = _rapport_bornes(mois_prec)
+    heures_prec = int((fin_prec - debut_prec).total_seconds() // 3600)
+    jours_prec = (fin_prec - debut_prec).days
+    debut_annee = dt.datetime(debut.year, 1, 1)
+
+    prix = _rapport_prix_m3(client)
+    ag = _rapport_agregats(stations, debut, fin)
+    ag_prec = _rapport_agregats(stations, debut_prec, fin_prec)
+    ag_annee = _rapport_agregats(stations, debut_annee, fin)
+    pannes_stats, pannes_liste = _rapport_pannes(stations, debut, fin)
+
+    detail = []
+    for s in stations:
+        a = ag.get(s["nom"], _RAPPORT_VIDE)
+        ind = _rapport_indicateurs(a, prix, heures_attendues, jours_periode)
+        prec = _rapport_indicateurs(ag_prec.get(s["nom"], _RAPPORT_VIDE), prix, heures_prec, jours_prec)
+        ind["variation_eau_recyclee_pct"] = _rapport_variation(ind["eau_recyclee_m3"], prec["eau_recyclee_m3"])
+        ind["pannes"] = _rapport_pannes_indic([pannes_stats.get(s["nom"], {})])
+        if a is _RAPPORT_VIDE:
+            ind["motifs_incompletude"] = ["aucune donnée reçue ce mois"]
+            ind["donnees_incompletes"] = True
+        detail.append({"nom_automate": s["nom"], "lieu": s["lieu"], **ind})
+
+    n = len(stations)
+    total = _rapport_indicateurs(_rapport_somme(list(ag.values())), prix, heures_attendues, jours_periode, n)
+    total.pop("motifs_incompletude")
+    total["donnees_incompletes"] = any(d["donnees_incompletes"] for d in detail)
+    total["stations_donnees_incompletes"] = [d["nom_automate"] for d in detail if d["donnees_incompletes"]]
+    total["pannes"] = _rapport_pannes_indic(list(pannes_stats.values()))
+
+    prec_tot = _rapport_indicateurs(_rapport_somme(list(ag_prec.values())), prix, heures_prec, jours_prec, n)
+    cles_cmp = ("eau_recyclee_m3", "eau_renvoyee_m3", "economies_eur", "energie_kwh", "jours_avec_lavage")
+    comparaison = {
+        "mois": mois_prec,
+        "aucune_donnee": prec_tot["heures_avec_donnees"] == 0,
+        **{k: prec_tot[k] for k in cles_cmp + ("taux_recyclage_pct", "couverture_pct", "kwh_par_m3_recycle")},
+        "variations_pct": {k: _rapport_variation(total[k], prec_tot[k]) for k in cles_cmp + ("kwh_par_m3_recycle",)},
+        "ecart_taux_recyclage_points": (round(total["taux_recyclage_pct"] - prec_tot["taux_recyclage_pct"], 1)
+                                        if total["taux_recyclage_pct"] is not None
+                                        and prec_tot["taux_recyclage_pct"] is not None else None),
+    }
+
+    annee = _rapport_indicateurs(_rapport_somme(list(ag_annee.values())), prix, 0, 0, n)
+    cumul = {
+        "depuis": annee["premiere_donnee"][:10] if annee["premiere_donnee"] else None,
+        "jusqu_au": (fin - dt.timedelta(days=1)).date().isoformat(),
+        **{k: annee[k] for k in ("eau_recyclee_m3", "eau_renvoyee_m3", "taux_recyclage_pct", "economies_eur",
+                                 "equivalent_piscines_olympiques", "energie_kwh")},
+        "heures_ecartees": annee["heures_ecartees"],
+    }
+
+    return {
+        "client": stations[0]["client"],
+        "mois": f"{debut.year:04d}-{debut.month:02d}",
+        "periode": {"debut": debut.isoformat(), "fin_exclue": fin.isoformat(),
+                    "fuseau": "Europe/Paris (heure locale)", "mois_en_cours": mois_en_cours},
+        "aucune_donnee": total["heures_avec_donnees"] == 0,
+        "nb_stations": n,
+        "total": total,
+        "stations": detail,
+        "comparaison_mois_precedent": comparaison,
+        "cumul_annee": cumul,
+        "pannes_du_mois": pannes_liste,
+        "parametres": {
+            "prix_m3_eur": prix,
+            "piscine_olympique_m3": _RAPPORT_PISCINE_OLYMPIQUE_M3,
+            "plage_ph": [_RAPPORT_PH_MIN, _RAPPORT_PH_MAX],
+            "plage_chlore_mg_l": [_RAPPORT_CHLORE_MIN_MG_L, _RAPPORT_CHLORE_MAX_MG_L],
+            "seuil_couverture_pct": _RAPPORT_SEUIL_COUVERTURE_PCT,
+            "max_m3_par_heure": _RAPPORT_MAX_M3_HEURE,
+            "max_kwh_par_heure": _RAPPORT_MAX_KWH_HEURE,
+            "source": "mesures_aggregate (horaire)",
+        },
+        "genere_le": maintenant.replace(microsecond=0).isoformat(),
+    }
+
+
+# ----------------------------- Rendu HTML ------------------------------------
+def _fr_nombre(v, nd=0) -> str:
+    """1234567.8 -> '1 234 567,8' (espace fine insecable)."""
+    if v is None:
+        return "—"
+    return f"{v:,.{nd}f}".replace(",", " ").replace(".", ",")
+
+
+def _fr_pct(v, nd=1) -> str:
+    return "—" if v is None else f"{_fr_nombre(v, nd)} %"
+
+
+def _fr_eur(v, nd=0) -> str:
+    return "—" if v is None else f"{_fr_nombre(v, nd)} €"
+
+
+def _fr_var(v) -> str:
+    if v is None:
+        return '<span class="var neutre">—</span>'
+    cls = "hausse" if v > 0 else ("baisse" if v < 0 else "neutre")
+    signe = "+" if v > 0 else ("−" if v < 0 else "")
+    return f'<span class="var {cls}">{signe}{_fr_nombre(abs(v), 1)} %</span>'
+
+
+def _fr_date(iso) -> str:
+    if not iso:
+        return "—"
+    try:
+        return dt.datetime.fromisoformat(str(iso)).strftime("%d/%m/%Y")
+    except ValueError:
+        return _rapport_html.escape(str(iso))
+
+
+def _fr_mois(mois: str) -> str:
+    a, m = mois.split("-")
+    return f"{_RAPPORT_MOIS_FR[int(m) - 1]} {a}"
+
+
+def _fr_duree(h) -> str:
+    if h is None:
+        return "—"
+    if h < 48:
+        return f"{_fr_nombre(h, 1)} h"
+    return f"{_fr_nombre(h / 24, 1)} j"
+
+
+_RAPPORT_CSS = """
+:root{--tq:#41AEAD;--tq-fonce:#2c7f7e;--tq-clair:#e8f5f5;--txt:#1d2b2b;--gris:#5d6b6b;--ligne:#d6e3e3;
+--hausse:#1e7d4f;--baisse:#b23b3b;--alerte:#fff6e0;--alerte-bord:#e0b44c}
+*{box-sizing:border-box}
+html{background:#eef3f3}
+body{margin:0;background:#eef3f3;color:var(--txt);font:14px/1.45 "Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+.page{max-width:210mm;margin:16px auto;background:#fff;padding:14mm 14mm 10mm;box-shadow:0 1px 6px rgba(0,0,0,.08)}
+header{display:flex;justify-content:space-between;align-items:flex-end;border-bottom:3px solid var(--tq);padding-bottom:10px;margin-bottom:16px;gap:12px;flex-wrap:wrap}
+.marque{font-size:26px;font-weight:700;color:var(--tq);letter-spacing:.5px}
+.marque small{display:block;font-size:12px;font-weight:400;color:var(--gris);letter-spacing:0}
+h1{font-size:20px;margin:0;text-align:right}
+h1 small{display:block;font-size:14px;font-weight:400;color:var(--gris)}
+h2{font-size:15px;color:var(--tq-fonce);margin:20px 0 8px;text-transform:uppercase;letter-spacing:.6px}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.kpi{background:var(--tq-clair);border-radius:8px;padding:10px 12px;break-inside:avoid}
+.kpi .lib{font-size:12px;color:var(--gris)}
+.kpi .val{font-size:22px;font-weight:700;color:var(--tq-fonce);white-space:nowrap}
+.kpi .cmp{font-size:11.5px;color:var(--gris)}
+.kpis.second .kpi{background:#f6f9f9}
+.kpis.second .val{font-size:18px;color:var(--txt)}
+.var{font-weight:600}.var.hausse{color:var(--hausse)}.var.baisse{color:var(--baisse)}.var.neutre{color:var(--gris)}
+table{width:100%;border-collapse:collapse;font-size:12.5px;break-inside:auto}
+th,td{padding:5px 6px;border-bottom:1px solid var(--ligne);text-align:right;vertical-align:top}
+th{background:var(--tq);color:#fff;font-weight:600;font-size:11.5px}
+th:first-child,td:first-child,th.g,td.g{text-align:left}
+tr{break-inside:avoid}
+tfoot td{font-weight:700;border-top:2px solid var(--tq)}
+.nom{font-size:11px;color:var(--gris)}
+.drapeau{color:#9a6a00;font-weight:700}
+.alerte{background:var(--alerte);border-left:4px solid var(--alerte-bord);padding:8px 12px;margin:14px 0;font-size:12.5px;break-inside:avoid}
+.alerte ul{margin:4px 0 0;padding-left:18px}
+.vide{background:var(--tq-clair);padding:14px;border-radius:8px;text-align:center;color:var(--gris)}
+.methode{font-size:11px;color:var(--gris);margin-top:22px;border-top:1px solid var(--ligne);padding-top:8px}
+.methode p{margin:3px 0}
+.actions{max-width:210mm;margin:12px auto 0;text-align:right}
+.actions button{background:var(--tq);color:#fff;border:0;border-radius:6px;padding:8px 14px;font-size:14px;cursor:pointer}
+.tableau{overflow-x:auto}
+@media (max-width:700px){.page{padding:16px;margin:0}.kpis{grid-template-columns:repeat(2,1fr)}h1{text-align:left}
+.actions{padding:0 16px}}
+@page{size:A4;margin:12mm}
+@media print{html,body{background:#fff}.page{box-shadow:none;margin:0;padding:0;max-width:none}.actions{display:none}
+*{-webkit-print-color-adjust:exact;print-color-adjust:exact}h2{break-after:avoid}.tableau{overflow:visible}}
+"""
+
+
+def rapport_mensuel_html(r: dict) -> str:
+    e = _rapport_html.escape
+    t, cmp_, cum, par = r["total"], r["comparaison_mois_precedent"], r["cumul_annee"], r["parametres"]
+    v = cmp_["variations_pct"]
+    mois_txt = _fr_mois(r["mois"])
+    prec_txt = _fr_mois(cmp_["mois"])
+
+    def nom_station(s):
+        if s["lieu"]:
+            return f'{e(s["lieu"])}<div class="nom">{e(s["nom_automate"])}</div>'
+        return e(s["nom_automate"])
+
+    def kpi(lib, val, cmp_html=""):
+        return (f'<div class="kpi"><div class="lib">{lib}</div><div class="val">{val}</div>'
+                f'<div class="cmp">{cmp_html}</div></div>')
+
+    vs = f"vs {e(prec_txt)} : "
+    ecart = cmp_["ecart_taux_recyclage_points"]
+    ecart_html = ('<span class="var neutre">—</span>' if ecart is None else
+                  f'<span class="var {"hausse" if ecart > 0 else "baisse" if ecart < 0 else "neutre"}">'
+                  f'{"+" if ecart > 0 else "−" if ecart < 0 else ""}{_fr_nombre(abs(ecart), 1)} pt</span>')
+    piscines = t["equivalent_piscines_olympiques"]
+    parts = []
+    parts.append(f"""<!doctype html><html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rapport Eaukey {e(mois_txt)}</title><style>{_RAPPORT_CSS}</style></head><body>
+<div class="actions"><button onclick="window.print()">Imprimer / enregistrer en PDF</button></div>
+<div class="page">
+<header><div class="marque">Eaukey<small>Recyclage de l'eau des stations de lavage</small></div>
+<h1>Rapport de performance – {e(mois_txt)}<small>{e(r["client"])} · {r["nb_stations"]} station{"s" if r["nb_stations"] > 1 else ""}</small></h1></header>
+""")
+    if r["periode"]["mois_en_cours"]:
+        parts.append('<div class="alerte">Mois en cours : chiffres provisoires, arrêtés à la date de génération.</div>')
+    if r["aucune_donnee"]:
+        parts.append(f'<div class="vide">Aucune donnée n\'a été reçue de vos stations en {e(mois_txt)}.</div>')
+    else:
+        parts.append('<h2>Chiffres clés du mois</h2><div class="kpis">')
+        parts.append(kpi("Eau recyclée", f"{_fr_nombre(t['eau_recyclee_m3'])} m³", vs + _fr_var(v["eau_recyclee_m3"])))
+        parts.append(kpi("Taux de recyclage", _fr_pct(t["taux_recyclage_pct"]), vs + ecart_html))
+        parts.append(kpi("Économies estimées", _fr_eur(t["economies_eur"]), vs + _fr_var(v["economies_eur"])))
+        parts.append(kpi("Piscines olympiques", _fr_nombre(piscines, 2 if piscines < 10 else 1),
+                         f"1 piscine = {_fr_nombre(par['piscine_olympique_m3'])} m³"))
+        parts.append('</div><div class="kpis second" style="margin-top:10px">')
+        parts.append(kpi("Énergie consommée", f"{_fr_nombre(t['energie_kwh'])} kWh", vs + _fr_var(v["energie_kwh"])))
+        kpm = t["kwh_par_m3_recycle"]
+        parts.append(kpi("kWh par m³ recyclé", "—" if kpm is None else _fr_nombre(kpm, 2)))
+        parts.append(kpi("Jours avec lavage", _fr_nombre(t["jours_avec_lavage"]),
+                         f"cumulés sur {r['nb_stations']} station{'s' if r['nb_stations'] > 1 else ''}"))
+        parts.append(kpi("Données reçues", _fr_pct(t["couverture_pct"]), "des heures du mois"))
+        parts.append('</div>')
+
+    if t["donnees_incompletes"]:
+        items = "".join(
+            f'<li><b>{e(s["lieu"] or s["nom_automate"])}</b> : {e(" ; ".join(s["motifs_incompletude"]))}</li>'
+            for s in r["stations"] if s["donnees_incompletes"])
+        parts.append('<div class="alerte"><b>Données incomplètes</b> – les chiffres ci-dessous ne comptent que '
+                     f'les périodes où les stations ont transmis leurs mesures (rien n\'est extrapolé).<ul>{items}</ul></div>')
+
+    # Detail par station
+    parts.append('<h2>Détail par station</h2><div class="tableau"><table><thead><tr><th>Station</th>'
+                 '<th>Eau recyclée</th><th>Taux</th><th>Économies</th><th>kWh</th><th>Jours lavage</th>'
+                 f'<th>Données</th><th>vs {e(prec_txt)}</th></tr></thead><tbody>')
+    for s in r["stations"]:
+        flag = ' <span class="drapeau" title="Données incomplètes">⚠</span>' if s["donnees_incompletes"] else ""
+        parts.append(
+            f'<tr><td>{nom_station(s)}</td><td>{_fr_nombre(s["eau_recyclee_m3"])} m³</td>'
+            f'<td>{_fr_pct(s["taux_recyclage_pct"])}</td><td>{_fr_eur(s["economies_eur"])}</td>'
+            f'<td>{_fr_nombre(s["energie_kwh"])}</td><td>{s["jours_avec_lavage"]}</td>'
+            f'<td>{_fr_pct(s["couverture_pct"], 0)}{flag}</td><td>{_fr_var(s["variation_eau_recyclee_pct"])}</td></tr>')
+    if r["nb_stations"] > 1:
+        parts.append(
+            f'<tfoot><tr><td>Total</td><td>{_fr_nombre(t["eau_recyclee_m3"])} m³</td>'
+            f'<td>{_fr_pct(t["taux_recyclage_pct"])}</td><td>{_fr_eur(t["economies_eur"])}</td>'
+            f'<td>{_fr_nombre(t["energie_kwh"])}</td><td>{t["jours_avec_lavage"]}</td>'
+            f'<td>{_fr_pct(t["couverture_pct"], 0)}</td><td>{_fr_var(v["eau_recyclee_m3"])}</td></tr></tfoot>')
+    parts.append('</tbody></table></div>')
+
+    # Qualite de l'eau
+    q = t["qualite"]
+    parts.append(
+        '<h2>Qualité de l\'eau</h2><div class="tableau"><table><thead><tr><th>Station</th><th>pH moyen</th>'
+        f'<th>pH dans la plage ({_fr_nombre(par["plage_ph"][0], 1)}–{_fr_nombre(par["plage_ph"][1], 1)})</th>'
+        '<th>Chlore moyen (mg/L)</th>'
+        f'<th>Chlore dans la plage ({_fr_nombre(par["plage_chlore_mg_l"][0], 1)}–{_fr_nombre(par["plage_chlore_mg_l"][1], 1)} mg/L)</th>'
+        '</tr></thead><tbody>')
+    for s in r["stations"]:
+        sq = s["qualite"]
+        parts.append(f'<tr><td>{nom_station(s)}</td><td>{_fr_nombre(sq["ph_moyen"], 2)}</td>'
+                     f'<td>{_fr_pct(sq["ph_pct_dans_plage"])}</td><td>{_fr_nombre(sq["chlore_moyen_mg_l"], 2)}</td>'
+                     f'<td>{_fr_pct(sq["chlore_pct_dans_plage"])}</td></tr>')
+    if r["nb_stations"] > 1:
+        parts.append(f'<tfoot><tr><td>Ensemble</td><td>{_fr_nombre(q["ph_moyen"], 2)}</td>'
+                     f'<td>{_fr_pct(q["ph_pct_dans_plage"])}</td><td>{_fr_nombre(q["chlore_moyen_mg_l"], 2)}</td>'
+                     f'<td>{_fr_pct(q["chlore_pct_dans_plage"])}</td></tr></tfoot>')
+    parts.append('</tbody></table></div>')
+
+    # Interventions
+    p = t["pannes"]
+    parts.append('<h2>Interventions</h2><div class="kpis second">')
+    parts.append(kpi("Pannes signalées", str(p["ouvertes_dans_le_mois"])))
+    parts.append(kpi("Pannes résolues", str(p["resolues_dans_le_mois"])))
+    parts.append(kpi("Délai moyen de résolution", _fr_duree(p["delai_moyen_resolution_h"])))
+    parts.append(kpi("Déplacements sur site", str(p["deplacements"]),
+                     f"{p['en_cours_fin_de_mois']} en cours en fin de mois"))
+    parts.append('</div>')
+    if r["pannes_du_mois"]:
+        noms = {s["nom_automate"]: (s["lieu"] or s["nom_automate"]) for s in r["stations"]}
+        parts.append('<div class="tableau" style="margin-top:10px"><table><thead><tr><th>Station</th><th class="g">Type</th>'
+                     '<th>Début</th><th>Fin</th><th>Durée</th></tr></thead><tbody>')
+        for pn in r["pannes_du_mois"]:
+            parts.append(f'<tr><td>{e(noms.get(pn["nom_automate"], pn["nom_automate"]))}</td><td class="g">{e(pn["type"] or "—")}</td>'
+                         f'<td>{_fr_date(pn["date_debut"])}</td><td>{_fr_date(pn["date_fin"]) if pn["date_fin"] else "en cours"}</td>'
+                         f'<td>{_fr_duree(pn["duree_h"])}</td></tr>')
+        parts.append('</tbody></table></div>')
+
+    # Cumul annee
+    parts.append(f'<h2>Depuis le début de l\'année {r["mois"][:4]}</h2><div class="kpis">')
+    parts.append(kpi("Eau recyclée", f"{_fr_nombre(cum['eau_recyclee_m3'])} m³",
+                     f"du {_fr_date(cum['depuis'])} au {_fr_date(cum['jusqu_au'])}" if cum["depuis"] else ""))
+    parts.append(kpi("Taux de recyclage", _fr_pct(cum["taux_recyclage_pct"])))
+    parts.append(kpi("Économies estimées", _fr_eur(cum["economies_eur"])))
+    parts.append(kpi("Piscines olympiques", _fr_nombre(cum["equivalent_piscines_olympiques"], 1)))
+    parts.append('</div>')
+
+    parts.append(
+        '<div class="methode">'
+        f'<p><b>Méthode.</b> Eau recyclée = eau renvoyée vers le lavage − eau d\'appoint adoucie, mesurées par les compteurs '
+        f'des stations. Taux de recyclage = eau recyclée / eau renvoyée. Économies estimées sur la base de '
+        f'{_fr_nombre(par["prix_m3_eur"], 2)} € le m³ (eau + assainissement, prix indicatif). '
+        'Données horaires, heure de Paris ; une heure sans transmission n\'est pas comptée.</p>'
+        f'<p>Rapport généré le {_fr_date(r["genere_le"])}.</p></div>')
+    parts.append('</div></body></html>')
+    return "".join(parts)
+
+
+@app.get("/rapport/mensuel")
+def rapport_mensuel_json(
+    request: Request,
+    client: str = Query(..., description="Client (automate.client)"),
+    mois: Optional[str] = Query(None, description="AAAA-MM (défaut : mois précédent, heure de Paris)"),
+):
+    """ADMIN : rapport de performance mensuel d'un client (JSON)."""
+    _require_admin_or_super(request)
+    return rapport_mensuel(client, mois or _rapport_mois_precedent())
+
+
+@app.get("/rapport/mensuel/html", response_class=HTMLResponse)
+def rapport_mensuel_page(
+    request: Request,
+    client: str = Query(..., description="Client (automate.client)"),
+    mois: Optional[str] = Query(None, description="AAAA-MM (défaut : mois précédent, heure de Paris)"),
+):
+    """ADMIN : meme rapport en page HTML autonome, imprimable en PDF (A4)."""
+    _require_admin_or_super(request)
+    r = rapport_mensuel(client, mois or _rapport_mois_precedent())
+    return HTMLResponse(rapport_mensuel_html(r), headers={"Cache-Control": "no-store"})
+
+
+@app.get("/rapport/mensuel/clients")
+def rapport_mensuel_clients(
+    request: Request,
+    mois: Optional[str] = Query(None, description="AAAA-MM (défaut : mois précédent, heure de Paris)"),
+):
+    """ADMIN : clients ayant au moins une station avec des donnees ce mois-ci
+    (base de la future generation en lot)."""
+    _require_admin_or_super(request)
+    mois = mois or _rapport_mois_precedent()
+    debut, fin = _rapport_bornes(mois)
+    rows = _rapport_sql(
+        """
+        WITH actives AS (
+            SELECT DISTINCT trim(nom_automate) AS nom
+            FROM   mesures_aggregate
+            WHERE  rounded_timestamp >= %s AND rounded_timestamp < %s
+        )
+        SELECT mode() WITHIN GROUP (ORDER BY trim(a.client)) AS client,
+               count(DISTINCT trim(a.nom_automate)) AS stations_avec_donnees
+        FROM   automate a
+        JOIN   actives ON actives.nom = trim(a.nom_automate)
+        WHERE  NULLIF(trim(a.client), '') IS NOT NULL
+        GROUP  BY lower(trim(a.client))
+        ORDER  BY 1
+        """,
+        (debut, fin),
+    )
+    return {"mois": f"{debut.year:04d}-{debut.month:02d}",
+            "clients": [{"client": r[0], "stations_avec_donnees": int(r[1])} for r in rows]}
+
+
+# =============================================================================
 # REMONTEE DE DONNEES (page /parc, interne : admin / super_admin)
 # =============================================================================
 # Objectif : savoir en un coup d'oeil quels automates remontent encore des
