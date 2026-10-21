@@ -3233,6 +3233,8 @@ def _alerte_diagnostic(alerte_id: int, code: str, libelle: Optional[str]) -> dic
                 SELECT id, titre, solution
                   FROM sav_fiches, (SELECT plainto_tsquery('french', %s) AS q) tsq
                  WHERE NOT archivee AND recherche @@ q
+                   -- brouillons de l'assistant (colonne de la migration 014) exclus, avant comme après la 014
+                   AND NOT coalesce((to_jsonb(sav_fiches) ->> 'brouillon')::boolean, false)
                  ORDER BY ts_rank(recherche, q) DESC, updated_at DESC
                  LIMIT 3;
                 """,
