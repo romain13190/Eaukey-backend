@@ -63,7 +63,7 @@ with psycopg.connect(DSN, autocommit=True) as c:
         partage_sav boolean DEFAULT true);
       DO $$ BEGIN CREATE ROLE app_backend; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
       CREATE TABLE messages (id serial PRIMARY KEY, client_id text, sender_id int, content text,
-                             file_url text, created_at text DEFAULT now()::text, is_read boolean DEFAULT false);
+                             file_url text, created_at timestamp DEFAULT now(), is_read boolean DEFAULT false);
       CREATE TABLE automate (nom_automate text PRIMARY KEY, client text, lieu text,
                              email text, email2 text, email3 text);
       INSERT INTO automate VALUES
@@ -327,7 +327,7 @@ check(r.json()["resultats"] == ["enregistre"] and len(CALLS) == n_calls and len(
       "humain actif : message enregistré, agent non appelé, pas de réponse automatique")
 
 # 11. Pas de relais au-delà de 14 jours, ni si le client écrit depuis l'appli
-sql("UPDATE messages SET created_at = (now() - interval '20 days')::text WHERE client_id = 'acme' AND sender_id = 1")
+sql("UPDATE messages SET created_at = (now() - interval '20 days') WHERE client_id = 'acme' AND sender_id = 1")
 n_env = len(ENVOIS)
 api.post("/messages/acme", json={"sender_id": 0, "content": "Des nouvelles ?"}, headers=ADMIN)
 check(len(ENVOIS) == n_env, "dernier e-mail du client > 14 jours : pas de relais")
