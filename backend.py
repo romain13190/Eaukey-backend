@@ -3188,7 +3188,64 @@ def detail_alerte(alerte_id: int, request: Request):
     if out["panne_id"]:
         p = executer_requete_sql_one(f"SELECT {_PANNE_COLS} FROM pannes WHERE id = %s;", (out["panne_id"],))
         out["panne"] = _panne_to_dict(p) if p else None
+    out["diagnostic"] = _alerte_diagnostic(alerte_id, out["code"], out["libelle"])
     return out
+
+
+def _alerte_diagnostic(alerte_id: int, code: str, libelle: Optional[str]) -> dict:
+    """Diagnostic probable d'une alerte (A3), sans modèle : ce que l'historique en dit.
+
+    - causes : causes des pannes clôturées déjà liées à une alerte de MÊME code (toutes
+      stations), les plus fréquentes d'abord — ce que les techniciens ont constaté ;
+    - fiches : fiches de la Base SAV qui contiennent TOUS les mots du libellé (recherche
+      stricte : un libellé court comme « Température haute » ne doit pas ramener
+      « Pression filtre haute » sur le seul mot « haute »).
+    Ne bloque jamais le détail de l'alerte (liste vide en cas d'erreur).
+    """
+    causes, fiches = [], []
+    try:
+        rows = executer_requete_sql(
+            """
+            SELECT lower(btrim(p.cause)) AS cle, min(btrim(p.cause)) AS cause, count(*) AS n,
+                   max(p.date_fin) AS derniere,
+                   (array_agg(p.action_realisee ORDER BY p.date_fin DESC)
+                      FILTER (WHERE coalesce(btrim(p.action_realisee), '') <> ''))[1] AS action
+              FROM alertes a JOIN pannes p ON p.id = a.panne_id
+             WHERE a.code = %s AND a.id <> %s
+               AND p.date_fin IS NOT NULL AND coalesce(btrim(p.cause), '') <> ''
+             GROUP BY 1
+             ORDER BY n DESC, derniere DESC
+             LIMIT 3;
+            """,
+            (code, alerte_id),
+        )
+        causes = [
+            {"cause": cause, "occurrences": int(n), "action": action,
+             "derniere": derniere.isoformat() if hasattr(derniere, "isoformat") else derniere}
+            for _cle, cause, n, derniere, action in rows
+        ]
+    except Exception as e:
+        logging.getLogger("alertes").warning("Diagnostic (causes) indisponible : %s", e)
+    try:
+        if libelle:
+            rows = executer_requete_sql(
+                f"""
+                SELECT id, titre, solution
+                  FROM sav_fiches, (SELECT plainto_tsquery('french', %s) AS q) tsq
+                 WHERE NOT archivee AND recherche @@ q
+                 ORDER BY ts_rank(recherche, q) DESC, updated_at DESC
+                 LIMIT 3;
+                """,
+                (libelle,),
+            )
+            fiches = [
+                {"id": fid, "titre": titre,
+                 "extrait": (" ".join((solution or "").split()))[:220]}
+                for fid, titre, solution in rows
+            ]
+    except Exception as e:
+        logging.getLogger("alertes").warning("Diagnostic (fiches) indisponible : %s", e)
+    return {"causes": causes, "fiches": fiches}
 
 
 class AlerteMajIn(BaseModel):
