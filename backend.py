@@ -56,9 +56,6 @@ _ADMIN_ONLY_ROUTES = {
     ("GET", "/notifications/admin_all"),
     ("POST", "/messages_admin/{client_id}/marquer_non_lu"),
     ("GET", "/chat/escalades"),
-    ("GET", "/rapport/mensuel"),
-    ("GET", "/rapport/mensuel/html"),
-    ("GET", "/rapport/mensuel/clients"),
 }
 
 
@@ -5115,6 +5112,13 @@ from zoneinfo import ZoneInfo as _RapportZoneInfo
 from fastapi.responses import HTMLResponse
 
 # --- Valeurs par defaut (decisions Loane du 2026-10-21, faciles a changer) ---
+# Routes du rapport réservées aux admins (déclarées ici, à côté du code, plutôt que dans
+# la liste centrale : évite les conflits avec les autres PR qui y ajoutent leurs routes).
+_ADMIN_ONLY_ROUTES.update({
+    ("GET", "/rapport/mensuel"),
+    ("GET", "/rapport/mensuel/html"),
+    ("GET", "/rapport/mensuel/clients"),
+})
 _RAPPORT_PRIX_M3_DEFAUT = _PRIX_EAU_M3     # EUR / m3 : même prix que les économies de l'appli (PRIX_EAU_M3), surchargeable par RAPPORT_PRIX_M3
 _RAPPORT_PISCINE_OLYMPIQUE_M3 = 2500.0    # equivalence « piscine olympique »
 _RAPPORT_PH_MIN, _RAPPORT_PH_MAX = 6.5, 8.5
