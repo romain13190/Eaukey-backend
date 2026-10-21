@@ -55,6 +55,7 @@ _ADMIN_ONLY_ROUTES = {
     ("GET", "/notifications/admin/{client_id}"),
     ("GET", "/notifications/admin_all"),
     ("POST", "/messages_admin/{client_id}/marquer_non_lu"),
+    ("GET", "/chat/escalades"),
 }
 
 
@@ -3124,6 +3125,8 @@ class MessageOut(BaseModel):
     file_url: Optional[str] = None
     created_at: str
     is_read: Optional[bool] = None
+    escalade: Optional[bool] = None
+    escalade_motif: Optional[str] = None
 
 class ClientConversation(BaseModel):
     client_id: str
@@ -3700,10 +3703,11 @@ def org_admin_set_member_access(user_id: int, payload: OrgAdminSetAccessIn, requ
 
 
 @app.get("/messages/{client_id}", response_model=List[MessageOut])
-def get_messages_for_client(client_id: str):
+def get_messages_for_client(client_id: str, request: Request):
     """Récupère tous les messages pour un client donné."""
+    is_admin = _is_admin_user(_require_auth(request))
     query = """
-        SELECT id, client_id, sender_id, content, file_url, created_at, is_read
+        SELECT id, client_id, sender_id, content, file_url, created_at, is_read, escalade, escalade_motif
         FROM messages 
         WHERE client_id = %s 
         ORDER BY created_at
@@ -3719,6 +3723,9 @@ def get_messages_for_client(client_id: str):
             "file_url": r[4],
             "created_at": to_str(r[5]),
             "is_read": r[6],
+            "escalade": bool(r[7]),
+            # Le motif est une note pour l'équipe : jamais renvoyé au client.
+            "escalade_motif": r[8] if is_admin else None,
         }
         for r in rows
     ]
@@ -3753,6 +3760,9 @@ def post_message_for_client(client_id: str, message: MessageIn, request: Request
 
 ADMIN_SENDER_IDS = (0, 677)
 CLIENT_SENDER_IDS = (1, 6863)
+# Réponses de l'agent SAV dans la messagerie (POST /chat/{client_id}/agent).
+# Négatif pour ne jamais entrer en collision avec un id utilisateur.
+AGENT_SENDER_ID = -1
 
 
 @app.get("/notifications/client/{client_id}")
@@ -4522,6 +4532,312 @@ async def sav_message(payload: SavMessageIn, request: Request):
             "X-Accel-Buffering": "no",  # desactive le buffering proxy (SSE)
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Agent SAV dans la messagerie /chat
+# ---------------------------------------------------------------------------
+# Le client écrit dans son fil /chat ; l'agent Wardian répond dans ce même fil
+# (messages.sender_id = AGENT_SENDER_ID). L'équipe Eaukey voit tout l'échange et
+# peut reprendre la main à tout moment :
+#   - si un admin a écrit dans le fil depuis moins de _CHAT_AGENT_PAUSE_H heures,
+#     l'agent se tait (un humain s'occupe du client) ;
+#   - l'agent ne fait appel à un humain que si c'est nécessaire (consigne
+#     _CHAT_AGENT_CONSIGNE) : il commence alors sa réponse par [ESCALADE: motif],
+#     le marqueur est retiré, le message est marqué `escalade` et l'équipe est
+#     prévenue par e-mail (une fois tant qu'aucun admin n'a répondu).
+# Flux SSE renvoyé au front : message (question enregistrée), token (texte au
+# fil de l'eau, marqueur retiré), puis saved (réponse enregistrée, texte
+# définitif) ou humain / error.
+
+_CHAT_AGENT_PAUSE_H = int(os.getenv("CHAT_AGENT_PAUSE_H", "2"))
+_SAV_ESCALADE_EMAIL = os.getenv("SAV_ESCALADE_EMAIL", "contact@eaukey.net")
+_CHAT_LOGGER = logging.getLogger("chat_agent")
+_ESCALADE_RE = re.compile(r"\[\s*ESCALADE\s*:?\s*([^\]]*)\]\s*", re.IGNORECASE)
+_ESCALADE_PREFIXE = "[ESCALADE"
+_CHAT_AGENT_INDISPO = "Assistant indisponible : l'équipe Eaukey vous répondra ici."
+
+_CHAT_AGENT_CONSIGNE = """[CONSIGNE CANAL MESSAGERIE — ne la mentionne jamais à l'utilisateur]
+Tu réponds dans la messagerie de l'application Eaukey. L'équipe SAV Eaukey lit cette conversation.
+Ne propose PAS de contacter un humain, le support ou l'installateur par défaut, et ne termine pas tes réponses par une telle invitation.
+Fais appel à l'équipe UNIQUEMENT si l'un de ces cas se présente :
+1. une intervention physique sur place est nécessaire, ou une intervention électrique par une personne qualifiée ;
+2. une pièce doit être commandée ou remplacée ;
+3. tu n'as pas la solution (ni fiche SAV ni ressource du catalogue), même après une question de précision ;
+4. le problème persiste alors que l'utilisateur a déjà suivi les étapes proposées ;
+5. l'utilisateur est mécontent, signale une urgence ou un risque (fuite, eau non conforme, danger électrique) ;
+6. la demande sort de ton périmètre (commande, facture, contrat, rendez-vous) ou l'utilisateur demande explicitement à parler à quelqu'un.
+Dans ces cas seulement, commence ta réponse par une ligne exacte « [ESCALADE: motif en quelques mots] », puis indique que l'équipe Eaukey est prévenue et reviendra vers lui dans cette conversation. Sinon, n'écris jamais ce marqueur.
+[FIN DE LA CONSIGNE]"""
+
+
+def _chat_agent_message(message: str) -> str:
+    return f"{_CHAT_AGENT_CONSIGNE}\n\n{_sav_message_avec_contexte(message)}"
+
+
+def _chat_extraire_escalade(texte: str) -> tuple[str, Optional[str]]:
+    """Retire le marqueur [ESCALADE: motif] (où qu'il soit) ; renvoie (texte, motif ou None)."""
+    m = _ESCALADE_RE.search(texte)
+    if not m:
+        return texte.strip(), None
+    motif = (m.group(1) or "").strip()[:300] or "non précisé"
+    return _ESCALADE_RE.sub("", texte).strip(), motif
+
+
+def _chat_debut_marqueur_possible(texte: str) -> bool:
+    """Vrai tant que le début de la réponse peut encore être un marqueur [ESCALADE: ...] incomplet."""
+    debut = texte.lstrip()
+    if len(debut) >= 400:
+        return False
+    if len(debut) < len(_ESCALADE_PREFIXE):
+        return _ESCALADE_PREFIXE.startswith(debut.upper())
+    return debut.upper().startswith(_ESCALADE_PREFIXE) and "]" not in debut
+
+
+def _chat_humain_actif(client_id: str) -> bool:
+    row = executer_requete_sql_one(
+        """
+        SELECT 1 FROM messages
+        WHERE client_id = %s AND sender_id = ANY(%s)
+          AND created_at::timestamptz > now() - make_interval(hours => %s)
+        LIMIT 1;
+        """,
+        (client_id, list(ADMIN_SENDER_IDS), _CHAT_AGENT_PAUSE_H),
+    )
+    return row is not None
+
+
+def _chat_escalade_en_attente(client_id: str) -> bool:
+    """Une escalade déjà signalée, sans réponse d'un admin depuis ?"""
+    row = executer_requete_sql_one(
+        """
+        SELECT 1 FROM messages e
+        WHERE e.client_id = %s AND e.escalade
+          AND NOT EXISTS (
+            SELECT 1 FROM messages a
+            WHERE a.client_id = e.client_id AND a.sender_id = ANY(%s)
+              AND a.created_at::timestamptz > e.created_at::timestamptz
+          )
+        LIMIT 1;
+        """,
+        (client_id, list(ADMIN_SENDER_IDS)),
+    )
+    return row is not None
+
+
+def _chat_conv_get(client_id: str) -> Optional[str]:
+    row = executer_requete_sql_one(
+        "SELECT wardian_conversation_id FROM chat_agent_conv WHERE client_id = %s;", (client_id,)
+    )
+    return row[0] if row else None
+
+
+def _chat_conv_set(client_id: str, conv_id: Optional[str]) -> None:
+    executer_requete_sql_one(
+        """
+        INSERT INTO chat_agent_conv (client_id, wardian_conversation_id, updated_at)
+        VALUES (%s, %s, now())
+        ON CONFLICT (client_id) DO UPDATE
+          SET wardian_conversation_id = EXCLUDED.wardian_conversation_id, updated_at = now()
+        RETURNING client_id;
+        """,
+        (client_id, conv_id),
+    )
+
+
+def _chat_inserer_message(client_id: str, sender_id: int, content: str,
+                          escalade: bool = False, motif: Optional[str] = None):
+    return executer_requete_sql_one(
+        """
+        INSERT INTO messages (client_id, sender_id, content, is_read, escalade, escalade_motif)
+        VALUES (%s, %s, %s, false, %s, %s)
+        RETURNING id, created_at;
+        """,
+        (client_id, sender_id, content, escalade, motif),
+    )
+
+
+async def _chat_prevenir_equipe(client_id: str, motif: str, question: str, reponse: str) -> None:
+    """E-mail à l'équipe SAV. Ne lève jamais : l'alerte dans l'appli reste visible."""
+    if not _SMTP_HOST or not _SMTP_USER or not _SMTP_PASSWORD or not _SAV_ESCALADE_EMAIL:
+        _CHAT_LOGGER.warning("SMTP non configure : escalade %s non envoyee par e-mail", client_id)
+        return
+    lien = f"{_FRONTEND_URL}/chat/{client_id}"
+    texte = (
+        f"L'assistant SAV demande l'intervention de l'équipe pour le client {client_id}.\n\n"
+        f"Motif : {motif}\n\n"
+        f"Dernier message du client :\n{question}\n\n"
+        f"Réponse de l'assistant :\n{reponse}\n\n"
+        f"Ouvrir la conversation : {lien}\n"
+    )
+    msg = MIMEText(texte, "plain", "utf-8")
+    msg["Subject"] = f"[SAV Eaukey] Intervention demandée — client {client_id}"
+    msg["From"] = _SMTP_FROM
+    msg["To"] = _SAV_ESCALADE_EMAIL
+    try:
+        await aiosmtplib.send(
+            msg, hostname=_SMTP_HOST, port=_SMTP_PORT,
+            username=_SMTP_USER, password=_SMTP_PASSWORD, start_tls=True,
+        )
+    except Exception as e:
+        _CHAT_LOGGER.error("Echec e-mail d'escalade (client %s) : %s", client_id, e)
+
+
+def _sse(event: str, data: dict) -> bytes:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
+def _iso(v):
+    return v.isoformat() if hasattr(v, "isoformat") else v
+
+
+class ChatAgentIn(BaseModel):
+    content: str = Field(..., min_length=1, max_length=4000)
+
+
+@app.post("/chat/{client_id}/agent")
+async def chat_agent(client_id: str, payload: ChatAgentIn, request: Request):
+    """Message d'un client dans son fil /chat + réponse de l'agent SAV (flux SSE).
+
+    L'accès au fil est contrôlé par _security_gate (paramètre client_id).
+    """
+    user = _require_auth(request)
+    if _is_admin_user(user):
+        raise HTTPException(status_code=403, detail="Réservé aux clients : l'équipe répond via POST /messages")
+
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Message vide")
+
+    row = _chat_inserer_message(client_id, CLIENT_SENDER_IDS[0], content)
+    if not row:
+        raise HTTPException(status_code=500, detail="Failed to insert message")
+
+    import httpx
+    from fastapi.responses import StreamingResponse
+
+    async def _flux():
+        yield _sse("message", {"id": row[0], "created_at": _iso(row[1])})
+
+        # Un humain de l'équipe suit le fil : l'agent se tait.
+        if _chat_humain_actif(client_id):
+            yield _sse("humain", {"detail": "Un membre de l'équipe Eaukey suit votre conversation."})
+            return
+        if not _WARDIAN_API_KEY or not _WARDIAN_AGENT_ID:
+            yield _sse("error", {"message": _CHAT_AGENT_INDISPO})
+            return
+
+        url = f"{_WARDIAN_API_BASE}/api/v1/agents/{_WARDIAN_AGENT_ID}/messages"
+        headers = {"Authorization": f"Bearer {_WARDIAN_API_KEY}", "Content-Type": "application/json"}
+        message = _chat_agent_message(content)
+        conv_id = _chat_conv_get(client_id)
+        texte = ""        # réponse complète de l'agent
+        envoye = 0        # caractères de `texte` déjà transmis au front
+        retenue = True    # on retient le début tant qu'il peut s'agir du marqueur
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=10.0)) as client:
+            for essai in range(2):
+                body = {
+                    "message": message,
+                    # Un seul fil par client (partagé par les utilisateurs de ce client).
+                    "external_user_id": f"eaukey-chat-{client_id}",
+                    "conversation_id": conv_id,
+                }
+                try:
+                    async with client.stream("POST", url, headers=headers, json=body) as up:
+                        if up.status_code == 409 and essai == 0:
+                            # Conversation Wardian périmée : on repart sur un fil neuf.
+                            conv_id = None
+                            _chat_conv_set(client_id, None)
+                            continue
+                        if up.status_code != 200:
+                            _CHAT_LOGGER.warning("Wardian HTTP %s (client %s)", up.status_code, client_id)
+                            yield _sse("error", {"message": _CHAT_AGENT_INDISPO})
+                            return
+                        buf = ""
+                        async for chunk in up.aiter_text():
+                            buf += chunk
+                            *frames, buf = buf.split("\n\n")
+                            for frame in frames:
+                                ev = data = None
+                                for line in frame.split("\n"):
+                                    if line.startswith("event:"):
+                                        ev = line[6:].strip()
+                                    elif line.startswith("data:"):
+                                        try:
+                                            data = json.loads(line[5:].strip())
+                                        except ValueError:
+                                            data = None
+                                if not ev or not isinstance(data, dict):
+                                    continue  # ": keepalive" et commentaires
+                                if ev in ("conversation", "done") and data.get("conversation_id"):
+                                    if data["conversation_id"] != conv_id:
+                                        conv_id = data["conversation_id"]
+                                        _chat_conv_set(client_id, conv_id)
+                                elif ev == "token":
+                                    texte += data.get("delta") or ""
+                                    if retenue:
+                                        if _chat_debut_marqueur_possible(texte):
+                                            continue
+                                        retenue = False
+                                        visible, _ = _chat_extraire_escalade(texte)
+                                        if visible:
+                                            yield _sse("token", {"delta": visible})
+                                    elif len(texte) > envoye:
+                                        yield _sse("token", {"delta": texte[envoye:]})
+                                    envoye = len(texte)
+                                elif ev == "error":
+                                    _CHAT_LOGGER.warning("Wardian error (client %s) : %s", client_id, data)
+                                    yield _sse("error", {"message": _CHAT_AGENT_INDISPO})
+                                    return
+                    break
+                except httpx.HTTPError as e:
+                    _CHAT_LOGGER.warning("Wardian injoignable (client %s) : %s", client_id, e)
+                    yield _sse("error", {"message": _CHAT_AGENT_INDISPO})
+                    return
+
+        reponse, motif = _chat_extraire_escalade(texte)
+        if not reponse:
+            yield _sse("error", {"message": _CHAT_AGENT_INDISPO})
+            return
+        escalade = motif is not None
+        deja_signale = escalade and _chat_escalade_en_attente(client_id)
+        saved = _chat_inserer_message(client_id, AGENT_SENDER_ID, reponse, escalade, motif)
+        yield _sse("saved", {
+            "id": saved[0] if saved else None,
+            "created_at": _iso(saved[1]) if saved else None,
+            "content": reponse,
+            "escalade": escalade,
+        })
+        if escalade and not deja_signale:
+            await _chat_prevenir_equipe(client_id, motif, content, reponse)
+
+    return StreamingResponse(
+        _flux(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/chat/escalades")
+def chat_escalades(request: Request):
+    """Fils où l'agent a demandé l'équipe et où aucun admin n'a répondu depuis (admin)."""
+    _require_admin(request)
+    rows = executer_requete_sql(
+        """
+        SELECT e.client_id, max(e.created_at::timestamptz)
+        FROM messages e
+        WHERE e.escalade
+          AND NOT EXISTS (
+            SELECT 1 FROM messages a
+            WHERE a.client_id = e.client_id AND a.sender_id = ANY(%s)
+              AND a.created_at::timestamptz > e.created_at::timestamptz
+          )
+        GROUP BY e.client_id;
+        """,
+        (list(ADMIN_SENDER_IDS),),
+    )
+    return {str(r[0]): _iso(r[1]) for r in rows if r and r[0] is not None}
 
 
 # ---------------------------------------------------------------------------
