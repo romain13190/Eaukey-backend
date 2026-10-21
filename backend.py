@@ -5067,6 +5067,439 @@ def _sav_message_avec_contexte(message: str) -> str:
 
 
 # =============================================================================
+# PROBLEMES FREQUENTS (tâche S4 « Recommandations aux équipes », page /problemes)
+# =============================================================================
+# Rapport interne (admin) : pannes, escalades de l'assistant SAV et alertes les
+# plus fréquentes sur une période (7, 30 ou 90 jours, défaut 30), comparées à la
+# période précédente de même durée, + recommandations produites par des règles
+# simples et explicables (aucune IA). Lecture seule, aucune migration.
+#   GET /rapport/problemes?jours=30        -> JSON (page /problemes)
+#   GET /rapport/problemes/texte?jours=30  -> texte brut à coller dans un e-mail
+# La table `alertes` (migrations/010_alertes.sql) peut ne pas encore exister :
+# la section alertes est alors renvoyée vide avec disponible = false.
+# Suite prévue : envoi régulier du texte par un agent Wardian planifié.
+from datetime import timedelta, timezone
+from zoneinfo import ZoneInfo
+from fastapi.responses import PlainTextResponse
+
+_ADMIN_ONLY_ROUTES.update({
+    ("GET", "/rapport/problemes"),
+    ("GET", "/rapport/problemes/texte"),
+})
+
+_PB_TOP = 5                    # longueur des listes « top »
+_PB_STATION_MIN = 2            # station affichée à partir de 2 pannes
+_PB_RECO_CAUSE_MIN = 2         # cause répétée -> fiche SAV
+_PB_RECO_STATION_MIN = 3       # station -> visite préventive
+_PB_RECO_MOTIF_MIN = 2         # motif d'escalade répété -> enrichir l'agent / la Base SAV
+_PB_RECO_ALERTE_MIN = 10       # occurrences d'un code d'alerte sans panne -> revoir le seuil
+_PB_RECO_HAUSSE_MIN = 3        # hausse des pannes signalée à partir de 3 pannes et +50 %
+_PB_TZ = ZoneInfo("Europe/Paris")
+
+
+def _pb_propre(texte) -> str:
+    """Texte nettoyé pour l'affichage (espaces multiples réduits)."""
+    return re.sub(r"\s+", " ", str(texte or "")).strip()
+
+
+def _pb_cle(texte) -> str:
+    """Clé de regroupement : minuscules, sans ponctuation, espaces réduits."""
+    t = re.sub(r"[^\w\s]|_", " ", str(texte or "").lower())
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _pb_top(valeurs, n: int = _PB_TOP) -> list:
+    """Regroupe des textes libres (casse / espaces / ponctuation ignorés).
+
+    Libellé affiché = l'écriture la plus fréquente du groupe.
+    """
+    groupes = {}
+    for v in valeurs:
+        cle = _pb_cle(v)
+        if not cle:
+            continue
+        g = groupes.setdefault(cle, {"nombre": 0, "ecritures": {}})
+        g["nombre"] += 1
+        e = _pb_propre(v)
+        g["ecritures"][e] = g["ecritures"].get(e, 0) + 1
+    res = []
+    for g in groupes.values():
+        libelle = max(g["ecritures"].items(), key=lambda kv: (kv[1], -len(kv[0])))[0]
+        res.append({"libelle": libelle, "nombre": g["nombre"]})
+    res.sort(key=lambda x: (-x["nombre"], x["libelle"].casefold()))
+    return res[:n] if n else res
+
+
+def _pb_variation(actuel: int, precedent: int) -> dict:
+    pct = None if not precedent else round((actuel - precedent) * 100.0 / precedent)
+    return {"actuel": actuel, "precedent": precedent, "ecart": actuel - precedent, "pct": pct}
+
+
+def _pb_part(n: int, total: int):
+    return None if not total else round(n * 100.0 / total)
+
+
+def _pb_table_existe(nom: str) -> bool:
+    row = executer_requete_sql_one("SELECT to_regclass(%s) IS NOT NULL;", (f"public.{nom}",))
+    return bool(row and row[0])
+
+
+def _pb_stations_noms() -> dict:
+    """nom_automate (trimé) -> (client, lieu). trim() : espaces en trop dans automate."""
+    rows = executer_requete_sql("SELECT trim(nom_automate), client, lieu FROM automate;")
+    return {r[0]: (_pb_propre(r[1]) or None, _pb_propre(r[2]) or None) for r in rows if r and r[0]}
+
+
+def _pb_fiche_couvre(texte: str) -> bool:
+    """Une fiche SAV active couvre-t-elle ce texte (tous ses mots significatifs) ?"""
+    row = executer_requete_sql_one(
+        "SELECT count(*) FROM sav_fiches WHERE NOT archivee AND recherche @@ plainto_tsquery('french', %s);",
+        (texte,),
+    )
+    return bool(row and row[0])
+
+
+def _pb_section_pannes(debut, debut_prec, fin, noms) -> dict:
+    rows = executer_requete_sql(
+        """
+        SELECT id, client, lieu, trim(nom_automate), panne, cause, pieces_changees, deplacement,
+               date_debut::timestamptz, date_fin::timestamptz
+          FROM pannes
+         WHERE date_debut::timestamptz >= %s OR date_fin::timestamptz >= %s OR date_fin IS NULL
+         ORDER BY date_debut, id;
+        """,
+        (debut_prec, debut_prec),
+    )
+    signalees, signalees_prec, resolues, resolues_prec, en_cours = [], 0, [], 0, 0
+    for r in rows:
+        dd, df = r[8], r[9]
+        if df is None:
+            en_cours += 1
+        if dd is not None and debut <= dd <= fin:
+            signalees.append(r)
+        elif dd is not None and debut_prec <= dd < debut:
+            signalees_prec += 1
+        if df is not None and debut <= df <= fin:
+            resolues.append(r)
+        elif df is not None and debut_prec <= df < debut:
+            resolues_prec += 1
+
+    # Stations : pannes signalées dans la période
+    par_station = {}
+    for r in signalees:
+        nom = r[3] or ""
+        s = par_station.setdefault(nom, {"nom_automate": nom, "client": None, "lieu": None, "nombre": 0, "types": []})
+        client, lieu = noms.get(nom, (None, None))
+        s["client"] = client or _pb_propre(r[1]) or None
+        s["lieu"] = lieu or _pb_propre(r[2]) or None
+        s["nombre"] += 1
+        s["types"].append(r[4])
+    stations = []
+    for s in par_station.values():
+        if s["nombre"] >= _PB_STATION_MIN:
+            s["types"] = [t["libelle"] for t in _pb_top(s["types"], 3)]
+            stations.append(s)
+    stations.sort(key=lambda s: (-s["nombre"], (s["lieu"] or s["nom_automate"]).casefold()))
+
+    # Résolution : pannes résolues dans la période
+    durees = [(r[9] - r[8]).total_seconds() / 3600.0 for r in resolues if r[8] is not None and r[9] >= r[8]]
+    renseignees = [r for r in resolues if r[7] is not None]
+    avec_depl = sum(1 for r in renseignees if r[7])
+    pieces = []
+    for r in resolues:
+        for p in re.split(r"[,;\n/+]|\bet\b", r[6] or ""):
+            if _pb_cle(p):
+                pieces.append(p)
+
+    return {
+        "signalees": _pb_variation(len(signalees), signalees_prec),
+        "resolues": _pb_variation(len(resolues), resolues_prec),
+        "en_cours": en_cours,
+        "top_types": _pb_top([r[4] for r in signalees]),
+        "top_causes": _pb_top([r[5] for r in resolues]),
+        "toutes_causes": _pb_top([r[5] for r in resolues], 0),
+        "causes_renseignees": sum(1 for r in resolues if _pb_cle(r[5])),
+        "stations": stations[:10],
+        "delai_moyen_heures": round(sum(durees) / len(durees), 1) if durees else None,
+        "delai_base": len(durees),
+        "deplacement": {"avec": avec_depl, "renseignees": len(renseignees), "pct": _pb_part(avec_depl, len(renseignees))},
+        "top_pieces": _pb_top(pieces),
+    }
+
+
+def _pb_section_escalades(debut, debut_prec, fin) -> dict:
+    # messages.created_at est du TEXTE : on écarte les valeurs non datées avant le cast.
+    rows = executer_requete_sql(
+        """
+        SELECT client_id, escalade_motif, quand
+          FROM (SELECT client_id, escalade_motif,
+                       CASE WHEN created_at ~ '^\\d{4}-\\d{2}-\\d{2}' THEN created_at::timestamptz END AS quand
+                  FROM messages
+                 WHERE escalade AND sender_id = -1) m
+         WHERE quand >= %s;
+        """,
+        (debut_prec,),
+    )
+    periode = [r for r in rows if debut <= r[2] <= fin]
+    prec = sum(1 for r in rows if debut_prec <= r[2] < debut)
+    return {
+        "nombre": _pb_variation(len(periode), prec),
+        "top_motifs": _pb_top([r[1] for r in periode]),
+        "sans_motif": sum(1 for r in periode if not _pb_cle(r[1])),
+        "clients": len({r[0] for r in periode if r[0]}),
+    }
+
+
+def _pb_section_alertes(debut, debut_prec, fin, noms) -> dict:
+    vide = {"disponible": False, "nombre": _pb_variation(0, 0), "occurrences": 0, "top_codes": [],
+            "stations": [], "devenues_pannes": {"nombre": 0, "total": 0, "pct": None}}
+    if not _pb_table_existe("alertes"):
+        return vide
+    # Alertes actives dans la période = dernière occurrence dans la période.
+    rows = executer_requete_sql(
+        """
+        SELECT trim(nom_automate), code, libelle, occurrences, derniere_at, panne_id
+          FROM alertes
+         WHERE derniere_at >= %s
+         ORDER BY derniere_at, id;
+        """,
+        (debut_prec,),
+    )
+    periode = [r for r in rows if debut <= r[4] <= fin]
+    prec = sum(1 for r in rows if debut_prec <= r[4] < debut)
+
+    codes = {}
+    for nom, code, libelle, occ, _, panne_id in periode:
+        c = codes.setdefault(code, {"code": code, "libelles": [], "alertes": 0, "occurrences": 0,
+                                    "pannes": 0, "stations": set()})
+        c["libelles"].append(libelle)
+        c["alertes"] += 1
+        c["occurrences"] += occ or 0
+        c["pannes"] += 1 if panne_id else 0
+        c["stations"].add(nom)
+    top_codes = []
+    for c in codes.values():
+        top = _pb_top(c.pop("libelles"), 1)
+        c["libelle"] = top[0]["libelle"] if top else c["code"]
+        c["stations"] = len(c["stations"])
+        top_codes.append(c)
+    top_codes.sort(key=lambda c: (-c["occurrences"], str(c["code"])))
+
+    stations = {}
+    for nom, code, _, occ, _, _ in periode:
+        client, lieu = noms.get(nom, (None, None))
+        s = stations.setdefault(nom, {"nom_automate": nom, "client": client, "lieu": lieu,
+                                      "alertes": 0, "occurrences": 0})
+        s["alertes"] += 1
+        s["occurrences"] += occ or 0
+    stations = sorted(stations.values(), key=lambda s: (-s["occurrences"], s["nom_automate"]))
+
+    pannes = sum(1 for r in periode if r[5])
+    return {
+        "disponible": True,
+        "nombre": _pb_variation(len(periode), prec),
+        "occurrences": sum(r[3] or 0 for r in periode),
+        "top_codes": top_codes[:_PB_TOP],
+        "tous_codes": top_codes,
+        "stations": stations[:_PB_TOP],
+        "devenues_pannes": {"nombre": pannes, "total": len(periode), "pct": _pb_part(pannes, len(periode))},
+    }
+
+
+def _pb_recommandations(jours: int, pannes: dict, escalades: dict, alertes: dict) -> list:
+    recos = []
+
+    def ajouter(regle, priorite, texte, pourquoi, chiffres):
+        recos.append({"regle": regle, "priorite": priorite, "texte": texte,
+                      "pourquoi": pourquoi, "chiffres": chiffres})
+
+    # 1. Cause répétée sans fiche SAV qui la couvre
+    fiches_ok = _pb_table_existe("sav_fiches")
+    for c in pannes.get("toutes_causes", []):
+        if c["nombre"] < _PB_RECO_CAUSE_MIN:
+            continue
+        if fiches_ok and _pb_fiche_couvre(c["libelle"]):
+            continue
+        ajouter("fiche_sav", "haute" if c["nombre"] >= 4 else "moyenne",
+                f"Créer une fiche dans la Base SAV pour la cause « {c['libelle']} ».",
+                f"Cette cause revient {c['nombre']} fois dans les pannes résolues sur {jours} jours "
+                "et aucune fiche SAV ne la couvre.",
+                {"cause": c["libelle"], "pannes": c["nombre"], "jours": jours})
+
+    # 2. Station souvent en panne
+    for s in pannes["stations"]:
+        if s["nombre"] < _PB_RECO_STATION_MIN:
+            continue
+        nom = " — ".join(x for x in (s["client"], s["lieu"]) if x) or s["nom_automate"]
+        ajouter("visite_preventive", "haute" if s["nombre"] >= 5 else "moyenne",
+                f"Prévoir une visite préventive à {nom}.",
+                f"La station a eu {s['nombre']} pannes en {jours} jours"
+                + (f" ({', '.join(s['types'])})." if s["types"] else "."),
+                {"nom_automate": s["nom_automate"], "pannes": s["nombre"], "jours": jours})
+
+    # 3. Motif d'escalade répété
+    for m in escalades["top_motifs"]:
+        if m["nombre"] < _PB_RECO_MOTIF_MIN:
+            continue
+        ajouter("agent_sav", "haute" if m["nombre"] >= 5 else "moyenne",
+                f"Enrichir les instructions de l'assistant SAV ou la Base SAV sur « {m['libelle']} ».",
+                f"L'assistant a passé la main à l'équipe {m['nombre']} fois pour ce motif en {jours} jours.",
+                {"motif": m["libelle"], "escalades": m["nombre"], "jours": jours})
+
+    # 4. Code d'alerte qui se répète sans jamais devenir une panne
+    for c in alertes.get("tous_codes", []):
+        if c["occurrences"] < _PB_RECO_ALERTE_MIN or c["pannes"]:
+            continue
+        ajouter("seuil_alerte", "haute" if c["occurrences"] >= 50 else "moyenne",
+                f"Revoir le seuil de l'alerte {c['code']} ({c['libelle']}).",
+                f"{c['occurrences']} occurrences sur {c['stations']} station(s) en {jours} jours, "
+                "sans qu'aucune ne devienne une panne.",
+                {"code": c["code"], "occurrences": c["occurrences"], "stations": c["stations"], "jours": jours})
+
+    # 5. Hausse nette des pannes
+    v = pannes["signalees"]
+    if v["actuel"] >= _PB_RECO_HAUSSE_MIN and v["pct"] is not None and v["pct"] >= 50:
+        ajouter("hausse_pannes", "moyenne",
+                "Les pannes sont en nette hausse : faire un point d'équipe sur les causes.",
+                f"{v['actuel']} pannes signalées contre {v['precedent']} sur les {jours} jours précédents (+{v['pct']} %).",
+                {"actuel": v["actuel"], "precedent": v["precedent"], "pct": v["pct"], "jours": jours})
+
+    ordre = {"haute": 0, "moyenne": 1}
+    recos.sort(key=lambda r: ordre[r["priorite"]])
+    return recos
+
+
+def rapport_problemes(jours: int) -> dict:
+    fin = datetime.now(timezone.utc)
+    debut = fin - timedelta(days=jours)
+    debut_prec = debut - timedelta(days=jours)
+    noms = _pb_stations_noms()
+    pannes = _pb_section_pannes(debut, debut_prec, fin, noms)
+    escalades = _pb_section_escalades(debut, debut_prec, fin)
+    alertes = _pb_section_alertes(debut, debut_prec, fin, noms)
+    recos = _pb_recommandations(jours, pannes, escalades, alertes)
+    pannes.pop("toutes_causes", None)
+    alertes.pop("tous_codes", None)
+    return {
+        "jours": jours,
+        "debut": debut.isoformat(),
+        "fin": fin.isoformat(),
+        "precedente": {"debut": debut_prec.isoformat(), "fin": debut.isoformat()},
+        "recommandations": recos,
+        "pannes": pannes,
+        "escalades": escalades,
+        "alertes": alertes,
+    }
+
+
+def _pb_fmt_var(v: dict) -> str:
+    if v["pct"] is None:
+        return f"{v['actuel']} (période précédente : {v['precedent']})"
+    signe = "+" if v["pct"] > 0 else ""
+    return f"{v['actuel']} (période précédente : {v['precedent']}, {signe}{v['pct']} %)"
+
+
+def _pb_fmt_delai(h) -> str:
+    if h is None:
+        return "non calculable"
+    if h < 48:
+        return f"{str(round(h, 1)).replace('.', ',')} h"
+    return f"{str(round(h / 24, 1)).replace('.', ',')} jours"
+
+
+def rapport_problemes_texte(r: dict) -> str:
+    d = datetime.fromisoformat(r["debut"]).astimezone(_PB_TZ).strftime("%d/%m/%Y")
+    f = datetime.fromisoformat(r["fin"]).astimezone(_PB_TZ).strftime("%d/%m/%Y")
+    j = r["jours"]
+    L = [f"PROBLÈMES FRÉQUENTS — {j} derniers jours (du {d} au {f})",
+         f"Comparaison avec les {j} jours précédents.", ""]
+
+    L.append("RECOMMANDATIONS")
+    if not r["recommandations"]:
+        L.append("Aucune recommandation sur la période.")
+    for i, reco in enumerate(r["recommandations"], 1):
+        L.append(f"{i}. [{reco['priorite'].upper()}] {reco['texte']}")
+        L.append(f"   Pourquoi : {reco['pourquoi']}")
+    L.append("")
+
+    def top(titre, items, unite=""):
+        L.append(f"{titre} :")
+        if not items:
+            L.append("  (aucun)")
+        for it in items:
+            L.append(f"  - {it['libelle']} : {it['nombre']}{unite}")
+
+    p = r["pannes"]
+    L.append("PANNES")
+    L.append(f"- Signalées : {_pb_fmt_var(p['signalees'])}")
+    L.append(f"- Résolues : {_pb_fmt_var(p['resolues'])}")
+    L.append(f"- En cours aujourd'hui : {p['en_cours']}")
+    L.append(f"- Délai moyen de résolution : {_pb_fmt_delai(p['delai_moyen_heures'])}"
+             + (f" (sur {p['delai_base']} pannes)" if p["delai_base"] else ""))
+    dep = p["deplacement"]
+    if dep["renseignees"]:
+        L.append(f"- Avec déplacement : {dep['pct']} % ({dep['avec']} sur {dep['renseignees']} renseignées)")
+    else:
+        L.append("- Avec déplacement : non renseigné")
+    top("Types les plus fréquents", p["top_types"])
+    top("Causes les plus fréquentes", p["top_causes"])
+    top("Pièces les plus changées", p["top_pieces"])
+    L.append(f"Stations les plus touchées (au moins {_PB_STATION_MIN} pannes) :")
+    if not p["stations"]:
+        L.append("  (aucune)")
+    for s in p["stations"]:
+        nom = " — ".join(x for x in (s["client"], s["lieu"]) if x) or s["nom_automate"]
+        L.append(f"  - {nom} ({s['nom_automate']}) : {s['nombre']} pannes"
+                 + (f" ({', '.join(s['types'])})" if s["types"] else ""))
+    L.append("")
+
+    e = r["escalades"]
+    L.append("ESCALADES DE L'ASSISTANT SAV")
+    L.append(f"- Nombre : {_pb_fmt_var(e['nombre'])}")
+    L.append(f"- Clients concernés : {e['clients']}")
+    top("Motifs les plus fréquents", e["top_motifs"])
+    L.append("")
+
+    a = r["alertes"]
+    L.append("ALERTES DES AUTOMATES")
+    if not a["disponible"]:
+        L.append("Pas encore disponible (les alertes ne sont pas encore remontées dans l'appli).")
+    else:
+        L.append(f"- Alertes actives : {_pb_fmt_var(a['nombre'])}, {a['occurrences']} occurrences")
+        dp = a["devenues_pannes"]
+        L.append(f"- Devenues des pannes : {dp['nombre']} sur {dp['total']}"
+                 + (f" ({dp['pct']} %)" if dp["pct"] is not None else ""))
+        L.append("Codes les plus fréquents :")
+        if not a["top_codes"]:
+            L.append("  (aucun)")
+        for c in a["top_codes"]:
+            L.append(f"  - {c['code']} {c['libelle']} : {c['occurrences']} occurrences "
+                     f"({c['stations']} station(s), {c['pannes']} panne(s))")
+        L.append("Stations les plus bruyantes :")
+        if not a["stations"]:
+            L.append("  (aucune)")
+        for s in a["stations"]:
+            nom = " — ".join(x for x in (s["client"], s["lieu"]) if x) or s["nom_automate"]
+            L.append(f"  - {nom} ({s['nom_automate']}) : {s['occurrences']} occurrences")
+    L.append("")
+    L.append("Rapport généré par la plateforme Eaukey (page Problèmes fréquents).")
+    return "\n".join(L)
+
+
+@app.get("/rapport/problemes")
+def get_rapport_problemes(request: Request, jours: int = Query(30, ge=1, le=365)):
+    _require_admin(request)
+    return rapport_problemes(jours)
+
+
+@app.get("/rapport/problemes/texte", response_class=PlainTextResponse)
+def get_rapport_problemes_texte(request: Request, jours: int = Query(30, ge=1, le=365)):
+    _require_admin(request)
+    return PlainTextResponse(rapport_problemes_texte(rapport_problemes(jours)),
+                             headers={"Cache-Control": "no-store"})
+
+
+# =============================================================================
 # REMONTEE DE DONNEES (page /parc, interne : admin / super_admin)
 # =============================================================================
 # Objectif : savoir en un coup d'oeil quels automates remontent encore des
