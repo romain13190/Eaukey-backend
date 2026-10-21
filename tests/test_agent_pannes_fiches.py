@@ -48,7 +48,7 @@ with psycopg.connect(DSN, autocommit=True) as c:
         cause text, action_realisee text, pieces_changees text, deplacement boolean, intervenant text,
         partage_sav boolean DEFAULT true);
       CREATE TABLE messages (id serial PRIMARY KEY, client_id text, sender_id int, content text,
-                             file_url text, created_at text DEFAULT now()::text, is_read boolean DEFAULT false);
+                             file_url text, created_at timestamp DEFAULT now(), is_read boolean DEFAULT false);
       CREATE TABLE automate (nom_automate text PRIMARY KEY, client text, lieu text,
                              email text, email2 text, email3 text);
       INSERT INTO automate (nom_automate, client, lieu) VALUES
@@ -281,7 +281,7 @@ post("multi", "multi", "et à nimes la pompe est bloquée")
 check(rows("SELECT p.nom_automate FROM messages m JOIN pannes p ON p.id = m.panne_id "
            "WHERE m.client_id = 'multi' ORDER BY m.id DESC LIMIT 1") == [("M4",)],
       "lieu cité sans accent (« nimes » pour « Nîmes », client « Multi » avec espaces) : le message le plus récent l'emporte")
-sql("UPDATE messages SET created_at = (now() - interval '30 hours')::text WHERE client_id = 'multi'")
+sql("UPDATE messages SET created_at = (now() - interval '30 hours') WHERE client_id = 'multi'")
 n = nb_pannes()
 SCRIPT.append(("ok", "[PANNE: Pompe désamorcée | la pompe tourne sans débit]\nPurgez la pompe."))
 st, evs, toks = post("multi", "multi", "la pompe tourne mais rien ne sort")
