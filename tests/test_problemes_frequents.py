@@ -42,7 +42,7 @@ sql("""
   CREATE TABLE pannes (id serial PRIMARY KEY, client text, lieu text, nom_automate text, panne text,
                        probleme text, date_debut timestamp, date_fin timestamp, created_by text);
   CREATE TABLE messages (id serial PRIMARY KEY, client_id text, sender_id int, content text,
-                         file_url text, created_at text DEFAULT now()::text, is_read boolean DEFAULT false);
+                         file_url text, created_at timestamp DEFAULT now(), is_read boolean DEFAULT false);
 """)
 for m in ("007_pannes_resolution.sql", "008_sav_fiches.sql", "009_chat_agent.sql"):
     sql(open(os.path.join(B, "migrations", m)).read())
@@ -77,7 +77,7 @@ panne("A1", "Acme", "Fuite", 100, 99)                              # hors fenêt
 
 def esc(client, sender, motif, jours_avant, escalade=True, brut=None):
     sql("INSERT INTO messages (client_id, sender_id, content, created_at, escalade, escalade_motif) "
-        "VALUES (%s, %s, 'msg', coalesce(%s, (now() - make_interval(days => %s))::text), %s, %s)",
+        "VALUES (%s, %s, 'msg', coalesce(%s, (now() - make_interval(days => %s))), %s, %s)",
         (client, sender, brut, jours_avant, escalade, motif))
 
 
@@ -89,7 +89,7 @@ esc("gamma", -1, None, 3)
 esc("delta", -1, "x", 40)                       # période précédente
 esc("acme", 0, "équipe", 1)                     # pas l'assistant : ignoré
 esc("acme", -1, None, 1, escalade=False)        # réponse sans escalade : ignorée
-esc("beta", -1, "date illisible", 0, brut="n/a")  # created_at non daté : ignoré sans erreur
+# (pas de cas « date illisible » : messages.created_at est un timestamp en prod)
 
 sys.path.insert(0, B)
 import backend  # noqa: E402

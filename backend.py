@@ -4331,12 +4331,13 @@ def _pb_section_pannes(debut, debut_prec, fin, noms) -> dict:
 
 
 def _pb_section_escalades(debut, debut_prec, fin) -> dict:
-    # messages.created_at est du TEXTE : on écarte les valeurs non datées avant le cast.
+    # messages.created_at est un timestamp en prod (vérifié le 2026-10-21) ; le passage par
+    # ::text garde la requête valable si la colonne est du texte, et écarte les valeurs non datées.
     rows = executer_requete_sql(
         """
         SELECT client_id, escalade_motif, quand
           FROM (SELECT client_id, escalade_motif,
-                       CASE WHEN created_at ~ '^\\d{4}-\\d{2}-\\d{2}' THEN created_at::timestamptz END AS quand
+                       CASE WHEN created_at::text ~ '^\\d{4}-\\d{2}-\\d{2}' THEN created_at::timestamptz END AS quand
                   FROM messages
                  WHERE escalade AND sender_id = -1) m
          WHERE quand >= %s;
