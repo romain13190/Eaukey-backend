@@ -60,7 +60,7 @@ INSERT INTO automate (nom_automate, client, lieu) VALUES
   ('A3', ' lavage alpha ', 'Alpha Toulon'),         -- casse / espaces differents
   ('B1', 'Beta Wash', 'Beta Lyon');
 
--- A1, septembre : 720 h ; base elec 3 kWh/h, pH 7,50, chlore 0,5 mg/L
+-- A1, septembre : 720 h ; base elec 3 kWh/h, pH 7,50, redox 500 mV
 INSERT INTO mesures_aggregate (rounded_timestamp, nom_automate, compteur_electrique, avg_ph, avg_chlore)
 SELECT t, 'A1', 3, 750, 500 FROM generate_series('2026-09-01'::timestamp, '2026-09-30 23:00', '1 hour') t;
 -- lavage jours 1-20, 8h-17h : 2 m3/h renvoyes (400), 1 m3 d'appoint a 8h (20)
@@ -73,7 +73,7 @@ UPDATE mesures_aggregate SET compteur_eau_renvoi = 99999 WHERE nom_automate='A1'
 -- pH 9,00 pendant 100 h (21-24 + 25 de 0h a 3h)
 UPDATE mesures_aggregate SET avg_ph = 900 WHERE nom_automate='A1'
  AND rounded_timestamp >= '2026-09-21' AND rounded_timestamp < '2026-09-25 04:00';
--- chlore absent (0) 72 h, puis 0,1 mg/L 48 h
+-- sonde redox absente (0) 72 h, puis 100 mV (sous le seuil de 300 mV) 48 h
 UPDATE mesures_aggregate SET avg_chlore = 0 WHERE nom_automate='A1'
  AND rounded_timestamp >= '2026-09-26' AND rounded_timestamp < '2026-09-29';
 UPDATE mesures_aggregate SET avg_chlore = 100 WHERE nom_automate='A1' AND rounded_timestamp >= '2026-09-29';
@@ -168,8 +168,8 @@ check((a1["jours_avec_lavage"], a1["couverture_pct"], a1["heures_attendues"]) ==
 q = a1["qualite"]
 check((q["ph_moyen"], q["ph_pct_dans_plage"], q["heures_mesure_ph"]) == (7.71, 86.1, 720),
       "A1 : pH moyen 7,71, 86,1 % dans la plage")
-check((q["chlore_moyen_mg_l"], q["chlore_pct_dans_plage"], q["heures_mesure_chlore"]) == (0.47, 92.6, 648),
-      "A1 : chlore 0,47 mg/L, 92,6 % dans la plage, heures a 0 exclues")
+check((q["redox_moyen_mv"], q["chlore_pct_dans_plage"], q["heures_mesure_chlore"]) == (470, 92.6, 648),
+      "A1 : redox 470 mV, 92,6 % du temps >= 300 mV, heures a 0 exclues")
 a2 = st["A2"]
 check((a2["eau_recyclee_m3"], a2["couverture_pct"], a2["jours_sans_donnees"], a2["donnees_incompletes"])
       == (10, 33.3, 20, True), "A2 : trou de donnees -> couverture 33,3 %, 20 jours muets, signale")
