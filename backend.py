@@ -6382,10 +6382,12 @@ def _sav_message_avec_contexte(message: str) -> str:
 #   pendant le trou. La couverture (heures avec donnees / heures du mois) le
 #   signale, rien n'est extrapole.
 # - pH : avg_ph = mediane horaire de mesures.ph, qui est en pH x 100.
-# - Chlore : avg_chlore = mediane horaire de mesures.chlore_mv (0..2000 dans
-#   l'appli). HYPOTHESE A CONFIRMER : valeur brute / 1000 = mg/L
-#   (_RAPPORT_CHLORE_ECHELLE). 0 = sonde absente / pas de mesure (l'ETL remplace
-#   les manques par 0) : ces heures sont exclues des moyennes de chlore.
+# - Desinfection : avg_chlore = mediane horaire de mesures.chlore_mv, un potentiel
+#   REDOX en millivolts (0..2000), pas une concentration : c'est ce que l'appli
+#   affiche (« Chlore (mV) », taux de desinfection = mV / 3). Le rapport donne le
+#   redox moyen en mV et le temps passe au-dessus du seuil de desinfection
+#   (_RAPPORT_REDOX_SEUIL_MV, 300 mV = 100 % du taux de l'appli). 0 = sonde absente
+#   / pas de mesure (l'ETL remplace les manques par 0) : heures exclues.
 # - Passage heure d'ete / d'hiver : en heure locale naive, un mois compte
 #   toujours jours x 24 creneaux (en mars, le creneau 02:00 n'existe pas : la
 #   couverture plafonne a 99,9 %).
@@ -6407,11 +6409,10 @@ _ADMIN_ONLY_ROUTES.update({
 _RAPPORT_PRIX_M3_DEFAUT = _PRIX_EAU_M3     # EUR / m3 : même prix que les économies de l'appli (PRIX_EAU_M3), surchargeable par RAPPORT_PRIX_M3
 _RAPPORT_PISCINE_OLYMPIQUE_M3 = 2500.0    # equivalence « piscine olympique »
 _RAPPORT_PH_MIN, _RAPPORT_PH_MAX = 6.5, 8.5
-_RAPPORT_CHLORE_MIN_MG_L, _RAPPORT_CHLORE_MAX_MG_L = 0.2, 2.0
+_RAPPORT_REDOX_SEUIL_MV = 300.0           # desinfection suffisante au-dessus (= 100 % du taux de l'appli)
 # --- Unites et filtres ---
 _RAPPORT_PH_ECHELLE = 100.0               # avg_ph brut = pH x 100
 _RAPPORT_PH_VALIDE = (2.0, 12.0)          # meme filtre que /ph/jour
-_RAPPORT_CHLORE_ECHELLE = 1000.0          # HYPOTHESE : avg_chlore brut / 1000 = mg/L
 _RAPPORT_CHLORE_BRUT_MAX = 2000           # meme filtre que /chlore/jour
 _RAPPORT_MAX_M3_HEURE = 50                # au-dela : heure aberrante (remise a zero)
 _RAPPORT_MAX_KWH_HEURE = 200
@@ -6544,10 +6545,9 @@ SELECT nom,
        sum(ph) FILTER (WHERE ph_ok)                                   AS ph_somme,
        count(*) FILTER (WHERE ph_ok)                                  AS ph_n,
        count(*) FILTER (WHERE ph_ok AND ph BETWEEN %(ph_min)s AND %(ph_max)s) AS ph_n_plage,
-       sum(cl_brut / %(cl_ech)s) FILTER (WHERE cl_ok)                 AS cl_somme,
+       sum(cl_brut) FILTER (WHERE cl_ok)                              AS cl_somme,
        count(*) FILTER (WHERE cl_ok)                                  AS cl_n,
-       count(*) FILTER (WHERE cl_ok AND cl_brut / %(cl_ech)s
-                        BETWEEN %(cl_min)s AND %(cl_max_mg)s)         AS cl_n_plage,
+       count(*) FILTER (WHERE cl_ok AND cl_brut >= %(cl_seuil)s)      AS cl_n_plage,
        min(ts)                                                        AS premiere_donnee
 FROM   q
 GROUP  BY nom
@@ -6566,8 +6566,7 @@ def _rapport_agregats(stations: list, debut: dt.datetime, fin: dt.datetime) -> d
         "noms": _rapport_noms_sql(stations), "debut": debut, "fin": fin,
         "ph_ech": _RAPPORT_PH_ECHELLE, "ph_vmin": _RAPPORT_PH_VALIDE[0], "ph_vmax": _RAPPORT_PH_VALIDE[1],
         "ph_min": _RAPPORT_PH_MIN, "ph_max": _RAPPORT_PH_MAX,
-        "cl_ech": _RAPPORT_CHLORE_ECHELLE, "cl_max": _RAPPORT_CHLORE_BRUT_MAX,
-        "cl_min": _RAPPORT_CHLORE_MIN_MG_L, "cl_max_mg": _RAPPORT_CHLORE_MAX_MG_L,
+        "cl_max": _RAPPORT_CHLORE_BRUT_MAX, "cl_seuil": _RAPPORT_REDOX_SEUIL_MV,
         "max_m3": _RAPPORT_MAX_M3_HEURE, "max_kwh": _RAPPORT_MAX_KWH_HEURE,
     })
     out = {}
@@ -6713,7 +6712,7 @@ def _rapport_indicateurs(a: dict, prix: float, heures_attendues: int, jours_peri
             "ph_moyen": round(a["ph_somme"] / a["ph_n"], 2) if a["ph_n"] else None,
             "ph_pct_dans_plage": _rapport_pct(a["ph_n_plage"], a["ph_n"]),
             "heures_mesure_ph": int(a["ph_n"]),
-            "chlore_moyen_mg_l": round(a["cl_somme"] / a["cl_n"], 2) if a["cl_n"] else None,
+            "redox_moyen_mv": round(a["cl_somme"] / a["cl_n"]) if a["cl_n"] else None,
             "chlore_pct_dans_plage": _rapport_pct(a["cl_n_plage"], a["cl_n"]),
             "heures_mesure_chlore": int(a["cl_n"]),
         },
@@ -6826,7 +6825,7 @@ def rapport_mensuel(client: str, mois: str) -> dict:
             "prix_m3_eur": prix,
             "piscine_olympique_m3": _RAPPORT_PISCINE_OLYMPIQUE_M3,
             "plage_ph": [_RAPPORT_PH_MIN, _RAPPORT_PH_MAX],
-            "plage_chlore_mg_l": [_RAPPORT_CHLORE_MIN_MG_L, _RAPPORT_CHLORE_MAX_MG_L],
+            "seuil_redox_mv": _RAPPORT_REDOX_SEUIL_MV,
             "seuil_couverture_pct": _RAPPORT_SEUIL_COUVERTURE_PCT,
             "max_m3_par_heure": _RAPPORT_MAX_M3_HEURE,
             "max_kwh_par_heure": _RAPPORT_MAX_KWH_HEURE,
@@ -7009,17 +7008,17 @@ def rapport_mensuel_html(r: dict) -> str:
     parts.append(
         '<h2>Qualité de l\'eau</h2><div class="tableau"><table><thead><tr><th>Station</th><th>pH moyen</th>'
         f'<th>pH dans la plage ({_fr_nombre(par["plage_ph"][0], 1)}–{_fr_nombre(par["plage_ph"][1], 1)})</th>'
-        '<th>Chlore moyen (mg/L)</th>'
-        f'<th>Chlore dans la plage ({_fr_nombre(par["plage_chlore_mg_l"][0], 1)}–{_fr_nombre(par["plage_chlore_mg_l"][1], 1)} mg/L)</th>'
+        '<th>Désinfection : redox moyen (mV)</th>'
+        f'<th>Temps désinfecté (≥ {_fr_nombre(par["seuil_redox_mv"], 0)} mV)</th>'
         '</tr></thead><tbody>')
     for s in r["stations"]:
         sq = s["qualite"]
         parts.append(f'<tr><td>{nom_station(s)}</td><td>{_fr_nombre(sq["ph_moyen"], 2)}</td>'
-                     f'<td>{_fr_pct(sq["ph_pct_dans_plage"])}</td><td>{_fr_nombre(sq["chlore_moyen_mg_l"], 2)}</td>'
+                     f'<td>{_fr_pct(sq["ph_pct_dans_plage"])}</td><td>{_fr_nombre(sq["redox_moyen_mv"], 0)}</td>'
                      f'<td>{_fr_pct(sq["chlore_pct_dans_plage"])}</td></tr>')
     if r["nb_stations"] > 1:
         parts.append(f'<tfoot><tr><td>Ensemble</td><td>{_fr_nombre(q["ph_moyen"], 2)}</td>'
-                     f'<td>{_fr_pct(q["ph_pct_dans_plage"])}</td><td>{_fr_nombre(q["chlore_moyen_mg_l"], 2)}</td>'
+                     f'<td>{_fr_pct(q["ph_pct_dans_plage"])}</td><td>{_fr_nombre(q["redox_moyen_mv"], 0)}</td>'
                      f'<td>{_fr_pct(q["chlore_pct_dans_plage"])}</td></tr></tfoot>')
     parts.append('</tbody></table></div>')
 
