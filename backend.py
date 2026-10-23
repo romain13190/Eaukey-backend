@@ -1910,6 +1910,69 @@ _SMTP_USER = os.getenv("SMTP_USER", "")
 _SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 _SMTP_FROM = os.getenv("SMTP_FROM", "noreply@eaukey.com")
 _FRONTEND_URL = os.getenv("FRONTEND_URL", "https://my-app-zeta-blue.vercel.app")
+
+# Relais d'envoi d'e-mails par Google Apps Script (compte Google d'Eaukey).
+# Render (offre gratuite) bloque les ports SMTP sortants : aiosmtplib vers
+# smtp.gmail.com échoue par délai dépassé. Le relais est appelé en HTTPS (autorisé) ;
+# le script envoie l'e-mail depuis le Gmail d'Eaukey (adresse @eaukey.net, pas de spam).
+# Code du script et mise en place : kit migrations_pending/2026-10-23_email_google/.
+# Sans EMAIL_RELAIS_URL + EMAIL_RELAIS_SECRET, on garde l'envoi SMTP.
+_EMAIL_RELAIS_URL = os.getenv("EMAIL_RELAIS_URL", "").strip()
+_EMAIL_RELAIS_SECRET = os.getenv("EMAIL_RELAIS_SECRET", "").strip()
+_EMAIL_RELAIS_NOM = os.getenv("EMAIL_RELAIS_NOM", "Eaukey")
+
+
+def _mail_configure() -> bool:
+    """Un moyen d'envoi est-il configuré (relais Google ou SMTP) ?"""
+    return bool(_EMAIL_RELAIS_URL and _EMAIL_RELAIS_SECRET) or bool(_SMTP_HOST and _SMTP_USER and _SMTP_PASSWORD)
+
+
+def _mail_parties(msg) -> tuple[str, str]:
+    """(texte, html) d'un message MIMEText / MIMEMultipart."""
+    texte, html_ = "", ""
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        ctype = part.get_content_type()
+        charset = part.get_content_charset() or "utf-8"
+        contenu = part.get_payload(decode=True)
+        contenu = contenu.decode(charset, "replace") if isinstance(contenu, bytes) else (contenu or "")
+        if ctype == "text/plain" and not texte:
+            texte = contenu
+        elif ctype == "text/html" and not html_:
+            html_ = contenu
+    return texte, html_
+
+
+async def _mail_envoyer(msg) -> None:
+    """Envoie le message par le relais Google s'il est configuré, sinon en SMTP. Lève en cas d'échec."""
+    if _EMAIL_RELAIS_URL and _EMAIL_RELAIS_SECRET:
+        import httpx
+
+        texte, html_ = _mail_parties(msg)
+        payload = {
+            "secret": _EMAIL_RELAIS_SECRET,
+            "to": msg["To"],
+            "subject": msg["Subject"],
+            "text": texte,
+            "html": html_,
+            "replyTo": msg["Reply-To"] or "",
+            "name": _EMAIL_RELAIS_NOM,
+        }
+        # Une application web Apps Script répond par une redirection vers googleusercontent.com.
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0), follow_redirects=True) as client:
+            r = await client.post(_EMAIL_RELAIS_URL, json=payload)
+        try:
+            data = r.json()
+        except ValueError:
+            data = {}
+        if r.status_code != 200 or not data.get("ok"):
+            raise RuntimeError(f"relais e-mail : HTTP {r.status_code}, {data.get('error') or 'réponse invalide'}")
+        return
+    await aiosmtplib.send(
+        msg, hostname=_SMTP_HOST, port=_SMTP_PORT,
+        username=_SMTP_USER, password=_SMTP_PASSWORD, start_tls=True,
+    )
 _RESET_TOKEN_TTL_SECONDS = int(os.getenv("RESET_TOKEN_TTL_SECONDS", "3600"))  # 1 hour
 
 
@@ -2194,8 +2257,8 @@ class ResetPasswordIn(BaseModel):
 
 async def _send_reset_email(email: str, reset_token: str) -> bool:
     """Send password reset email via SMTP."""
-    if not _SMTP_HOST or not _SMTP_USER or not _SMTP_PASSWORD:
-        _AUTH_LOGGER.warning("SMTP not configured, cannot send reset email")
+    if not _mail_configure():
+        _AUTH_LOGGER.warning("E-mail sending not configured (EMAIL_RELAIS_* or SMTP_*), cannot send reset email")
         return False
 
     reset_link = f"{_FRONTEND_URL}/reset-password?token={reset_token}"
@@ -2266,14 +2329,7 @@ Si vous n'avez pas demandé cette réinitialisation, ignorez simplement cet emai
     msg.attach(MIMEText(html_content, "html", "utf-8"))
 
     try:
-        await aiosmtplib.send(
-            msg,
-            hostname=_SMTP_HOST,
-            port=_SMTP_PORT,
-            username=_SMTP_USER,
-            password=_SMTP_PASSWORD,
-            start_tls=True,
-        )
+        await _mail_envoyer(msg)
         _AUTH_LOGGER.info(f"Reset email sent to {email}")
         return True
     except Exception as e:
@@ -5627,8 +5683,8 @@ def _chat_inserer_message(client_id: str, sender_id: int, content: str,
 
 async def _chat_prevenir_equipe(client_id: str, motif: str, question: str, reponse: str) -> None:
     """E-mail à l'équipe SAV. Ne lève jamais : l'alerte dans l'appli reste visible."""
-    if not _SMTP_HOST or not _SMTP_USER or not _SMTP_PASSWORD or not _SAV_ESCALADE_EMAIL:
-        _CHAT_LOGGER.warning("SMTP non configure : escalade %s non envoyee par e-mail", client_id)
+    if not _mail_configure() or not _SAV_ESCALADE_EMAIL:
+        _CHAT_LOGGER.warning("Envoi d'e-mail non configure (EMAIL_RELAIS_* ou SMTP_*) : escalade %s non envoyee", client_id)
         return
     lien = f"{_FRONTEND_URL}/chat/{client_id}"
     texte = (
@@ -5643,10 +5699,7 @@ async def _chat_prevenir_equipe(client_id: str, motif: str, question: str, repon
     msg["From"] = _SMTP_FROM
     msg["To"] = _SAV_ESCALADE_EMAIL
     try:
-        await aiosmtplib.send(
-            msg, hostname=_SMTP_HOST, port=_SMTP_PORT,
-            username=_SMTP_USER, password=_SMTP_PASSWORD, start_tls=True,
-        )
+        await _mail_envoyer(msg)
     except Exception as e:
         _CHAT_LOGGER.error("Echec e-mail d'escalade (client %s) : %s", client_id, e)
 
@@ -7437,8 +7490,8 @@ def _email_id_entete(valeur: str) -> str:
 async def _email_envoyer(destinataire: str, sujet: str, texte: str, in_reply_to: str = "",
                          references: str = "", automatique: bool = True) -> bool:
     """Réponse par e-mail dans le fil e-mail du client. Ne lève jamais."""
-    if not _SMTP_HOST or not _SMTP_USER or not _SMTP_PASSWORD:
-        _EMAIL_LOGGER.warning("SMTP non configure : reponse e-mail non envoyee")
+    if not _mail_configure():
+        _EMAIL_LOGGER.warning("Envoi d'e-mail non configure : reponse e-mail non envoyee")
         return False
     from email.utils import formatdate, make_msgid
     msg = MIMEText(f"{texte}\n\n--\n{_EMAIL_PIED}\n", "plain", "utf-8")
@@ -7459,10 +7512,7 @@ async def _email_envoyer(destinataire: str, sujet: str, texte: str, in_reply_to:
         # RFC 3834 : réponse automatique -> les répondeurs du client ne nous répondent pas.
         msg["Auto-Submitted"] = "auto-replied"
     try:
-        await aiosmtplib.send(
-            msg, hostname=_SMTP_HOST, port=_SMTP_PORT,
-            username=_SMTP_USER, password=_SMTP_PASSWORD, start_tls=True,
-        )
+        await _mail_envoyer(msg)
         return True
     except Exception as e:
         _EMAIL_LOGGER.error("Echec envoi e-mail SAV : %s", e)
@@ -7475,8 +7525,8 @@ async def _email_alerte_inconnu(adresse: str, sujet: str) -> None:
     if maintenant - _email_inconnus_alertes.get(adresse, 0) < _EMAIL_ALERTE_INCONNU_S:
         return
     _email_inconnus_alertes[adresse] = maintenant
-    if not _SMTP_HOST or not _SMTP_USER or not _SMTP_PASSWORD or not _SAV_ESCALADE_EMAIL:
-        _EMAIL_LOGGER.warning("SMTP non configure : alerte expediteur inconnu non envoyee")
+    if not _mail_configure() or not _SAV_ESCALADE_EMAIL:
+        _EMAIL_LOGGER.warning("Envoi d'e-mail non configure : alerte expediteur inconnu non envoyee")
         return
     sujet = re.sub(r"[\r\n]+", " ", sujet or "").strip()[:200] or "(sans sujet)"
     msg = MIMEText(
@@ -7492,10 +7542,7 @@ async def _email_alerte_inconnu(adresse: str, sujet: str) -> None:
     msg["To"] = _SAV_ESCALADE_EMAIL
     msg["Auto-Submitted"] = "auto-generated"
     try:
-        await aiosmtplib.send(
-            msg, hostname=_SMTP_HOST, port=_SMTP_PORT,
-            username=_SMTP_USER, password=_SMTP_PASSWORD, start_tls=True,
-        )
+        await _mail_envoyer(msg)
     except Exception as e:
         _EMAIL_LOGGER.error("Echec alerte expediteur inconnu : %s", e)
 

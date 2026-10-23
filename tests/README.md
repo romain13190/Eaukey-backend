@@ -23,4 +23,5 @@ pg_ctl -D /tmp/pg_test stop
 |---|---|
 | `test_rapport_mensuel.py` | Rapport mensuel par client (`/rapport/mensuel`, `/html`, `/clients`) : calculs, remise à zéro de compteur, trou de données, M-1, cumul annuel, pannes, isolation entre clients, droits |
 | `test_canal_email.py` (PR canal e-mail) | Canal e-mail de la messagerie (`/canaux/email/entrant`, relais des réponses de l'équipe, `/clients/{client_id}/contacts`) : secret, formats générique et Brevo, anti-boucle, idempotence, expéditeur inconnu / ambigu, escalade, droits. Variables `CANAL_TEST_PGHOST` / `CANAL_TEST_PGPORT`. Faux Wardian, SMTP intercepté |
+| `test_email_relais.py` | Envoi des e-mails par le relais Google Apps Script (`_mail_envoyer`) : relais, redirection, refus, repli SMTP. Sans base ni réseau, aucun e-mail envoyé |
 | `test_problemes_frequents.py` (PR problèmes fréquents) | Rapport des problèmes fréquents pour l'équipe (`/rapport/problemes`) |
