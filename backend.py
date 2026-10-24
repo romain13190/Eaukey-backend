@@ -5304,6 +5304,108 @@ def eau_photo_validation(photo_id: int, payload: PhotoValidationIn, request: Req
 
 
 # ---------------------------------------------------------------------------
+# Photos a verifier (super admin) : file de relecture des predictions IA
+# ---------------------------------------------------------------------------
+# Une photo par station et par heure (les photos d'une meme heure sont quasi identiques),
+# jamais une heure deja validee. Trois motifs, dans cet ordre de priorite d'affichage :
+#   - "alerte"      : le modele signale un probleme (bac vide, MES, indice de qualite bas) ;
+#   - "incertain"   : le modele hesite (probabilite bac vide ou MES proche de 0,5) ;
+#   - "echantillon" : ~10 % des heures tirees au hasard (regle fixe sur l'id), notees A L'AVEUGLE
+#                     par l'admin (le front cache la prediction) : mesure honnete de l'erreur du modele.
+# L'echantillon est tire avant les autres motifs : une photo d'alerte peut en faire partie.
+# La validation passe par PUT /eau/photo/{id}/validation (route existante).
+_VERIF_INDICE_ALERTE = 5.0     # indice (qualite + 10 - opacite) / 2 en dessous duquel on alerte
+_VERIF_ECHANTILLON_PCT = 10    # part des heures tirees au hasard
+# Regle d'echantillonnage (melange de l'id, stable dans le temps) : meme regle en SQL partout.
+_VERIF_SQL_ECHANTILLON = "((u.id::bigint * 2654435761) %% 100) < %s"
+
+
+def _verif_motif_sql() -> str:
+    return f"""CASE
+        WHEN {_VERIF_SQL_ECHANTILLON} THEN 'echantillon'
+        WHEN u.pred_bac_vide_prob >= %s
+          OR u.pred_matiere_prob >= 0.5
+          OR (u.pred_qualite_eau + 10 - COALESCE(u.pred_opacite, 10 - u.pred_qualite_eau)) / 2 <= %s THEN 'alerte'
+        WHEN u.pred_bac_vide_prob BETWEEN 0.3 AND 0.7
+          OR u.pred_matiere_prob BETWEEN 0.3 AND 0.7 THEN 'incertain'
+      END"""
+
+
+@app.get("/eau/a_verifier")
+def eau_a_verifier(request: Request,
+                   jours: int = Query(30, ge=1, le=365, description="Photos des N derniers jours"),
+                   limit: int = Query(20, ge=1, le=100)):
+    """File des photos a verifier (super admin). JSON : {photos:[...], restantes}.
+    Pour chaque photo : motif (alerte / incertain / echantillon), station, predictions."""
+    _require_super_admin(request)
+    query = f"""
+      WITH relues AS (   -- heures (station, heure) dont au moins une photo est deja validee
+        SELECT DISTINCT numero_automate, date_trunc('hour', timestamp) AS h
+        FROM urls_images
+        WHERE validated_at IS NOT NULL AND timestamp >= now() - make_interval(days => %s) - interval '1 hour'
+      ), heures AS (
+        SELECT DISTINCT ON (u.numero_automate, date_trunc('hour', u.timestamp))
+               u.id, u.url, u.timestamp, u.numero_automate, u.pred_qualite_eau, u.pred_opacite,
+               u.pred_matiere_prob, u.pred_bac_vide_prob, u.pred_modele
+        FROM urls_images u
+        LEFT JOIN relues r ON r.numero_automate = u.numero_automate AND r.h = date_trunc('hour', u.timestamp)
+        WHERE u.timestamp >= now() - make_interval(days => %s)
+          AND u.url IS NOT NULL
+          AND u.pred_qualite_eau IS NOT NULL
+          AND u.validated_at IS NULL
+          AND r.h IS NULL
+        ORDER BY u.numero_automate, date_trunc('hour', u.timestamp), u.timestamp DESC
+      ), motifs AS (
+        SELECT u.*, {_verif_motif_sql()} AS motif FROM heures u
+      )
+      SELECT m.id, m.url, m.timestamp, m.numero_automate, a.nom_automate, a.client, a.lieu,
+             m.pred_qualite_eau, m.pred_opacite, m.pred_matiere_prob, m.pred_bac_vide_prob, m.pred_modele,
+             m.motif, count(*) OVER () AS restantes
+      FROM motifs m
+      LEFT JOIN automate a ON a.nom_automate = m.numero_automate::text || '.0'
+      WHERE m.motif IS NOT NULL
+      ORDER BY CASE m.motif WHEN 'alerte' THEN 0 WHEN 'incertain' THEN 1 ELSE 2 END, m.timestamp DESC
+      LIMIT %s;
+    """
+    rows = executer_requete_sql(query, (jours, jours, _VERIF_ECHANTILLON_PCT, _EAU_BAC_VIDE_SEUIL,
+                                        _VERIF_INDICE_ALERTE, limit))
+    f = lambda v: float(v) if v is not None else None
+    photos = [{
+        "id": r[0], "url": r[1], "timestamp": r[2].isoformat() if r[2] is not None else None,
+        "numero_automate": r[3], "nom_automate": r[4] or (f"{r[3]}.0" if r[3] is not None else None),
+        "client": r[5], "lieu": r[6],
+        "pred_qualite": f(r[7]), "pred_opacite": f(r[8]),
+        "pred_matiere": f(r[9]) * 10 if r[9] is not None else None,   # echelle /10 comme /eau/photos
+        "bac_vide_prob": f(r[10]), "modele": r[11], "motif": r[12],
+    } for r in rows]
+    return {"photos": photos, "restantes": int(rows[0][13]) if rows else 0}
+
+
+@app.get("/eau/a_verifier/stats")
+def eau_a_verifier_stats(request: Request, jours: int = Query(90, ge=7, le=365)):
+    """Suivi de la relecture (super admin) : photos validees sur 7 jours, et erreur moyenne du
+    modele sur l'echantillon note a l'aveugle (ecart entre la note humaine et la prediction)."""
+    _require_super_admin(request)
+    rows = executer_requete_sql(f"""
+      SELECT count(*) FILTER (WHERE u.validated_at >= now() - interval '7 days'),
+             count(*) FILTER (WHERE {_VERIF_SQL_ECHANTILLON} AND u.corr_qualite_eau IS NOT NULL),
+             AVG(abs(u.corr_qualite_eau - u.pred_qualite_eau)) FILTER (WHERE {_VERIF_SQL_ECHANTILLON}),
+             AVG(abs(u.corr_opacite - u.pred_opacite)) FILTER (WHERE {_VERIF_SQL_ECHANTILLON})
+      FROM urls_images u
+      WHERE u.validated_at >= now() - make_interval(days => %s)
+        AND u.pred_qualite_eau IS NOT NULL;
+    """, (_VERIF_ECHANTILLON_PCT, _VERIF_ECHANTILLON_PCT, _VERIF_ECHANTILLON_PCT, jours))
+    r = rows[0] if rows else (0, 0, None, None)
+    return {
+        "validees_7j": int(r[0] or 0),
+        "echantillon_notees": int(r[1] or 0),
+        "erreur_qualite": round(float(r[2]), 2) if r[2] is not None else None,
+        "erreur_opacite": round(float(r[3]), 2) if r[3] is not None else None,
+        "jours": jours,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Assistant SAV (Wardian) - proxy backend SSE
 # ---------------------------------------------------------------------------
 # La cle Wardian (wsk_...) est un SECRET serveur : elle ne doit JAMAIS etre
