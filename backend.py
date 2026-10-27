@@ -6560,6 +6560,7 @@ _ADMIN_ONLY_ROUTES.update({
     ("GET", "/rapport/mensuel"),
     ("GET", "/rapport/mensuel/html"),
     ("GET", "/rapport/mensuel/clients"),
+    ("GET", "/rapport/mensuel/lot"),
 })
 _RAPPORT_PRIX_M3_DEFAUT = _PRIX_EAU_M3     # EUR / m3 : même prix que les économies de l'appli (PRIX_EAU_M3), surchargeable par RAPPORT_PRIX_M3
 _RAPPORT_PISCINE_OLYMPIQUE_M3 = 2500.0    # equivalence « piscine olympique »
@@ -6964,7 +6965,7 @@ def rapport_mensuel(client: str, mois: str) -> dict:
         "heures_ecartees": annee["heures_ecartees"],
     }
 
-    return {
+    res = {
         "client": stations[0]["client"],
         "mois": f"{debut.year:04d}-{debut.month:02d}",
         "periode": {"debut": debut.isoformat(), "fin_exclue": fin.isoformat(),
@@ -6987,6 +6988,229 @@ def rapport_mensuel(client: str, mois: str) -> dict:
             "source": "mesures_aggregate (horaire)",
         },
         "genere_le": maintenant.replace(microsecond=0).isoformat(),
+    }
+    res.update(_rapport_analyse(res, stations, debut, fin))
+    return res
+
+
+# ------------------- Analyse : ce que le rapport peut affirmer -------------------
+# Regles validees par Romain le 2026-10-27 (docs/RAPPORT_MENSUEL_ADAPTATIF.md) :
+# - eau « fiable » pour une station = compteur renvoi > 0, compteur d'appoint > 0 et
+#   appoint <= renvoi. Un appoint a zero donne un faux 100 % : la station est exclue
+#   des chiffres d'eau (mais garde sa qualite d'eau) et le rapport passe « a relire ».
+# - le titre de couverture est choisi par ordre de priorite (record, objectif,
+#   progression...), une variation n'est donnee que si le mois precedent depasse
+#   _RAPPORT_VOLUME_MIN_M3 ;
+# - statut : « pret » (aucune alerte), « a_relire » (au moins une alerte), « pas_d_envoi »
+#   (rien de fiable a montrer). Rien n'est envoye automatiquement.
+_RAPPORT_OBJECTIF_TAUX = 80.0
+_RAPPORT_VOLUME_MIN_M3 = 20.0          # en dessous : mois calme, pas de variation calculee
+_RAPPORT_RECORD_MIN_M3 = 50.0
+_RAPPORT_COUVERTURE_ALERTE_PCT = 70.0
+_RAPPORT_QUALITE_BONNE_PCT = 90.0
+_RAPPORT_QUALITE_MAUVAISE_PCT = 50.0
+_RAPPORT_HISTO_MOIS = 6
+_RAPPORT_EQUIV = {"douche_l": 60.0, "foyer_m3_an": 150.0, "lavage_l": 150.0, "bouteille_l": 1.5}
+
+_RAPPORT_SQL_EAU_GRAIN = """
+SELECT trim(nom_automate)                                  AS nom,
+       date_trunc(%(grain)s, rounded_timestamp)            AS periode,
+       COALESCE(sum(compteur_eau_renvoi)  FILTER (WHERE ok), 0) AS renvoi,
+       COALESCE(sum(compteur_eau_adoucie) FILTER (WHERE ok), 0) AS adoucie
+FROM (
+    SELECT nom_automate, rounded_timestamp, compteur_eau_renvoi, compteur_eau_adoucie,
+           COALESCE(compteur_eau_renvoi  BETWEEN 0 AND %(max_m3)s
+                AND compteur_eau_adoucie BETWEEN 0 AND %(max_m3)s, false) AS ok
+    FROM   mesures_aggregate
+    WHERE  nom_automate = ANY(%(noms)s)
+      AND  rounded_timestamp >= %(debut)s
+      AND  rounded_timestamp <  %(fin)s
+) x
+GROUP BY 1, 2
+"""
+
+
+def _rapport_eau_par(stations: list, debut: dt.datetime, fin: dt.datetime, grain: str) -> dict:
+    """{(station, periode naive): (renvoi, adoucie)} par mois ou par jour."""
+    rows = _rapport_sql(_RAPPORT_SQL_EAU_GRAIN, {"grain": grain, "noms": _rapport_noms_sql(stations),
+                                                 "debut": debut, "fin": fin, "max_m3": _RAPPORT_MAX_M3_HEURE})
+    out = {}
+    for nom, periode, renvoi, adoucie in rows:
+        k = (nom, _rapport_naif(periode))
+        r0, a0 = out.get(k, (0.0, 0.0))
+        out[k] = (r0 + float(renvoi), a0 + float(adoucie))
+    return out
+
+
+def _rapport_eau_fiable(renvoi: float, adoucie: float) -> bool:
+    return renvoi > 0 and adoucie > 0 and adoucie <= renvoi
+
+
+def _rapport_analyse_station(s: dict) -> dict:
+    """Fiabilite et alertes d'une station (dict de rapport_mensuel()['stations'])."""
+    renvoi, adoucie = s["eau_renvoyee_m3"], s["eau_adoucie_m3"]
+    q = s["qualite"]
+    heures = s["heures_avec_donnees"]
+    ph = bool(heures) and q["heures_mesure_ph"] >= 0.5 * heures
+    redox = bool(heures) and q["heures_mesure_chlore"] >= 0.5 * heures
+    q_bonne = (ph and (q["ph_pct_dans_plage"] or 0) >= _RAPPORT_QUALITE_BONNE_PCT) or \
+              (redox and (q["chlore_pct_dans_plage"] or 0) >= _RAPPORT_QUALITE_BONNE_PCT)
+    q_mauvaise = (ph and (q["ph_pct_dans_plage"] or 0) < _RAPPORT_QUALITE_MAUVAISE_PCT) or \
+                 (redox and (q["chlore_pct_dans_plage"] or 0) < _RAPPORT_QUALITE_MAUVAISE_PCT)
+    alertes = []
+    if not heures:
+        alertes.append("aucune donnée reçue ce mois")
+    else:
+        if s["couverture_pct"] is not None and s["couverture_pct"] < _RAPPORT_COUVERTURE_ALERTE_PCT:
+            alertes.append(f"données reçues {_fr_nombre(s['couverture_pct'])} % du mois")
+        if s["jours_sans_donnees"] > _RAPPORT_JOURS_MUETS_MAX:
+            alertes.append(f"{s['jours_sans_donnees']} jours sans aucune donnée")
+        if renvoi <= 0:
+            alertes.append("compteur d'eau renvoyée à zéro : eau recyclée non mesurable")
+        elif adoucie <= 0:
+            alertes.append("compteur d'appoint à zéro : taux de 100 % douteux, eau exclue du rapport")
+        elif adoucie > renvoi:
+            alertes.append("appoint supérieur à l'eau renvoyée : compteurs incohérents")
+        if s["heures_ecartees"]["eau"]:
+            alertes.append(f"{s['heures_ecartees']['eau']} heure(s) de compteur d'eau écartée(s) (remise à zéro ?)")
+        if q_mauvaise:
+            alertes.append("pH ou désinfection hors plage la plupart du temps : à vérifier (sonde ou traitement)")
+    return {"eau_fiable": _rapport_eau_fiable(renvoi, adoucie), "ph": ph, "redox": redox,
+            "qualite_bonne": bool(q_bonne), "qualite_mauvaise": bool(q_mauvaise),
+            "energie": s["energie_kwh"] > 0, "alertes": alertes}
+
+
+def _rapport_analyse(r: dict, stations: list, debut: dt.datetime, fin: dt.datetime) -> dict:
+    """Ajoute au rapport : analyse (statut, titre, blocs), historique 6 mois et jours du mois.
+    Les chiffres d'eau de l'analyse ne comptent que les stations aux compteurs fiables."""
+    prix = r["parametres"]["prix_m3_eur"]
+    for s in r["stations"]:
+        s["analyse"] = _rapport_analyse_station(s)
+    fiables = [s for s in r["stations"] if s["analyse"]["eau_fiable"]]
+    noms_fiables = {s["nom_automate"] for s in fiables}
+
+    # Historique : 6 mois civils jusqu'au mois du rapport, stations-mois fiables seulement.
+    a, m = debut.year, debut.month - (_RAPPORT_HISTO_MOIS - 1)
+    while m < 1:
+        a, m = a - 1, m + 12
+    debut_histo = dt.datetime(a, m, 1)
+    debut_annee = dt.datetime(debut.year, 1, 1)
+    par_mois = _rapport_eau_par(stations, min(debut_histo, debut_annee), fin, "month")
+    cumul_ren = cumul_ado = 0.0
+    cumul_depuis = None
+    for (nom, mm), (rv, av) in sorted(par_mois.items(), key=lambda kv: kv[0][1]):
+        if mm >= debut_annee and _rapport_eau_fiable(rv, av):
+            cumul_ren, cumul_ado = cumul_ren + rv, cumul_ado + av
+            cumul_depuis = cumul_depuis or mm
+    historique = []
+    for i in range(_RAPPORT_HISTO_MOIS):
+        mm = dt.datetime(a + (m - 1 + i) // 12, (m - 1 + i) % 12 + 1, 1)
+        ren = ado = 0.0
+        for s in stations:
+            rv, av = par_mois.get((s["nom"], mm), (0.0, 0.0))
+            if _rapport_eau_fiable(rv, av):
+                ren, ado = ren + rv, ado + av
+        historique.append({"mois": f"{mm.year:04d}-{mm.month:02d}",
+                           "eau_recyclee_m3": round(ren - ado, 1) if ren else None,
+                           "taux_recyclage_pct": round(100 * (ren - ado) / ren, 1) if ren else None})
+    while historique and historique[0]["eau_recyclee_m3"] is None:
+        historique.pop(0)
+
+    # Jours du mois (stations fiables) pour le calendrier.
+    par_jour = _rapport_eau_par([s for s in stations if s["nom"] in noms_fiables], debut, fin, "day")
+    jours = []
+    d = debut
+    while d < fin:
+        rec = sum(max(rv - av, 0.0) for (nom, jj), (rv, av) in par_jour.items() if jj == d)
+        jours.append({"date": d.date().isoformat(), "eau_recyclee_m3": round(rec, 1)})
+        d += dt.timedelta(days=1)
+
+    # Chiffres d'eau fiables du mois.
+    ren = sum(s["eau_renvoyee_m3"] for s in fiables)
+    rec = sum(s["eau_renvoyee_m3"] - s["eau_adoucie_m3"] for s in fiables)
+    taux = round(100 * rec / ren, 1) if ren else None
+    prec = historique[-2]["eau_recyclee_m3"] if len(historique) >= 2 else None
+    var = round(100 * (rec - prec) / prec, 1) if (fiables and prec and prec >= _RAPPORT_VOLUME_MIN_M3) else None
+    prec_taux = historique[-2]["taux_recyclage_pct"] if len(historique) >= 2 and prec and prec >= _RAPPORT_VOLUME_MIN_M3 else None
+    autres = [h["eau_recyclee_m3"] for h in historique[:-1] if h["eau_recyclee_m3"] is not None]
+    record = bool(fiables) and len(autres) >= 2 and rec >= _RAPPORT_RECORD_MIN_M3 and rec > max(autres)
+    kwh = sum(s["energie_kwh"] for s in fiables if s["analyse"]["energie"])
+    rec_energie = sum(s["eau_renvoyee_m3"] - s["eau_adoucie_m3"] for s in fiables if s["analyse"]["energie"])
+
+    avec_donnees = [s for s in r["stations"] if s["heures_avec_donnees"]]
+    q_bonne = any(s["analyse"]["qualite_bonne"] for s in avec_donnees)
+    q_mauvaise = any(s["analyse"]["qualite_mauvaise"] for s in avec_donnees)
+    qualite = any(s["analyse"]["ph"] or s["analyse"]["redox"] for s in avec_donnees)
+
+    if fiables and rec < _RAPPORT_VOLUME_MIN_M3:
+        titre = "mois_calme"
+    elif fiables and record:
+        titre = "record"
+    elif fiables and taux is not None and taux >= _RAPPORT_OBJECTIF_TAUX:
+        titre = "objectif"
+    elif fiables and var is not None and var >= 5:
+        titre = "progression"
+    elif fiables and var is not None and var <= -15:
+        titre = "mois_calme"
+    elif fiables:
+        titre = "volume"
+    elif q_bonne and not q_mauvaise:
+        titre = "qualite"
+    else:
+        titre = None
+
+    alertes = [{"nom_automate": s["nom_automate"], "lieu": s["lieu"], "alerte": al}
+               for s in r["stations"] for al in s["analyse"]["alertes"]]
+    statut = "pas_d_envoi" if titre is None or r["periode"]["mois_en_cours"] else ("a_relire" if alertes else "pret")
+    raisons = []
+    if r["periode"]["mois_en_cours"]:
+        raisons.append("mois en cours : chiffres provisoires")
+    if titre is None:
+        raisons.append("aucune donnée fiable à montrer (ni eau recyclée, ni qualité d'eau satisfaisante)")
+
+    objectif_suivant = None
+    if taux is not None:
+        objectif_suivant = _RAPPORT_OBJECTIF_TAUX if taux < _RAPPORT_OBJECTIF_TAUX else min(float(int(taux) + 2), 95.0)
+
+    return {
+        "historique": historique,
+        "jours": jours,
+        "analyse": {
+            "statut": statut, "raisons": raisons, "titre": titre, "alertes": alertes,
+            "stations_fiables": sorted(noms_fiables),
+            "eau": {
+                "eau_recyclee_m3": round(rec, 1), "eau_renvoyee_m3": round(ren, 1), "taux_recyclage_pct": taux,
+                "economies_eur": round(rec * prix, 2), "variation_pct": var,
+                "ecart_taux_points": round(taux - prec_taux, 1) if taux is not None and prec_taux is not None else None,
+                "record": record, "energie_kwh": round(kwh, 1),
+                "kwh_par_m3_recycle": round(kwh / rec_energie, 2) if kwh and rec_energie > 0 else None,
+                "equivalences": {
+                    "douches": round(rec * 1000 / _RAPPORT_EQUIV["douche_l"]),
+                    "foyers_un_an": round(rec / _RAPPORT_EQUIV["foyer_m3_an"], 1),
+                    "bouteilles": round(rec * 1000 / _RAPPORT_EQUIV["bouteille_l"]),
+                    "lavages": round(rec * 1000 / _RAPPORT_EQUIV["lavage_l"]),
+                    "piscines_olympiques": round(rec / _RAPPORT_PISCINE_OLYMPIQUE_M3, 2),
+                    "reperes": dict(_RAPPORT_EQUIV),
+                },
+            } if fiables else None,
+            "cumul_annee": {
+                "depuis_mois": f"{cumul_depuis.year:04d}-{cumul_depuis.month:02d}" if cumul_depuis else None,
+                "eau_recyclee_m3": round(cumul_ren - cumul_ado, 1),
+                "economies_eur": round((cumul_ren - cumul_ado) * prix, 2),
+                "piscines_olympiques": round((cumul_ren - cumul_ado) / _RAPPORT_PISCINE_OLYMPIQUE_M3, 1),
+            },
+            "objectif_taux": _RAPPORT_OBJECTIF_TAUX,
+            "objectif_suivant_taux": objectif_suivant,
+            "blocs": {
+                "eau": bool(fiables),
+                "evolution": bool(fiables) and sum(1 for h in historique if h["eau_recyclee_m3"] is not None) >= 2,
+                "energie": bool(kwh),
+                "stations": len(r["stations"]) > 1,
+                "qualite": qualite,
+                "calendrier": bool(fiables) and any(j["eau_recyclee_m3"] > 0 for j in jours),
+                "interventions": True,
+            },
+        },
     }
 
 
@@ -7037,183 +7261,391 @@ def _fr_duree(h) -> str:
 
 
 _RAPPORT_CSS = """
-:root{--tq:#41AEAD;--tq-fonce:#2c7f7e;--tq-clair:#e8f5f5;--txt:#1d2b2b;--gris:#5d6b6b;--ligne:#d6e3e3;
---hausse:#1e7d4f;--baisse:#b23b3b;--alerte:#fff6e0;--alerte-bord:#e0b44c}
+:root{color-scheme:dark;--abysse:#0a2425;--bassin:#10393a;--bassin-2:#174a4b;--ligne:#245657;--eau:#5cc3c2;
+--eau-fonce:#2a8f8e;--ecume:#eef7f7;--brume:#a9caca;--corail:#f39a78;--hausse:#7fd9a4;--baisse:#f3a1a1;
+--f:'Jost','Futura','Century Gothic','Avenir Next','Segoe UI',sans-serif;--r:18px}
 *{box-sizing:border-box}
-html{background:#eef3f3}
-body{margin:0;background:#eef3f3;color:var(--txt);font:14px/1.45 "Segoe UI",Roboto,Helvetica,Arial,sans-serif}
-.page{max-width:210mm;margin:16px auto;background:#fff;padding:14mm 14mm 10mm;box-shadow:0 1px 6px rgba(0,0,0,.08)}
-header{display:flex;justify-content:space-between;align-items:flex-end;border-bottom:3px solid var(--tq);padding-bottom:10px;margin-bottom:16px;gap:12px;flex-wrap:wrap}
-.marque{font-size:26px;font-weight:700;color:var(--tq);letter-spacing:.5px}
-.marque small{display:block;font-size:12px;font-weight:400;color:var(--gris);letter-spacing:0}
-h1{font-size:20px;margin:0;text-align:right}
-h1 small{display:block;font-size:14px;font-weight:400;color:var(--gris)}
-h2{font-size:15px;color:var(--tq-fonce);margin:20px 0 8px;text-transform:uppercase;letter-spacing:.6px}
-.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
-.kpi{background:var(--tq-clair);border-radius:8px;padding:10px 12px;break-inside:avoid}
-.kpi .lib{font-size:12px;color:var(--gris)}
-.kpi .val{font-size:22px;font-weight:700;color:var(--tq-fonce);white-space:nowrap}
-.kpi .cmp{font-size:11.5px;color:var(--gris)}
-.kpis.second .kpi{background:#f6f9f9}
-.kpis.second .val{font-size:18px;color:var(--txt)}
-.var{font-weight:600}.var.hausse{color:var(--hausse)}.var.baisse{color:var(--baisse)}.var.neutre{color:var(--gris)}
-table{width:100%;border-collapse:collapse;font-size:12.5px;break-inside:auto}
-th,td{padding:5px 6px;border-bottom:1px solid var(--ligne);text-align:right;vertical-align:top}
-th{background:var(--tq);color:#fff;font-weight:600;font-size:11.5px}
-th:first-child,td:first-child,th.g,td.g{text-align:left}
-tr{break-inside:avoid}
-tfoot td{font-weight:700;border-top:2px solid var(--tq)}
-.nom{font-size:11px;color:var(--gris)}
-.drapeau{color:#9a6a00;font-weight:700}
-.alerte{background:var(--alerte);border-left:4px solid var(--alerte-bord);padding:8px 12px;margin:14px 0;font-size:12.5px;break-inside:avoid}
-.alerte ul{margin:4px 0 0;padding-left:18px}
-.vide{background:var(--tq-clair);padding:14px;border-radius:8px;text-align:center;color:var(--gris)}
-.methode{font-size:11px;color:var(--gris);margin-top:22px;border-top:1px solid var(--ligne);padding-top:8px}
-.methode p{margin:3px 0}
-.actions{max-width:210mm;margin:12px auto 0;text-align:right}
-.actions button{background:var(--tq);color:#fff;border:0;border-radius:6px;padding:8px 14px;font-size:14px;cursor:pointer}
-.tableau{overflow-x:auto}
-@media (max-width:700px){.page{padding:16px;margin:0}.kpis{grid-template-columns:repeat(2,1fr)}h1{text-align:left}
-.actions{padding:0 16px}}
-@page{size:A4;margin:12mm}
-@media print{html,body{background:#fff}.page{box-shadow:none;margin:0;padding:0;max-width:none}.actions{display:none}
-*{-webkit-print-color-adjust:exact;print-color-adjust:exact}h2{break-after:avoid}.tableau{overflow:visible}}
+html,body{background:var(--abysse)}
+body{margin:0;color:var(--ecume);font-family:var(--f);font-size:16px;line-height:1.5;padding:0 16px 48px}
+h1,h2,h3,p{margin:0}h1,h2{font-weight:500;text-wrap:balance}
+.num{font-variant-numeric:tabular-nums}
+.wrap{max-width:900px;margin:0 auto}
+.f{padding:44px 0;border-bottom:1px solid var(--ligne);display:flex;flex-direction:column;gap:28px}
+.f:last-child{border-bottom:0}
+.sur{font-size:12.5px;letter-spacing:.18em;text-transform:uppercase;color:var(--brume);font-weight:500}
+.h2{font-size:clamp(28px,4.2vw,40px);line-height:1.15}.h2 em,h1 em{font-style:normal;color:var(--eau)}
+.entete{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;padding-top:28px}
+.marque{display:flex;align-items:center;gap:10px;color:var(--eau);font-size:24px}
+.periode{text-align:right;font-size:13px;letter-spacing:.16em;text-transform:uppercase;color:var(--brume)}
+.periode b{display:block;color:var(--ecume);font-size:15px;letter-spacing:.12em;font-weight:600}
+.couv{display:grid;grid-template-columns:minmax(0,.9fr) minmax(0,1.1fr);gap:40px;align-items:center}
+.goutte{width:100%;max-width:300px;justify-self:center}.goutte svg{width:100%;height:auto;display:block}
+.couv h1{font-size:clamp(32px,5vw,50px);line-height:1.1;margin-top:10px}
+.client{font-size:16px;color:var(--brume);margin-top:16px}.client b{color:var(--ecume);font-weight:500}
+.pill{display:inline-flex;align-items:center;gap:10px;margin-top:22px;padding:8px 16px 8px 10px;border-radius:999px;background:var(--bassin);font-size:15px}
+.pill i{width:26px;height:26px;border-radius:50%;background:var(--eau);color:var(--abysse);display:grid;place-items:center;font-style:normal;font-weight:700}
+.pill.non i{background:var(--bassin-2);color:var(--ecume)}
+.trio{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));border-top:1px solid var(--ligne);border-bottom:1px solid var(--ligne)}
+.trio>div{padding:22px 22px 22px 0;display:flex;flex-direction:column;gap:6px}
+.trio>div+div{padding-left:22px;border-left:1px solid var(--ligne)}
+.gros{font-size:clamp(32px,5vw,46px);font-weight:600;line-height:1;letter-spacing:-.01em}.gros small{font-size:.55em;font-weight:500;margin-left:4px}
+.lib{font-size:15px;color:var(--brume)}.lib b{color:var(--ecume);font-weight:600}
+.var{font-size:14px;font-weight:600}.up{color:var(--hausse)}.down{color:var(--baisse)}.flat{color:var(--brume)}
+.equiv{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+.carte{background:var(--bassin);border-radius:var(--r);padding:22px 24px;display:flex;flex-direction:column;gap:8px;min-width:0}
+.eq{flex-direction:row;align-items:center;gap:18px}.eq .gros{font-size:34px}
+.note{font-size:12.5px;color:var(--brume)}
+.graph svg{display:block;width:100%;height:auto}.graph .g-etroit{display:none}
+.legende{display:flex;gap:18px;flex-wrap:wrap;font-size:13px;color:var(--brume)}
+.legende i{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+.deux{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}
+.trois{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+.st{background:var(--bassin);border-radius:var(--r);padding:20px 24px;display:grid;grid-template-columns:64px minmax(0,1.4fr) repeat(3,minmax(0,1fr));gap:18px;align-items:center}
+.st.champion{border:2px solid var(--corail)}
+.st h3{font-size:20px;font-weight:500}.st .code{font-size:13px;color:var(--brume)}
+.badge{display:inline-block;margin-top:6px;font-size:12px;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:var(--abysse);background:var(--corail);border-radius:999px;padding:3px 10px}
+.st .v{font-size:22px;font-weight:600;line-height:1.1}.st .l{font-size:13px;color:var(--brume)}
+.st .indispo{grid-column:3 / -1;font-size:14px;color:var(--brume)}
+.jauge{position:relative;height:14px;border-radius:7px;background:var(--bassin-2);margin-top:30px}
+.jauge .plage{position:absolute;top:0;bottom:0;background:var(--eau-fonce);border-radius:7px}
+.jauge .curseur{position:absolute;top:-30px;transform:translateX(-50%);font-size:14px;font-weight:600;white-space:nowrap;text-align:center}
+.jauge .curseur::after{content:"";display:block;margin:4px auto 0;width:3px;height:22px;background:var(--ecume);border-radius:2px}
+.grad{display:flex;justify-content:space-between;font-size:12px;color:var(--brume);margin-top:6px}
+.barre{height:14px;border-radius:7px;background:var(--bassin-2);overflow:hidden}.barre span{display:block;height:100%;background:var(--eau)}
+.cal{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:6px}
+.cal .js{font-size:11.5px;color:var(--brume);text-align:center;letter-spacing:.08em;text-transform:uppercase}
+.cal .j{height:42px;border-radius:8px;display:grid;place-items:center;font-size:13px}
+.cal .rec{outline:2px solid var(--corail);outline-offset:1px}
+.mot{background:var(--eau);color:var(--abysse);border-radius:var(--r);padding:30px 32px;display:flex;flex-direction:column;gap:14px}
+.mot .cit{font-size:clamp(24px,3.4vw,32px);line-height:1.2;font-weight:500}.mot p{max-width:62ch}
+.defi{border:2px dashed var(--corail);border-radius:var(--r);padding:20px 24px}.defi .sur{color:var(--corail)}
+.contact{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;font-size:14px;color:var(--brume)}.contact b{color:var(--ecume);font-weight:500}
+.methode{font-size:12.5px;color:var(--brume);max-width:80ch}
+.admin{margin-top:20px;border-radius:12px;padding:14px 18px;font-size:14px;background:#3a2f12;color:#ffe7a8;border:1px solid #8a6d1f}
+.admin.pret{background:#123a26;color:#c4f2d6;border-color:#2c7a52}.admin.pas_d_envoi{background:#3d1717;color:#ffd0d0;border-color:#8a2f2f}
+.admin ul{margin:6px 0 0;padding-left:20px}.admin b{font-weight:600}
+.actions{max-width:900px;margin:12px auto 0;text-align:right}
+.actions button{background:var(--eau);color:var(--abysse);border:0;border-radius:8px;padding:9px 16px;font:600 14px var(--f);cursor:pointer}
+@media (max-width:720px){.graph .g-large{display:none}.graph .g-etroit{display:block}.couv{grid-template-columns:1fr;gap:20px}.goutte{max-width:220px}
+.trio{grid-template-columns:1fr}.trio>div,.trio>div+div{padding:16px 0;border-left:0}.trio>div+div{border-top:1px solid var(--ligne)}
+.equiv,.deux,.trois{grid-template-columns:1fr}.periode{text-align:left}
+.st{grid-template-columns:52px repeat(3,minmax(0,1fr));column-gap:12px;row-gap:12px;padding:18px}.st .nomst{grid-column:2 / -1}
+.st svg{width:52px;height:52px;grid-row:span 2;align-self:start}.st .v{font-size:18px}.st .indispo{grid-column:2 / -1}.cal .j{height:36px;font-size:12px}}
+@page{size:A4;margin:10mm}
+@media print{body{padding:0}.actions,.admin{display:none}.f{break-inside:avoid-page}*{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
 """
+
+_RAPPORT_GOUTTE = "M135 8 C135 8 250 170 250 245 C250 312 198 362 135 362 C72 362 20 312 20 245 C20 170 135 8 135 8 Z"
+_RAPPORT_ICONES = {
+    "douche": '<path d="M4 20V9a5 5 0 0 1 10 0"/><path d="M11 9h6"/><path d="M12 13v1M15 13v1M18 13v1M13 17v1M16 17v1M19 17v1"/>',
+    "maison": '<path d="M3 11l9-7 9 7"/><path d="M5 10v10h14V10"/><path d="M10 20v-5h4v5"/>',
+    "bouteille": '<path d="M10 2h4v3l1 2v14a1 1 0 0 1-1 1h-4a1 1 0 0 1-1-1V7l1-2z"/><path d="M9 12h6"/>',
+    "voiture": '<path d="M5 17h14l-1.5-5h-11z"/><path d="M7 12l1.5-4h7l1.5 4"/><circle cx="8" cy="18.5" r="1.5"/><circle cx="16" cy="18.5" r="1.5"/>',
+}
+_RAPPORT_JOURS_FR = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+
+
+def _rapport_mois_court(mois: str) -> str:
+    courts = ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."]
+    return courts[int(mois[5:7]) - 1]
+
+
+def _rapport_goutte_svg(pct: float) -> str:
+    p = max(0.0, min(pct, 100.0)) / 100
+    y = 362 - (362 - 8) * p
+    vague = f"M-70 {y:.1f}" + " q17 -10 34 0 t34 0" * 13 + " L380 370 L-70 370 Z"
+    return (f'<svg viewBox="0 0 270 370" role="img" aria-label="Goutte remplie à {round(pct)} %">'
+            f'<defs><clipPath id="cg"><path d="{_RAPPORT_GOUTTE}"/></clipPath>'
+            '<linearGradient id="ge" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#5cc3c2"/>'
+            '<stop offset="1" stop-color="#2a8f8e"/></linearGradient></defs>'
+            f'<path d="{_RAPPORT_GOUTTE}" fill="#10393a"/><g clip-path="url(#cg)"><path d="{vague}" fill="url(#ge)"/></g>'
+            f'<path d="{_RAPPORT_GOUTTE}" fill="none" stroke="#5cc3c2" stroke-width="3"/>'
+            f'<text x="135" y="258" text-anchor="middle" font-family="Jost, sans-serif" font-size="80" font-weight="600" fill="#eef7f7">{round(pct)}%</text></svg>')
+
+
+def _rapport_graph_svg(hist: list, W: int = 840, classe: str = "") -> str:
+    """Barres : eau recyclee (m3) ; courbe : taux (%). Echelles explicites, labels dans le cadre."""
+    pts = [h for h in hist if h["eau_recyclee_m3"] is not None]
+    H, gl, gr, gt, gb = 300, (60 if W > 600 else 44), (60 if W > 600 else 46), 30, 36
+    iw, ih, n = W - gl - gr, H - gt - gb, len(pts)
+    vmax = max(h["eau_recyclee_m3"] for h in pts)
+    pas = 50 if vmax <= 200 else 100 if vmax <= 500 else 250 if vmax <= 1500 else 500 if vmax <= 4000 else 1000
+    vmax = max(pas, -(-vmax // pas) * pas)
+    taux = [h["taux_recyclage_pct"] for h in pts if h["taux_recyclage_pct"] is not None]
+    tmin = max(0, min(taux) // 10 * 10 - 10) if taux else 0
+    tmax = min(100, -(-max(taux) // 10) * 10 + 10) if taux else 100
+    tmax = tmax if tmax > tmin else tmin + 10
+    X = lambda i: gl + iw / n * (i + 0.5)
+    Yv = lambda v: gt + ih - v / vmax * ih
+    Yt = lambda t: gt + ih - (t - tmin) / (tmax - tmin) * ih
+    bw = iw / n * 0.52
+    s = [f'<svg class="{classe}" viewBox="0 0 {W} {H}" role="img" aria-label="Eau recyclée et taux de recyclage par mois">']
+    v = 0
+    while v <= vmax:
+        s.append(f'<line x1="{gl}" x2="{W - gr}" y1="{Yv(v):.1f}" y2="{Yv(v):.1f}" stroke="#245657"/>'
+                 f'<text x="{gl - 10}" y="{Yv(v) + 4:.1f}" text-anchor="end" font-size="12" fill="#a9caca">{_fr_nombre(v)}</text>')
+        v += pas
+    t = tmin
+    while t <= tmax:
+        s.append(f'<text x="{W - gr + 10}" y="{Yt(t) + 4:.1f}" font-size="12" fill="#f39a78">{int(t)} %</text>')
+        t += 10
+    for i, h in enumerate(pts):
+        der = i == n - 1
+        y = Yv(h["eau_recyclee_m3"])
+        coul = "#eef7f7" if der else "#a9caca"
+        s.append(f'<rect x="{X(i) - bw / 2:.1f}" y="{y:.1f}" width="{bw:.1f}" height="{gt + ih - y:.1f}" rx="6" fill="{"#5cc3c2" if der else "#174a4b"}"/>'
+                 f'<text x="{X(i):.1f}" y="{y - 8:.1f}" text-anchor="middle" font-size="13" font-weight="{600 if der else 400}" fill="{coul}">{_fr_nombre(h["eau_recyclee_m3"])}</text>'
+                 f'<text x="{X(i):.1f}" y="{H - 12}" text-anchor="middle" font-size="13" fill="{coul}">{_rapport_mois_court(h["mois"])}</text>')
+    lt = [(X(i), Yt(h["taux_recyclage_pct"])) for i, h in enumerate(pts) if h["taux_recyclage_pct"] is not None]
+    if len(lt) >= 2:
+        s.append('<polyline points="' + " ".join(f"{x:.1f},{y:.1f}" for x, y in lt)
+                 + '" fill="none" stroke="#f39a78" stroke-width="2.5" stroke-linejoin="round"/>')
+    for k, (x, y) in enumerate(lt):
+        der = k == len(lt) - 1
+        s.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{5.5 if der else 3.5}" fill="{"#f39a78" if der else "#0a2425"}" stroke="#f39a78" stroke-width="2"/>')
+    s.append("</svg>")
+    return "".join(s).replace("<text ", '<text font-family="Jost, sans-serif" ')
+
+
+def _rapport_anneau_svg(pct) -> str:
+    c = 2 * 3.14159 * 26
+    arc = (f'<circle cx="32" cy="32" r="26" fill="none" stroke="#5cc3c2" stroke-width="7" stroke-linecap="round" '
+           f'stroke-dasharray="{c * pct / 100:.1f} {c:.1f}" transform="rotate(-90 32 32)"/>') if pct is not None else ""
+    txt = f"{round(pct)}%" if pct is not None else "—"
+    return (f'<svg width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="Taux de recyclage {txt}">'
+            '<circle cx="32" cy="32" r="26" fill="none" stroke="#174a4b" stroke-width="7"/>' + arc +
+            f'<text x="32" y="37" text-anchor="middle" font-size="15" font-weight="600" fill="#eef7f7" font-family="Jost, sans-serif">{txt}</text></svg>')
 
 
 def rapport_mensuel_html(r: dict) -> str:
+    """Rapport client « Impact » (fond eau profonde, charte Eaukey). Chaque bloc ne
+    s'affiche que si l'analyse a des donnees fiables pour lui. Le bandeau de statut
+    (pret / a relire / pas d'envoi) est reserve a l'equipe : masque a l'impression."""
     e = _rapport_html.escape
-    t, cmp_, cum, par = r["total"], r["comparaison_mois_precedent"], r["cumul_annee"], r["parametres"]
-    v = cmp_["variations_pct"]
+    an = r["analyse"]
+    eau, blocs = an["eau"], an["blocs"]
+    t = r["total"]
     mois_txt = _fr_mois(r["mois"])
-    prec_txt = _fr_mois(cmp_["mois"])
-
-    def nom_station(s):
-        if s["lieu"]:
-            return f'{e(s["lieu"])}<div class="nom">{e(s["nom_automate"])}</div>'
-        return e(s["nom_automate"])
-
-    def kpi(lib, val, cmp_html=""):
-        return (f'<div class="kpi"><div class="lib">{lib}</div><div class="val">{val}</div>'
-                f'<div class="cmp">{cmp_html}</div></div>')
-
-    vs = f"vs {e(prec_txt)} : "
-    ecart = cmp_["ecart_taux_recyclage_points"]
-    ecart_html = ('<span class="var neutre">—</span>' if ecart is None else
-                  f'<span class="var {"hausse" if ecart > 0 else "baisse" if ecart < 0 else "neutre"}">'
-                  f'{"+" if ecart > 0 else "−" if ecart < 0 else ""}{_fr_nombre(abs(ecart), 1)} pt</span>')
-    piscines = t["equivalent_piscines_olympiques"]
-    parts = []
-    parts.append(f"""<!doctype html><html lang="fr"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Rapport Eaukey {e(mois_txt)}</title><style>{_RAPPORT_CSS}</style></head><body>
-<div class="actions"><button onclick="window.print()">Imprimer / enregistrer en PDF</button></div>
-<div class="page">
-<header><div class="marque">Eaukey<small>Recyclage de l'eau des stations de lavage</small></div>
-<h1>Rapport de performance – {e(mois_txt)}<small>{e(r["client"])} · {r["nb_stations"]} station{"s" if r["nb_stations"] > 1 else ""}</small></h1></header>
-""")
-    if r["periode"]["mois_en_cours"]:
-        parts.append('<div class="alerte">Mois en cours : chiffres provisoires, arrêtés à la date de génération.</div>')
-    if r["aucune_donnee"]:
-        parts.append(f'<div class="vide">Aucune donnée n\'a été reçue de vos stations en {e(mois_txt)}.</div>')
-    else:
-        parts.append('<h2>Chiffres clés du mois</h2><div class="kpis">')
-        parts.append(kpi("Eau recyclée", f"{_fr_nombre(t['eau_recyclee_m3'])} m³", vs + _fr_var(v["eau_recyclee_m3"])))
-        parts.append(kpi("Taux de recyclage", _fr_pct(t["taux_recyclage_pct"]), vs + ecart_html))
-        parts.append(kpi("Économies estimées", _fr_eur(t["economies_eur"]), vs + _fr_var(v["economies_eur"])))
-        parts.append(kpi("Piscines olympiques", _fr_nombre(piscines, 2 if piscines < 10 else 1),
-                         f"1 piscine = {_fr_nombre(par['piscine_olympique_m3'])} m³"))
-        parts.append('</div><div class="kpis second" style="margin-top:10px">')
-        parts.append(kpi("Énergie consommée", f"{_fr_nombre(t['energie_kwh'])} kWh", vs + _fr_var(v["energie_kwh"])))
-        kpm = t["kwh_par_m3_recycle"]
-        parts.append(kpi("kWh par m³ recyclé", "—" if kpm is None else _fr_nombre(kpm, 2)))
-        parts.append(kpi("Jours avec lavage", _fr_nombre(t["jours_avec_lavage"]),
-                         f"cumulés sur {r['nb_stations']} station{'s' if r['nb_stations'] > 1 else ''}"))
-        parts.append(kpi("Données reçues", _fr_pct(t["couverture_pct"]), "des heures du mois"))
-        parts.append('</div>')
-
-    if t["donnees_incompletes"]:
-        items = "".join(
-            f'<li><b>{e(s["lieu"] or s["nom_automate"])}</b> : {e(" ; ".join(s["motifs_incompletude"]))}</li>'
-            for s in r["stations"] if s["donnees_incompletes"])
-        parts.append('<div class="alerte"><b>Données incomplètes</b> – les chiffres ci-dessous ne comptent que '
-                     f'les périodes où les stations ont transmis leurs mesures (rien n\'est extrapolé).<ul>{items}</ul></div>')
-
-    # Detail par station
-    parts.append('<h2>Détail par station</h2><div class="tableau"><table><thead><tr><th>Station</th>'
-                 '<th>Eau recyclée</th><th>Taux</th><th>Économies</th><th>kWh</th><th>Jours lavage</th>'
-                 f'<th>Données</th><th>vs {e(prec_txt)}</th></tr></thead><tbody>')
-    for s in r["stations"]:
-        flag = ' <span class="drapeau" title="Données incomplètes">⚠</span>' if s["donnees_incompletes"] else ""
-        parts.append(
-            f'<tr><td>{nom_station(s)}</td><td>{_fr_nombre(s["eau_recyclee_m3"])} m³</td>'
-            f'<td>{_fr_pct(s["taux_recyclage_pct"])}</td><td>{_fr_eur(s["economies_eur"])}</td>'
-            f'<td>{_fr_nombre(s["energie_kwh"])}</td><td>{s["jours_avec_lavage"]}</td>'
-            f'<td>{_fr_pct(s["couverture_pct"], 0)}{flag}</td><td>{_fr_var(s["variation_eau_recyclee_pct"])}</td></tr>')
-    if r["nb_stations"] > 1:
-        parts.append(
-            f'<tfoot><tr><td>Total</td><td>{_fr_nombre(t["eau_recyclee_m3"])} m³</td>'
-            f'<td>{_fr_pct(t["taux_recyclage_pct"])}</td><td>{_fr_eur(t["economies_eur"])}</td>'
-            f'<td>{_fr_nombre(t["energie_kwh"])}</td><td>{t["jours_avec_lavage"]}</td>'
-            f'<td>{_fr_pct(t["couverture_pct"], 0)}</td><td>{_fr_var(v["eau_recyclee_m3"])}</td></tr></tfoot>')
-    parts.append('</tbody></table></div>')
-
-    # Qualite de l'eau
+    mois_nom = _RAPPORT_MOIS_FR[int(r["mois"][5:7]) - 1]
+    hist = r["historique"]
+    prec_court = _rapport_mois_court(hist[-2]["mois"]) if len(hist) >= 2 else None
     q = t["qualite"]
-    parts.append(
-        '<h2>Qualité de l\'eau</h2><div class="tableau"><table><thead><tr><th>Station</th><th>pH moyen</th>'
-        f'<th>pH dans la plage ({_fr_nombre(par["plage_ph"][0], 1)}–{_fr_nombre(par["plage_ph"][1], 1)})</th>'
-        '<th>Désinfection : redox moyen (mV)</th>'
-        f'<th>Temps désinfecté (≥ {_fr_nombre(par["seuil_redox_mv"], 0)} mV)</th>'
-        '</tr></thead><tbody>')
-    for s in r["stations"]:
-        sq = s["qualite"]
-        parts.append(f'<tr><td>{nom_station(s)}</td><td>{_fr_nombre(sq["ph_moyen"], 2)}</td>'
-                     f'<td>{_fr_pct(sq["ph_pct_dans_plage"])}</td><td>{_fr_nombre(sq["redox_moyen_mv"], 0)}</td>'
-                     f'<td>{_fr_pct(sq["chlore_pct_dans_plage"])}</td></tr>')
-    if r["nb_stations"] > 1:
-        parts.append(f'<tfoot><tr><td>Ensemble</td><td>{_fr_nombre(q["ph_moyen"], 2)}</td>'
-                     f'<td>{_fr_pct(q["ph_pct_dans_plage"])}</td><td>{_fr_nombre(q["redox_moyen_mv"], 0)}</td>'
-                     f'<td>{_fr_pct(q["chlore_pct_dans_plage"])}</td></tr></tfoot>')
-    parts.append('</tbody></table></div>')
+    n = r["nb_stations"]
+    jours_lavage = sum(s["jours_avec_lavage"] for s in r["stations"] if s["analyse"]["eau_fiable"])
+    plusieurs = len(an["stations_fiables"]) > 1
+    out = []
 
-    # Interventions
+    def var_html(v, inverse=False, suffixe=" %"):
+        if v is None:
+            return ""
+        bon = v < 0 if inverse else v > 0
+        cls = "flat" if v == 0 else ("up" if bon else "down")
+        signe = "+" if v > 0 else ("−" if v < 0 else "")
+        return f'<span class="var {cls}">{signe}{_fr_nombre(abs(v), 1).replace(",0", "")}{suffixe} vs {prec_court}</span>'
+
+    out.append(f"""<!doctype html><html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rapport Eaukey {e(mois_txt)} – {e(r["client"])}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Jost:wght@300;400;500;600;700&display=swap">
+<style>{_RAPPORT_CSS}</style></head><body>
+<div class="actions"><button onclick="window.print()">Imprimer / enregistrer en PDF</button></div>
+<div class="wrap">""")
+
+    # Bandeau equipe (jamais imprime)
+    libelle = {"pret": "Prêt à envoyer", "a_relire": "À relire avant envoi", "pas_d_envoi": "Pas d'envoi possible"}[an["statut"]]
+    items = "".join(f"<li>{e(x)}</li>" for x in an["raisons"])
+    items += "".join(f"<li><b>{e(a['lieu'] or a['nom_automate'])}</b> : {e(a['alerte'])}</li>" for a in an["alertes"])
+    out.append(f'<div class="admin {an["statut"]}"><b>{libelle}</b> (visible par l\'équipe Eaukey seulement, '
+               f'non imprimé){"<ul>" + items + "</ul>" if items else ""}</div>')
+
+    out.append(f"""<header class="entete"><div class="marque" aria-label="Eaukey">
+<svg width="24" height="34" viewBox="0 0 26 36" aria-hidden="true"><path d="M13 2 L23 22 Q24 25 22 28 L18 34 L8 34 L4 28 Q2 25 3 22 Z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/><path d="M8 27 L13 31 L18 27" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+<span>Eaukey</span></div><div class="periode">Votre impact<b>{e(mois_txt)}</b></div></header>""")
+
+    # 1. Couverture
+    titre = an["titre"]
+    if eau:
+        m3 = _fr_nombre(eau["eau_recyclee_m3"])
+        taux = eau["taux_recyclage_pct"]
+        goutte = _rapport_goutte_svg(taux)
+        h1 = {
+            "record": ("Votre meilleur mois", f"Record battu : <em>{m3} m³</em> d'eau recyclée en {mois_nom}."),
+            "objectif": ("Eau réutilisée ce mois-ci", ("Presque toute l'eau utilisée pour laver vos clients a <em>déjà servi</em>."
+                         if taux >= 95 else f"{int(taux // 10)} litres sur 10 utilisés pour laver vos clients ont <em>déjà servi</em>.")),
+            "progression": ("En progression", f"<em>+{_fr_nombre(eau['variation_pct'], 0)} %</em> d'eau recyclée par rapport au mois dernier."),
+            "volume": ("Eau réutilisée ce mois-ci", f"<em>{m3} m³</em> d'eau recyclée, sans puiser dans le réseau."),
+            "mois_calme": ("Un mois plus calme", f"Déjà <em>{_fr_nombre(an['cumul_annee']['eau_recyclee_m3'])} m³</em> recyclés depuis janvier."),
+        }[titre]
+        atteint = taux >= an["objectif_taux"]
+        pill = (f'<div class="pill{"" if atteint else " non"}"><i aria-hidden="true">{"✓" if atteint else "→"}</i>'
+                f'Objectif Eaukey {_fr_nombre(an["objectif_taux"])} % : <b>&nbsp;{"atteint" if atteint else "en route"}</b></div>')
+        trio = (f'<div><span class="gros num">{m3}<small>m³</small></span><span class="lib">d\'eau recyclée</span>{var_html(eau["variation_pct"])}</div>'
+                f'<div><span class="gros num">{_fr_nombre(eau["economies_eur"])}<small>€</small></span><span class="lib">économisés sur l\'eau</span>{var_html(eau["variation_pct"])}</div>'
+                f'<div><span class="gros num">{_fr_nombre(taux, 1).replace(",0", "")}<small>%</small></span><span class="lib">taux de recyclage</span>'
+                f'{var_html(eau["ecart_taux_points"], suffixe=" pt")}</div>')
+    else:
+        pct_q = q["chlore_pct_dans_plage"] if q["chlore_pct_dans_plage"] is not None else q["ph_pct_dans_plage"]
+        goutte = _rapport_goutte_svg(pct_q or 0)
+        h1 = ("Qualité de l'eau", "Une eau <em>saine et désinfectée</em>, tout le mois.") if titre == "qualite" else \
+             ("Votre mois", "Le suivi de vos stations ce mois-ci.")
+        pill = ""
+        trio = (f'<div><span class="gros num">{_fr_nombre(q["ph_moyen"], 1) if q["ph_moyen"] else "—"}</span><span class="lib">pH moyen</span></div>'
+                f'<div><span class="gros num">{_fr_nombre(q["chlore_pct_dans_plage"] or 0)}<small>%</small></span><span class="lib">du temps désinfectée</span></div>'
+                f'<div><span class="gros num">{_fr_nombre(t["couverture_pct"] or 0)}<small>%</small></span><span class="lib">des heures suivies à distance</span></div>')
+    out.append(f"""<section class="f"><div class="couv"><div class="goutte">{goutte}</div><div>
+<p class="sur">{h1[0]}</p><h1>{h1[1]}</h1>
+<p class="client"><b>{e(r["client"])}</b> · {n} station{"s" if n > 1 else ""}</p>{pill}</div></div>
+<div class="trio">{trio}</div></section>""")
+
+    # 2. Equivalences
+    if blocs["eau"]:
+        eq = eau["equivalences"]
+        cartes = [(_fr_nombre(round(eq["douches"], -2)), "douches de 5 minutes", "douche"),
+                  (_fr_nombre(eq["foyers_un_an"], 1), "foyers alimentés pendant un an", "maison"),
+                  (_fr_nombre(round(eq["bouteilles"], -3)), "bouteilles d'eau de 1,5 L", "bouteille"),
+                  (_fr_nombre(round(eq["lavages"], -1)), "lavages de voiture", "voiture")]
+        out.append(f'<section class="f"><div><p class="sur">Pour se représenter</p><h2 class="h2">Ce que représentent '
+                   f'<em>{_fr_nombre(eau["eau_recyclee_m3"])} m³</em></h2></div><div class="equiv">')
+        for v, lib, ico in cartes:
+            out.append(f'<div class="carte eq"><svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#5cc3c2" '
+                       f'stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{_RAPPORT_ICONES[ico]}</svg>'
+                       f'<div><div class="gros num">{v}</div><div class="lib">{lib}</div></div></div>')
+        rp = eq["reperes"]
+        out.append(f'</div><p class="note">Repères : une douche de 5 minutes = {_fr_nombre(rp["douche_l"])} L ; un foyer = '
+                   f'{_fr_nombre(rp["foyer_m3_an"])} m³ par an ; un lavage de voiture = {_fr_nombre(rp["lavage_l"])} L ; '
+                   f'une bouteille = 1,5 L ; une piscine olympique = {_fr_nombre(_RAPPORT_PISCINE_OLYMPIQUE_M3)} m³ '
+                   f'({_fr_nombre(eq["piscines_olympiques"], 2)} ce mois-ci).</p></section>')
+
+    # 3. Evolution
+    if blocs["evolution"] or blocs["energie"]:
+        vals = [h["eau_recyclee_m3"] for h in hist if h["eau_recyclee_m3"] is not None]
+        meilleur = eau and eau["record"]
+        titre_evo = "Votre <em>meilleur mois</em> depuis {}".format("le début du suivi") if meilleur else \
+                    "Votre recyclage, <em>mois après mois</em>"
+        out.append(f'<section class="f"><div><p class="sur">Évolution</p><h2 class="h2">{titre_evo}</h2></div>')
+        if blocs["evolution"]:
+            out.append(f'<div class="carte graph">{_rapport_graph_svg(hist, 840, "g-large")}{_rapport_graph_svg(hist, 400, "g-etroit")}<div class="legende">'
+                       '<span><i style="background:#5cc3c2"></i>Eau recyclée (m³)</span>'
+                       '<span><i style="background:#f39a78"></i>Taux de recyclage (%)</span></div></div>')
+        out.append('<div class="deux">')
+        out.append(f'<div class="carte"><span class="sur">Économies du mois</span><span class="gros num">{_fr_nombre(eau["economies_eur"])}<small>€</small></span>'
+                   f'<span class="lib">sur la base de {_fr_nombre(r["parametres"]["prix_m3_eur"], 2)} € le m³ d\'eau de ville</span></div>')
+        if blocs["energie"]:
+            out.append(f'<div class="carte"><span class="sur">Énergie</span><span class="gros num">{_fr_nombre(eau["kwh_par_m3_recycle"], 2)}<small>kWh/m³</small></span>'
+                       f'<span class="lib">{_fr_nombre(eau["energie_kwh"])} kWh consommés pour recycler</span></div>')
+        else:
+            out.append(f'<div class="carte"><span class="sur">Lavages</span><span class="gros num">{jours_lavage}<small>jours</small></span>'
+                       f'<span class="lib">avec de l\'eau recyclée{" (cumul de vos stations)" if plusieurs else ""}</span></div>')
+        out.append('</div></section>')
+
+    # 4. Stations
+    if blocs["stations"]:
+        fiables = [s for s in r["stations"] if s["analyse"]["eau_fiable"]]
+        champion = max(fiables, key=lambda s: s["eau_recyclee_m3"]) if len(fiables) > 1 else None
+        out.append('<section class="f"><div><p class="sur">Vos stations</p><h2 class="h2">Station par station</h2></div><div style="display:flex;flex-direction:column;gap:12px">')
+        for s in sorted(r["stations"], key=lambda s: (not s["analyse"]["eau_fiable"], -s["eau_recyclee_m3"])):
+            nom = e(s["lieu"] or s["nom_automate"])
+            code = e(s["nom_automate"][:-2] if s["nom_automate"].endswith(".0") else s["nom_automate"])
+            badge = '<span class="badge">Station du mois</span>' if s is champion else ""
+            if s["analyse"]["eau_fiable"]:
+                rec_s = s["eau_renvoyee_m3"] - s["eau_adoucie_m3"]
+                taux_s = 100 * rec_s / s["eau_renvoyee_m3"]
+                v = s["variation_eau_recyclee_pct"]
+                corps = (f'<div><div class="v num">{_fr_nombre(rec_s)} m³</div><div class="l">recyclés</div></div>'
+                         f'<div><div class="v num">{_fr_nombre(rec_s * r["parametres"]["prix_m3_eur"])} €</div><div class="l">économisés</div></div>'
+                         f'<div><div class="v num">{s["jours_avec_lavage"]} j</div><div class="l">de lavage</div></div>')
+                ring = _rapport_anneau_svg(taux_s)
+            else:
+                ring = _rapport_anneau_svg(None)
+                qs = s["qualite"]
+                det = f' · eau désinfectée {_fr_nombre(qs["chlore_pct_dans_plage"])} % du temps' if qs["chlore_pct_dans_plage"] is not None else ""
+                corps = f'<div class="indispo">Mesure de l\'eau recyclée indisponible ce mois-ci{det}.</div>'
+            out.append(f'<article class="st{" champion" if s is champion else ""}">{ring}<div class="nomst"><h3>{nom}</h3>'
+                       f'<div class="code">Automate {code}</div>{badge}</div>{corps}</article>')
+        out.append('</div></section>')
+
+    # 5. Qualite, calendrier, interventions
+    out.append('<section class="f"><div><p class="sur">Qualité et suivi</p><h2 class="h2">')
+    out.append("Une eau <em>saine et désinfectée</em>" if (blocs["qualite"] and not any(
+        s["analyse"]["qualite_mauvaise"] for s in r["stations"])) else "Le suivi de vos stations")
+    out.append("</h2></div>")
+    if blocs["qualite"]:
+        cartes = []
+        if q["ph_moyen"] is not None:
+            pos = lambda v: max(0, min(100, (v - 5) / 5 * 100))
+            cartes.append(f'<div class="carte"><span class="sur">pH moyen</span><div class="jauge">'
+                          f'<span class="plage" style="left:{pos(_RAPPORT_PH_MIN):.0f}%;width:{pos(_RAPPORT_PH_MAX) - pos(_RAPPORT_PH_MIN):.0f}%"></span>'
+                          f'<span class="curseur num" style="left:{pos(q["ph_moyen"]):.1f}%">{_fr_nombre(q["ph_moyen"], 1)}</span></div>'
+                          '<div class="grad"><span>5</span><span>6</span><span>7</span><span>8</span><span>9</span><span>10</span></div>'
+                          f'<span class="lib"><b class="num">{_fr_nombre(q["ph_pct_dans_plage"], 1)} %</b> du temps dans la plage idéale '
+                          f'({_fr_nombre(_RAPPORT_PH_MIN, 1)} à {_fr_nombre(_RAPPORT_PH_MAX, 1)})</span></div>')
+        if q["chlore_pct_dans_plage"] is not None:
+            cartes.append(f'<div class="carte"><span class="sur">Désinfection</span><span class="gros num">{_fr_nombre(q["chlore_pct_dans_plage"])}<small>%</small></span>'
+                          f'<div class="barre" aria-hidden="true"><span style="width:{q["chlore_pct_dans_plage"]:.0f}%"></span></div>'
+                          f'<span class="lib">du temps au-dessus de {_fr_nombre(_RAPPORT_REDOX_SEUIL_MV)} mV (redox moyen '
+                          f'<span class="num">{_fr_nombre(q["redox_moyen_mv"])}</span> mV)</span></div>')
+        out.append(f'<div class="deux">{"".join(cartes)}</div>')
+    if blocs["calendrier"]:
+        jours = r["jours"]
+        vmax = max(j["eau_recyclee_m3"] for j in jours)
+        i_rec = next(i for i, j in enumerate(jours) if j["eau_recyclee_m3"] == vmax)
+        d0 = dt.date.fromisoformat(jours[0]["date"])
+        cases = "".join(f'<div class="js">{x[:3]}</div>' for x in _RAPPORT_JOURS_FR) + "<div></div>" * d0.weekday()
+        for i, j in enumerate(jours):
+            x = j["eau_recyclee_m3"]
+            bg, fg = (("#5cc3c2", "#0a2425") if x >= vmax * 0.85 else ("#3f9a99", "#eef7f7") if x >= vmax * 0.6
+                      else ("#2d6e6e", "#eef7f7") if x >= vmax * 0.35 else ("#174a4b", "#a9caca"))
+            cases += f'<div class="j{" rec" if i == i_rec else ""}" style="background:{bg};color:{fg}">{i + 1}</div>'
+        jr = dt.date.fromisoformat(jours[i_rec]["date"])
+        out.append(f'<div class="carte"><span class="sur">Le mois jour par jour</span><div class="cal">{cases}</div>'
+                   f'<span class="lib">Record le <b style="color:#f39a78">{_RAPPORT_JOURS_FR[jr.weekday()]} {jr.day}</b> avec '
+                   f'{_fr_nombre(vmax)} m³ recyclés · {jours_lavage} jours de lavage'
+                   f'{" (cumul de vos stations)" if plusieurs else ""}.</span></div>')
     p = t["pannes"]
-    parts.append('<h2>Interventions</h2><div class="kpis second">')
-    parts.append(kpi("Pannes signalées", str(p["ouvertes_dans_le_mois"])))
-    parts.append(kpi("Pannes résolues", str(p["resolues_dans_le_mois"])))
-    parts.append(kpi("Délai moyen de résolution", _fr_duree(p["delai_moyen_resolution_h"])))
-    parts.append(kpi("Déplacements sur site", str(p["deplacements"]),
-                     f"{p['en_cours_fin_de_mois']} en cours en fin de mois"))
-    parts.append('</div>')
-    if r["pannes_du_mois"]:
-        noms = {s["nom_automate"]: (s["lieu"] or s["nom_automate"]) for s in r["stations"]}
-        parts.append('<div class="tableau" style="margin-top:10px"><table><thead><tr><th>Station</th><th class="g">Type</th>'
-                     '<th>Début</th><th>Fin</th><th>Durée</th></tr></thead><tbody>')
-        for pn in r["pannes_du_mois"]:
-            parts.append(f'<tr><td>{e(noms.get(pn["nom_automate"], pn["nom_automate"]))}</td><td class="g">{e(pn["type"] or "—")}</td>'
-                         f'<td>{_fr_date(pn["date_debut"])}</td><td>{_fr_date(pn["date_fin"]) if pn["date_fin"] else "en cours"}</td>'
-                         f'<td>{_fr_duree(pn["duree_h"])}</td></tr>')
-        parts.append('</tbody></table></div>')
+    interv = (f'{p["ouvertes_dans_le_mois"]} panne{"s" if p["ouvertes_dans_le_mois"] > 1 else ""} signalée{"s" if p["ouvertes_dans_le_mois"] > 1 else ""} ce mois-ci'
+              + (f' · {p["resolues_dans_le_mois"]} résolue{"s" if p["resolues_dans_le_mois"] > 1 else ""} en {_fr_duree(p["delai_moyen_resolution_h"])} en moyenne'
+                 if p["resolues_dans_le_mois"] else ""))
+    out.append(f'<div class="deux"><div class="carte"><span class="sur">Interventions</span><span class="gros num">{p["ouvertes_dans_le_mois"]}</span>'
+               f'<span class="lib">{interv}</span></div><div class="carte"><span class="sur">Suivi à distance</span>'
+               f'<span class="gros num">{_fr_nombre(t["couverture_pct"] or 0)}<small>%</small></span>'
+               '<span class="lib">des heures du mois transmises à Eaukey</span></div></div></section>')
 
-    # Cumul annee
-    parts.append(f'<h2>Depuis le début de l\'année {r["mois"][:4]}</h2><div class="kpis">')
-    parts.append(kpi("Eau recyclée", f"{_fr_nombre(cum['eau_recyclee_m3'])} m³",
-                     f"du {_fr_date(cum['depuis'])} au {_fr_date(cum['jusqu_au'])}" if cum["depuis"] else ""))
-    parts.append(kpi("Taux de recyclage", _fr_pct(cum["taux_recyclage_pct"])))
-    parts.append(kpi("Économies estimées", _fr_eur(cum["economies_eur"])))
-    parts.append(kpi("Piscines olympiques", _fr_nombre(cum["equivalent_piscines_olympiques"], 1)))
-    parts.append('</div>')
-
-    parts.append(
-        '<div class="methode">'
-        f'<p><b>Méthode.</b> Eau recyclée = eau renvoyée vers le lavage − eau d\'appoint adoucie, mesurées par les compteurs '
-        f'des stations. Taux de recyclage = eau recyclée / eau renvoyée. Économies estimées sur la base de '
-        f'{_fr_nombre(par["prix_m3_eur"], 2)} € le m³ (eau + assainissement, prix indicatif). '
-        'Données horaires, heure de Paris ; une heure sans transmission n\'est pas comptée.</p>'
-        f'<p>Rapport généré le {_fr_date(r["genere_le"])}.</p></div>')
-    parts.append('</div></body></html>')
-    return "".join(parts)
+    # 6. Bilan
+    c = an["cumul_annee"]
+    out.append(f'<section class="f"><div><p class="sur">Depuis {"janvier" if (c["depuis_mois"] or "")[5:7] == "01" else "le début du suivi"}</p>'
+               f'<h2 class="h2">Votre bilan <em>{r["mois"][:4]}</em></h2></div>')
+    if c["eau_recyclee_m3"] > 0:
+        out.append(f'<div class="trois"><div class="carte"><span class="gros num">{_fr_nombre(c["eau_recyclee_m3"])}<small>m³</small></span><span class="lib">d\'eau recyclée</span></div>'
+                   f'<div class="carte"><span class="gros num">{_fr_nombre(c["economies_eur"])}<small>€</small></span><span class="lib">économisés</span></div>'
+                   f'<div class="carte"><span class="gros num">{_fr_nombre(c["piscines_olympiques"], 1)}</span><span class="lib">piscine{"s" if c["piscines_olympiques"] >= 2 else ""} olympique{"s" if c["piscines_olympiques"] >= 2 else ""}</span></div></div>')
+    phrase = []
+    if eau:
+        phrase.append(f"En {mois_nom}, vos stations ont recyclé {_fr_nombre(eau['eau_recyclee_m3'])} m³ d'eau")
+        if eau["variation_pct"] is not None:
+            v = eau["variation_pct"]
+            phrase[-1] += f", {'soit ' + _fr_nombre(v, 0) + ' % de plus' if v > 0 else 'un peu moins'} qu'en {_RAPPORT_MOIS_FR[int(hist[-2]['mois'][5:7]) - 1]}"
+        phrase[-1] += "."
+        if eau["record"]:
+            phrase.append("C'est votre meilleur mois depuis le début du suivi.")
+        fiab = [s for s in r["stations"] if s["analyse"]["eau_fiable"]]
+        if len(fiab) > 1:
+            b = max(fiab, key=lambda s: s["eau_recyclee_m3"])
+            phrase.append(f"La station de {e(b['lieu'] or b['nom_automate'])} arrive en tête.")
+    elif blocs["qualite"]:
+        phrase.append(f"En {mois_nom}, l'eau de vos stations a été suivie et désinfectée en continu.")
+    phrase.append("Merci de votre confiance.")
+    out.append(f'<div class="mot"><p class="cit">« L\'eau du futur vient des eaux d\'hier. »</p><p>{" ".join(phrase)}</p></div>')
+    if an["objectif_suivant_taux"]:
+        out.append(f'<div class="defi"><p class="sur">Objectif du mois prochain</p><p style="font-size:18px">'
+                   f'Dépasser {_fr_nombre(an["objectif_suivant_taux"])} % de recyclage sur l\'ensemble de vos stations.</p></div>')
+    out.append('<div class="contact"><span>Une question sur votre installation ? <b>Hotline 7 j/7</b> · <b>contact@eaukey.net</b></span><span>eaukey.net</span></div>')
+    out.append(f'<p class="methode">Eau recyclée = eau renvoyée vers le lavage − eau d\'appoint, mesurées par les compteurs de vos stations '
+               f'(seules les stations dont les deux compteurs ont fonctionné sont comptées). Taux de recyclage = eau recyclée / eau renvoyée. '
+               f'Économies estimées à {_fr_nombre(r["parametres"]["prix_m3_eur"], 2)} € le m³ (eau + assainissement). Données horaires, '
+               f'heure de Paris ; une heure sans transmission n\'est pas comptée. Rapport généré le {_fr_date(r["genere_le"])}.</p></section>')
+    out.append("</div></body></html>")
+    return "".join(out)
 
 
 @app.get("/rapport/mensuel")
@@ -7268,6 +7700,29 @@ def rapport_mensuel_clients(
     )
     return {"mois": f"{debut.year:04d}-{debut.month:02d}",
             "clients": [{"client": r[0], "stations_avec_donnees": int(r[1])} for r in rows]}
+
+
+@app.get("/rapport/mensuel/lot")
+def rapport_mensuel_lot(
+    request: Request,
+    mois: Optional[str] = Query(None, description="AAAA-MM (défaut : mois précédent, heure de Paris)"),
+):
+    """ADMIN : statut du rapport de chaque client du mois (pret / a_relire / pas_d_envoi),
+    titre choisi et alertes, pour preparer l'envoi. Ne genere et n'envoie rien."""
+    _require_admin_or_super(request)
+    mois = mois or _rapport_mois_precedent()
+    clients = rapport_mensuel_clients(request, mois)["clients"]
+    out = []
+    for c in clients:
+        r = rapport_mensuel(c["client"], mois)
+        an = r["analyse"]
+        out.append({"client": r["client"], "nb_stations": r["nb_stations"], "statut": an["statut"],
+                    "titre": an["titre"], "raisons": an["raisons"], "alertes": an["alertes"],
+                    "eau_recyclee_m3": an["eau"]["eau_recyclee_m3"] if an["eau"] else None,
+                    "taux_recyclage_pct": an["eau"]["taux_recyclage_pct"] if an["eau"] else None})
+    ordre = {"pret": 0, "a_relire": 1, "pas_d_envoi": 2}
+    out.sort(key=lambda x: (ordre[x["statut"]], x["client"].lower()))
+    return {"mois": mois, "resume": {k: sum(1 for x in out if x["statut"] == k) for k in ordre}, "clients": out}
 
 
 # =============================================================================
