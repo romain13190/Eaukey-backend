@@ -210,9 +210,9 @@ h = get("/rapport/mensuel/html", client="Lavage Alpha", mois="2026-09")
 check(h.status_code == 200 and h.headers["content-type"].startswith("text/html")
       and "Beta" not in h.text and "B1" not in h.text and "Panne Beta" not in h.text,
       "HTML : 200, aucune trace du client B")
-check("septembre 2026" in h.text and "420 m³" in h.text and "1 970 €" in h.text
-      and "95,5 %" in h.text and "@media print" in h.text and "size:A4" in h.text,
-      "HTML : format francais (1 970 EUR, 95,5 %), CSS d'impression A4")
+check("septembre 2026" in h.text and "380<small>m³" in h.text and backend._fr_nombre(1782) + "<small>€" in h.text
+      and "95<small>%" in h.text and "@media print" in h.text and "size:A4" in h.text,
+      "HTML : chiffres des seules stations fiables (380 m3, 1 782 EUR, 95 %), format francais, impression A4")
 rb = get("/rapport/mensuel", client="Beta Wash", mois="2026-09").json()
 check([s["nom_automate"] for s in rb["stations"]] == ["B1"] and rb["total"]["pannes"]["ouvertes_dans_le_mois"] == 1
       and "A1" not in json.dumps(rb), "rapport B : seulement B1 et sa panne")
@@ -223,7 +223,8 @@ check(v["aucune_donnee"] and v["total"]["eau_recyclee_m3"] == 0 and v["total"]["
       and all(s["motifs_incompletude"] == ["aucune donnée reçue ce mois"] for s in v["stations"]),
       "mois sans donnees : zero, taux None, stations signalees")
 hv = get("/rapport/mensuel/html", client="Lavage Alpha", mois="2026-05")
-check(hv.status_code == 200 and "Aucune donnée" in hv.text, "HTML mois vide : message explicite")
+check(hv.status_code == 200 and "Pas d'envoi possible" in hv.text and "aucune donnée" in hv.text,
+      "HTML mois vide : bandeau « pas d'envoi » explicite")
 cur = backend._rapport_maintenant()
 mc = get("/rapport/mensuel", client="Lavage Alpha", mois=f"{cur.year:04d}-{cur.month:02d}").json()
 check(mc["periode"]["mois_en_cours"] and mc["total"]["heures_attendues"] <= 3 * 24 * cur.day,
@@ -256,5 +257,46 @@ check(all(get(p, who=None, **k).status_code == 401 for p, k in routes), "sans je
 check(all(get(p, who="client", **k).status_code == 403 for p, k in routes),
       "client (meme sur son propre client) : 403 sur les 3 routes")
 check(all(get(p, who="super", **k).status_code == 200 for p, k in routes), "super_admin : 200")
+
+# 9. Analyse adaptative (regles du 2026-10-27)
+A = R["analyse"]
+fa = {s["nom_automate"]: s["analyse"] for s in R["stations"]}
+check(A["stations_fiables"] == ["A1"] and not fa["A2"]["eau_fiable"] and not fa["A3"]["eau_fiable"],
+      "seule A1 est fiable : A2 et A3 ont un compteur d'appoint a zero")
+check(any("appoint à zéro" in x for x in fa["A3"]["alertes"]) and any("jours sans aucune donnée" in x for x in fa["A2"]["alertes"])
+      and any("remise à zéro" in x for x in fa["A1"]["alertes"]), "alertes par station (appoint, jours muets, remise a zero)")
+E_ = A["eau"]
+check((E_["eau_recyclee_m3"], E_["taux_recyclage_pct"], E_["economies_eur"], E_["variation_pct"], E_["ecart_taux_points"])
+      == (380, 95.0, 1782.2, 40.7, 5.0), "eau fiable : 380 m3, 95 %, 1 782,20 EUR, +40,7 % et +5 points vs aout")
+check(R["historique"] == [{"mois": "2026-08", "eau_recyclee_m3": 270, "taux_recyclage_pct": 90.0},
+                          {"mois": "2026-09", "eau_recyclee_m3": 380, "taux_recyclage_pct": 95.0}],
+      "historique : mois sans compteurs fiables retires du debut (juillet : appoint a zero)")
+check(A["cumul_annee"] == {"depuis_mois": "2026-08", "eau_recyclee_m3": 650, "economies_eur": 3048.5, "piscines_olympiques": 0.3},
+      "cumul annuel fiable : 650 m3 depuis aout (decembre 2025 et juillet exclus)")
+J = R["jours"]
+check(len(J) == 30 and J[0]["eau_recyclee_m3"] == 19 and J[19]["eau_recyclee_m3"] == 19 and J[24]["eau_recyclee_m3"] == 0,
+      "jours : 19 m3 les jours 1 a 20, remise a zero du 25 ecartee")
+check(A["titre"] == "objectif" and A["statut"] == "a_relire" and not E_["record"], "titre objectif (95 % >= 80 %), statut a relire")
+check(A["blocs"] == {"eau": True, "evolution": True, "energie": True, "stations": True, "qualite": True,
+                     "calendrier": True, "interventions": True} and E_["kwh_par_m3_recycle"] == 5.68, "blocs affiches")
+check(A["objectif_suivant_taux"] == 95.0, "objectif suivant plafonne a 95 %")
+check("À relire avant envoi" in h.text and "non imprimé" in h.text and ".admin{display:none}" in h.text.replace(".actions,", ""),
+      "HTML : bandeau equipe a relire, masque a l'impression")
+check("Presque toute l" in h.text and "Station du mois" not in h.text and "Mesure de l" in h.text,
+      "HTML : titre adapte, pas de station du mois avec une seule station fiable, stations non mesurees signalees sobrement")
+check(rb["analyse"]["statut"] == "pas_d_envoi" and rb["analyse"]["titre"] is None and rb["analyse"]["eau"] is None,
+      "Beta : appoint a zero et aucune sonde -> pas d'envoi")
+hb = get("/rapport/mensuel/html", client="Beta Wash", mois="2026-09")
+check(hb.status_code == 200 and "Pas d'envoi possible" in hb.text and "Ce que représentent" not in hb.text,
+      "HTML Beta : bandeau pas d'envoi, aucun bloc d'eau")
+lot = get("/rapport/mensuel/lot", mois="2026-09")
+L = lot.json()
+check(lot.status_code == 200 and L["resume"] == {"pret": 0, "a_relire": 1, "pas_d_envoi": 1}
+      and [c["client"] for c in L["clients"]] == ["Lavage Alpha", "Beta Wash"] and L["clients"][0]["eau_recyclee_m3"] == 380,
+      "lot : Alpha a relire (380 m3), Beta pas d'envoi")
+check(get("/rapport/mensuel/lot", who=None, mois="2026-09").status_code == 401
+      and get("/rapport/mensuel/lot", who="client", mois="2026-09").status_code == 403, "lot : 401 sans jeton, 403 client")
+check(get("/rapport/mensuel", client="Lavage Alpha", mois=f"{cur.year:04d}-{cur.month:02d}").json()["analyse"]["statut"] == "pas_d_envoi",
+      "mois en cours : jamais pret a envoyer")
 
 print(f"\n{ok} vérifications OK")
