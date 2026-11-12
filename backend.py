@@ -7331,8 +7331,8 @@ h1,h2,h3,p{margin:0}h1,h2{font-weight:500;text-wrap:balance}
 .equiv,.deux,.trois{grid-template-columns:1fr}.periode{text-align:left}
 .st{grid-template-columns:52px repeat(3,minmax(0,1fr));column-gap:12px;row-gap:12px;padding:18px}.st .nomst{grid-column:2 / -1}
 .st svg{width:52px;height:52px;grid-row:span 2;align-self:start}.st .v{font-size:18px}.st .indispo{grid-column:2 / -1}.cal .j{height:36px;font-size:12px}}
-@page{size:A4;margin:10mm}
-@media print{body{padding:0}.actions,.admin{display:none}.f{break-inside:avoid-page}*{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
+@page{size:A4;margin:0}
+@media print{html,body{background:var(--abysse)}body{padding:9mm 10mm}.actions,.admin{display:none}.f{break-inside:avoid-page}*{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
 """
 
 _RAPPORT_GOUTTE = "M135 8 C135 8 250 170 250 245 C250 312 198 362 135 362 C72 362 20 312 20 245 C20 170 135 8 135 8 Z"
